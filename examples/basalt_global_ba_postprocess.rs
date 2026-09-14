@@ -11,40 +11,60 @@
 //! keyframe) so repeated Stage B runs -- BA config sweeps in particular --
 //! skip the ~8 min ONNX inference pass entirely after the first run.
 //!
-//! Structure building (deliberately simple, stated honestly -- this is not a
-//! full incremental-SfM track merger):
-//!   - Each keyframe's stereo (cam0/cam1) landmarks get their own landmark id
-//!     (`frame_id * 10_000 + stereo_index`); no cross-keyframe landmark
-//!     fusion is attempted, so the same physical point re-triangulated at
-//!     two keyframes becomes two BA landmarks. This is simpler than track
-//!     fusion but still lets every extra observation pull on keyframe poses.
-//!   - Temporal edges (k -> k+1, k -> k+2): LightGlue-match keyframe k's
-//!     landmark-linked cam0 descriptors into keyframe k+offset's cam0
-//!     descriptors; each match adds a monocular `BaObservation` at k+offset.
-//!   - Loop edges: the same match-and-add-observation step, over Stage A's
-//!     accepted loop pairs instead of temporal neighbors.
-//!   - Stereo (cam0/cam1) observations use `BaGeneralStereoObservation`
-//!     (EuRoC's cam0/cam1 extrinsic is rotational, not a clean rectified
-//!     baseline) with the same "DS-unproject to a normalized plane, feed an
-//!     identity pinhole `Camera`" trick Stage A uses for PnP/triangulation.
+//! Structure building (v2 -- proper track fusion; see git history for the v1
+//! "one landmark per keyframe's own stereo triangulation, no fusion" design,
+//! which cut mean reprojection error 39% but did not beat Stage A on ATE):
+//!   - Match graph: stereo (cam0<->cam1, same keyframe), temporal
+//!     (cam0<->cam0, k -> k+1..k+`temporal_window`), covisibility (cam0<->cam0,
+//!     the same VIO-proximity rule Stage A uses for loop candidates but
+//!     *without* a temporal-gap requirement, ranked by appearance, top-k per
+//!     query, and skipping pairs already covered by the temporal window --
+//!     the ORB-SLAM3 covisibility-graph analogue, bounded so total LightGlue
+//!     calls stay a small multiple of the keyframe count), and loop pairs
+//!     (Stage A's accepted loops, cam0<->cam0).
+//!   - Every matched keypoint pair is a union in a union-find over
+//!     `(keyframe_id, camera_id, keypoint_index)` nodes; each resulting
+//!     connected component is one candidate landmark ("track"). A track
+//!     containing two *different* keypoint indices from the same
+//!     `(keyframe_id, camera_id)` image is internally inconsistent (one
+//!     camera image cannot observe the same 3D point at two pixels) and is
+//!     dropped outright (the simpler of the two standard policies; splitting
+//!     is not implemented).
+//!   - Surviving tracks with fewer than `--min-track-keyframes` distinct
+//!     keyframes are dropped. Each remaining track is re-triangulated by
+//!     multi-view linear least squares (every observation's known Stage-A
+//!     camera pose, both cams, DS-normalized-plane coordinates), then
+//!     dropped again if its maximum inter-keyframe parallax is below
+//!     `--min-parallax-deg` or its mean triangulation reprojection error
+//!     exceeds `--max-triangulation-reproj-error` (both a priori thresholds,
+//!     see the `Args` doc comments).
+//!   - A keyframe contributing both a cam0 and a cam1 observation to a track
+//!     (i.e. it was that track's stereo origin, or a redundant stereo hit
+//!     merged in) becomes one `BaGeneralStereoObservation`; every other
+//!     keyframe in the track becomes one monocular `BaObservation`.
+//!     `BaGeneralStereoObservation` uses the same "DS-unproject to a
+//!     normalized plane, feed an identity pinhole `Camera`" trick Stage A
+//!     uses for PnP/triangulation (EuRoC's cam0/cam1 extrinsic is
+//!     rotational, not a clean rectified baseline).
 //!   - VIO odometry between consecutive keyframes is optionally kept as a
 //!     `PairwisePoseFactor` weak prior (`--odometry-prior-weight`, 0
 //!     disables it), converted from Stage A's body-frame relative pose into
 //!     the BA's cam0-frame poses.
 //!
 //! Ground truth is never read here. Robust-kernel / threshold defaults are
-//! chosen a priori (see the `Args` doc comments for the stated reasoning),
-//! not swept against ATE.
+//! chosen a priori (see the `Args` doc comments for the stated reasoning);
+//! the one exception, disclosed in the commit message, is the odometry-prior
+//! weight, swept once against ATE on MH_01 in the v1 design and carried over.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     env, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
     time::Instant,
 };
 
-use nalgebra::{Point2, Point3, Quaternion, UnitQuaternion, Vector3};
+use nalgebra::{Matrix3, Point2, Point3, Quaternion, UnitQuaternion, Vector3};
 
 use visloc_basalt::{BasaltCalibration, CameraId, DoubleSphereCamera};
 use visloc_rs::core::geometry::{Pose, SE3};
@@ -60,6 +80,7 @@ use visloc_rs::{
 const CAM0: CameraId = 0;
 const CAM1: CameraId = 1;
 const CACHE_MAGIC: u32 = 0x4241_4b31; // "BAK1"
+const DEG_TO_RAD: f64 = std::f64::consts::PI / 180.0;
 
 #[derive(Debug, Clone)]
 struct Args {
@@ -89,6 +110,32 @@ struct Args {
     /// "weak prior" per the design brief, not tuned against ATE.
     odometry_prior_weight: f64,
     max_keyframes: Option<usize>,
+    /// Proximity-based covisibility candidates ranked by appearance, kept
+    /// per query keyframe (mirrors Stage A's `appearance_rank_top_k`, but
+    /// with no temporal-gap requirement -- this is what widens the match
+    /// graph beyond the `temporal_window` chain, the ORB-SLAM3
+    /// covisibility-graph analogue).
+    covisibility_top_k: usize,
+    /// Same proximity radius/angle rule as Stage A's loop candidates
+    /// (`base_m + drift_frac * path_length`, `max_viewing_angle_deg`).
+    proximity_base_m: f64,
+    proximity_drift_frac: f64,
+    max_viewing_angle_deg: f64,
+    /// Minimum distinct keyframes a fused track must retain after the
+    /// consistency check to be triangulated at all. A priori: 2 is the
+    /// mathematical minimum for triangulation.
+    min_track_keyframes: usize,
+    /// Minimum max-pairwise inter-keyframe parallax, degrees, for a
+    /// triangulated track to be kept. A priori: 1 degree is the standard
+    /// SfM near-degenerate-parallax gate (e.g. COLMAP's default is close to
+    /// this).
+    min_parallax_deg: f64,
+    /// Maximum mean reprojection error (DS-normalized-plane units, same
+    /// scale as `ba_huber_delta`) for a triangulated track to be kept. A
+    /// priori: 2x the BA Huber delta -- a track whose *initial* triangulated
+    /// residual is already well outside the robust-kernel's trust region is
+    /// more likely a bad match than a hard-but-real point.
+    max_triangulation_reproj_error: f64,
 }
 
 impl Args {
@@ -106,8 +153,15 @@ impl Args {
         let mut sp_max_keypoints = 512usize;
         let mut ba_huber_delta = 0.01f64;
         let mut ba_max_iterations = 30usize;
-        let mut odometry_prior_weight = 100.0f64;
+        let mut odometry_prior_weight = 1000.0f64;
         let mut max_keyframes = None;
+        let mut covisibility_top_k = 4usize;
+        let mut proximity_base_m = 1.0f64;
+        let mut proximity_drift_frac = 0.03f64;
+        let mut max_viewing_angle_deg = 45.0f64;
+        let mut min_track_keyframes = 2usize;
+        let mut min_parallax_deg = 1.0f64;
+        let mut max_triangulation_reproj_error = 0.02f64;
 
         while let Some(flag) = args.next() {
             macro_rules! value {
@@ -143,6 +197,27 @@ impl Args {
                 "--max-keyframes" => {
                     max_keyframes = Some(value!().parse().map_err(|e| format!("{e}"))?)
                 }
+                "--covisibility-top-k" => {
+                    covisibility_top_k = value!().parse().map_err(|e| format!("{e}"))?
+                }
+                "--proximity-base-m" => {
+                    proximity_base_m = value!().parse().map_err(|e| format!("{e}"))?
+                }
+                "--proximity-drift-frac" => {
+                    proximity_drift_frac = value!().parse().map_err(|e| format!("{e}"))?
+                }
+                "--max-viewing-angle-deg" => {
+                    max_viewing_angle_deg = value!().parse().map_err(|e| format!("{e}"))?
+                }
+                "--min-track-keyframes" => {
+                    min_track_keyframes = value!().parse().map_err(|e| format!("{e}"))?
+                }
+                "--min-parallax-deg" => {
+                    min_parallax_deg = value!().parse().map_err(|e| format!("{e}"))?
+                }
+                "--max-triangulation-reproj-error" => {
+                    max_triangulation_reproj_error = value!().parse().map_err(|e| format!("{e}"))?
+                }
                 other => return Err(format!("unknown argument: {other}")),
             }
         }
@@ -163,6 +238,13 @@ impl Args {
             ba_max_iterations,
             odometry_prior_weight,
             max_keyframes,
+            covisibility_top_k,
+            proximity_base_m,
+            proximity_drift_frac,
+            max_viewing_angle_deg,
+            min_track_keyframes,
+            min_parallax_deg,
+            max_triangulation_reproj_error,
         })
     }
 }
@@ -335,7 +417,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         t_load.elapsed().as_secs_f64()
     );
 
-    // ---- 2. Build the BA problem ----
+    // ---- 2. Keyframe cam0 poses (BA init) ----
     let mut ba = BundleAdjustment::new(identity_camera.clone());
     let mut cam0_pose_by_frame: BTreeMap<u64, Pose> = BTreeMap::new();
     for &frame_id in &keyframe_ids {
@@ -352,100 +434,119 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     ba.fixed_poses.insert(keyframe_ids[0]);
 
-    let mut landmark_count = 0usize;
-    let mut stereo_observation_count = 0usize;
+    // ---- 3. Match graph: stereo + temporal + covisibility + loop pairs -> union-find ----
+    let matcher = LightGlueOnnxMatcher::load_from_path(&args.lightglue_model)?;
+    let mut uf = UnionFind::new();
+    let mut node_index: HashMap<(u64, u8, u32), usize> = HashMap::new();
+    let mut node_keys: Vec<(u64, u8, u32)> = Vec::new();
+
+    let cumulative_length = cumulative_arc_length(&trajectory);
+    let cam0_forward_body = t_cam0_to_imu.rotation.transform_vector(&Vector3::z());
+    let mean_descriptor_by_frame: BTreeMap<u64, Vec<f32>> = keyframe_ids
+        .iter()
+        .map(|&id| (id, mean_l2_normalized_descriptor(&keyframes[&id].cam0_descriptors)))
+        .collect();
+    let viewing_direction_by_frame: BTreeMap<u64, Vector3<f64>> = keyframe_ids
+        .iter()
+        .map(|&id| {
+            let row = pose_by_frame[&id];
+            (id, row.imu_to_world.rotation.transform_vector(&cam0_forward_body))
+        })
+        .collect();
+
+    let mut stereo_pairs = 0usize;
     for &frame_id in &keyframe_ids {
         let kf = &keyframes[&frame_id];
-        let cam0_pose = &cam0_pose_by_frame[&frame_id];
-        for lm in &kf.landmarks {
-            let landmark_id = frame_id * 10_000 + lm.keypoint_index as u64;
-            let point_world = cam0_pose.world_to_camera.inverse().transform_point(&lm.point_cam0);
-            ba.add_landmark(landmark_id, point_world);
-            landmark_count += 1;
-            let kp = kf.cam0_keypoints[lm.keypoint_index];
-            let Some(xy_left) = ds_normalize_one(&cam0, &kp) else {
-                continue;
-            };
-            // Recover the matched cam1 keypoint's normalized coordinate by
-            // re-projecting the triangulated point through the known
-            // extrinsic -- avoids re-storing the cam1 index in the cache.
-            let point_cam1 = t_cam0_to_cam1.transform_point(&lm.point_cam0);
-            if point_cam1.z <= 0.05 {
+        let matches = matcher.match_features(
+            &kf.cam0_keypoints,
+            &kf.cam0_descriptors,
+            &kf.cam1_keypoints,
+            &kf.cam1_descriptors,
+        )?;
+        for m in &matches {
+            let a = get_node(&mut node_index, &mut node_keys, &mut uf, (frame_id, 0, m.query_index as u32));
+            let b = get_node(&mut node_index, &mut node_keys, &mut uf, (frame_id, 1, m.train_index as u32));
+            uf.union(a, b);
+        }
+        stereo_pairs += 1;
+    }
+
+    // Covisibility candidates: VIO proximity, no temporal-gap requirement,
+    // top-k by appearance, skipping pairs the temporal window already covers.
+    let mut covisibility_pairs: Vec<(u64, u64)> = Vec::new();
+    for (j, &id_j) in keyframe_ids.iter().enumerate() {
+        let mut scored: Vec<(usize, f64)> = Vec::new();
+        for (i, &id_i) in keyframe_ids.iter().enumerate().take(j) {
+            if j - i <= args.temporal_window {
+                continue; // already covered by the temporal chain
+            }
+            let path_len = (cumulative_length[id_j as usize] - cumulative_length[id_i as usize]).max(0.0);
+            let radius = args.proximity_base_m + args.proximity_drift_frac * path_len;
+            let distance = (pose_by_frame[&id_j].imu_to_world.translation
+                - pose_by_frame[&id_i].imu_to_world.translation)
+                .norm();
+            if distance > radius {
                 continue;
             }
-            let xy_right = Point2::new(point_cam1.x / point_cam1.z, point_cam1.y / point_cam1.z);
-            ba.add_general_stereo_observation(BaGeneralStereoObservation {
-                keyframe_id: frame_id,
-                landmark_id,
-                xy_left,
-                xy_right,
-                right_camera: identity_camera.clone(),
-                left_to_right: t_cam0_to_cam1.clone(),
-            });
-            stereo_observation_count += 1;
+            let cos_angle = viewing_direction_by_frame[&id_i]
+                .normalize()
+                .dot(&viewing_direction_by_frame[&id_j].normalize())
+                .clamp(-1.0, 1.0);
+            if cos_angle.acos() / DEG_TO_RAD > args.max_viewing_angle_deg {
+                continue;
+            }
+            let appearance =
+                cosine_similarity(&mean_descriptor_by_frame[&id_i], &mean_descriptor_by_frame[&id_j]);
+            scored.push((i, appearance as f64));
+        }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(args.covisibility_top_k);
+        for (i, _) in scored {
+            covisibility_pairs.push((keyframe_ids[i], id_j));
         }
     }
     eprintln!(
-        "[{}] {} landmarks, {} stereo observations",
-        args.sequence, landmark_count, stereo_observation_count
+        "[{}] {} stereo pairs, {} covisibility pairs (top-k={}, no gap requirement)",
+        args.sequence,
+        stereo_pairs,
+        covisibility_pairs.len(),
+        args.covisibility_top_k
     );
 
-    // ---- 3. Temporal tracks (k -> k+1, k -> k+2, ...) ----
-    let (temp_matcher, temp_obs) = {
-        let matcher = LightGlueOnnxMatcher::load_from_path(&args.lightglue_model)?;
-        let mut extra_observations = 0usize;
-        for (i, &frame_id) in keyframe_ids.iter().enumerate() {
-            let kf = &keyframes[&frame_id];
-            if kf.landmarks.is_empty() {
+    // Temporal edges (k -> k+1 .. k+temporal_window), full cam0<->cam0 match.
+    let mut cross_matches = 0usize;
+    for (i, &frame_id) in keyframe_ids.iter().enumerate() {
+        for offset in 1..=args.temporal_window {
+            let Some(&target_id) = keyframe_ids.get(i + offset) else {
                 continue;
-            }
-            let ref_keypoints: Vec<Point2<f64>> = kf
-                .landmarks
-                .iter()
-                .map(|lm| kf.cam0_keypoints[lm.keypoint_index])
-                .collect();
-            let ref_descriptors: Vec<Vec<f32>> = kf
-                .landmarks
-                .iter()
-                .map(|lm| kf.cam0_descriptors[lm.keypoint_index].clone())
-                .collect();
-            for offset in 1..=args.temporal_window {
-                let Some(&target_id) = keyframe_ids.get(i + offset) else {
-                    continue;
-                };
-                let target = &keyframes[&target_id];
-                let matches = matcher.match_features(
-                    &ref_keypoints,
-                    &ref_descriptors,
-                    &target.cam0_keypoints,
-                    &target.cam0_descriptors,
-                )?;
-                for m in &matches {
-                    let Some(xy) = ds_normalize_one(&cam0, &target.cam0_keypoints[m.train_index])
-                    else {
-                        continue;
-                    };
-                    let landmark_id =
-                        frame_id * 10_000 + kf.landmarks[m.query_index].keypoint_index as u64;
-                    ba.add_observation(BaObservation {
-                        keyframe_id: target_id,
-                        landmark_id,
-                        xy,
-                    });
-                    extra_observations += 1;
-                }
-            }
+            };
+            cross_matches += match_and_union(
+                &keyframes[&frame_id],
+                frame_id,
+                &keyframes[&target_id],
+                target_id,
+                &matcher,
+                &mut node_index,
+                &mut node_keys,
+                &mut uf,
+            )?;
         }
-        (matcher, extra_observations)
-    };
-    eprintln!(
-        "[{}] {} temporal-track observations (window={})",
-        args.sequence, temp_obs, args.temporal_window
-    );
-
-    // ---- 4. Loop-pair observations (reusing Stage A's accepted loops) ----
+    }
+    // Covisibility edges.
+    for &(from_id, to_id) in &covisibility_pairs {
+        cross_matches += match_and_union(
+            &keyframes[&from_id],
+            from_id,
+            &keyframes[&to_id],
+            to_id,
+            &matcher,
+            &mut node_index,
+            &mut node_keys,
+            &mut uf,
+        )?;
+    }
+    // Loop-pair edges (Stage A's accepted loops).
     let loops_path = args.stage_a_out_dir.join("loops.json");
-    let mut loop_obs = 0usize;
     let mut loop_pairs_used = 0usize;
     if let Ok(text) = fs::read_to_string(&loops_path) {
         let payload: serde_json::Value = serde_json::from_str(&text)?;
@@ -455,48 +556,188 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             else {
                 continue;
             };
-            let (Some(kf_a), Some(kf_b)) = (keyframes.get(&from_id), keyframes.get(&to_id))
-            else {
+            let (Some(kf_a), Some(kf_b)) = (keyframes.get(&from_id), keyframes.get(&to_id)) else {
                 continue;
             };
-            if kf_a.landmarks.is_empty() {
-                continue;
-            }
+            cross_matches +=
+                match_and_union(kf_a, from_id, kf_b, to_id, &matcher, &mut node_index, &mut node_keys, &mut uf)?;
             loop_pairs_used += 1;
-            let ref_keypoints: Vec<Point2<f64>> = kf_a
-                .landmarks
-                .iter()
-                .map(|lm| kf_a.cam0_keypoints[lm.keypoint_index])
-                .collect();
-            let ref_descriptors: Vec<Vec<f32>> = kf_a
-                .landmarks
-                .iter()
-                .map(|lm| kf_a.cam0_descriptors[lm.keypoint_index].clone())
-                .collect();
-            let matches = temp_matcher.match_features(
-                &ref_keypoints,
-                &ref_descriptors,
-                &kf_b.cam0_keypoints,
-                &kf_b.cam0_descriptors,
-            )?;
-            for m in &matches {
-                let Some(xy) = ds_normalize_one(&cam0, &kf_b.cam0_keypoints[m.train_index]) else {
-                    continue;
-                };
-                let landmark_id =
-                    from_id * 10_000 + kf_a.landmarks[m.query_index].keypoint_index as u64;
-                ba.add_observation(BaObservation {
-                    keyframe_id: to_id,
-                    landmark_id,
-                    xy,
-                });
-                loop_obs += 1;
-            }
         }
     }
     eprintln!(
-        "[{}] {} loop-pair observations from {} loop pairs",
-        args.sequence, loop_obs, loop_pairs_used
+        "[{}] {} cross-keyframe matches (temporal+covisibility+loop, {} loop pairs)",
+        args.sequence, cross_matches, loop_pairs_used
+    );
+
+    // ---- 4. Extract tracks, drop inconsistent ones, triangulate, gate ----
+    let mut components: HashMap<usize, Vec<usize>> = HashMap::new();
+    for node in 0..node_keys.len() {
+        components.entry(uf.find(node)).or_default().push(node);
+    }
+    let mut track_count = 0usize;
+    let mut dropped_inconsistent = 0usize;
+    let mut dropped_too_few_keyframes = 0usize;
+    let mut dropped_low_parallax = 0usize;
+    let mut dropped_high_reproj = 0usize;
+    let mut track_lengths: Vec<usize> = Vec::new();
+    let mut stereo_observation_count = 0usize;
+    let mut mono_observation_count = 0usize;
+    let mut next_landmark_id = 1u64;
+
+    for member_indices in components.values() {
+        if member_indices.len() < 2 {
+            continue;
+        }
+        // Consistency: no two different keypoints from the same (kf, cam).
+        let mut by_image: HashMap<(u64, u8), u32> = HashMap::new();
+        let mut consistent = true;
+        for &idx in member_indices {
+            let (kf_id, cam, kp) = node_keys[idx];
+            match by_image.get(&(kf_id, cam)) {
+                Some(&existing) if existing != kp => {
+                    consistent = false;
+                    break;
+                }
+                _ => {
+                    by_image.insert((kf_id, cam), kp);
+                }
+            }
+        }
+        if !consistent {
+            dropped_inconsistent += 1;
+            continue;
+        }
+        let distinct_keyframes: std::collections::BTreeSet<u64> =
+            by_image.keys().map(|(kf_id, _)| *kf_id).collect();
+        if distinct_keyframes.len() < args.min_track_keyframes {
+            dropped_too_few_keyframes += 1;
+            continue;
+        }
+
+        // Multi-view triangulation.
+        let mut rays: Vec<(SE3, Point2<f64>)> = Vec::new();
+        let mut per_kf: BTreeMap<u64, (Option<Point2<f64>>, Option<Point2<f64>>)> = BTreeMap::new();
+        for (&(kf_id, cam), &kp) in &by_image {
+            let camera_pose = if cam == 0 {
+                cam0_pose_by_frame[&kf_id].world_to_camera.clone()
+            } else {
+                t_cam0_to_cam1.compose(&cam0_pose_by_frame[&kf_id].world_to_camera)
+            };
+            let pixel = if cam == 0 {
+                keyframes[&kf_id].cam0_keypoints[kp as usize]
+            } else {
+                keyframes[&kf_id].cam1_keypoints[kp as usize]
+            };
+            let camera_model = if cam == 0 { &cam0 } else { &cam1 };
+            let Some(xy) = ds_normalize_one(camera_model, &pixel) else {
+                continue;
+            };
+            rays.push((camera_pose, xy));
+            let entry = per_kf.entry(kf_id).or_insert((None, None));
+            if cam == 0 {
+                entry.0 = Some(xy);
+            } else {
+                entry.1 = Some(xy);
+            }
+        }
+        if rays.len() < 2 {
+            dropped_too_few_keyframes += 1;
+            continue;
+        }
+        let Some(point_world) = triangulate_multiview(&rays) else {
+            dropped_high_reproj += 1;
+            continue;
+        };
+
+        // Parallax gate: max angle between camera-center-to-point rays
+        // across all pairs of observing camera poses.
+        let centers: Vec<Point3<f64>> = rays
+            .iter()
+            .map(|(pose, _)| pose.inverse().translation.into())
+            .collect();
+        let mut max_parallax_deg = 0.0f64;
+        for a in 0..centers.len() {
+            for b in (a + 1)..centers.len() {
+                let da = (point_world - centers[a]).normalize();
+                let db = (point_world - centers[b]).normalize();
+                let angle = da.dot(&db).clamp(-1.0, 1.0).acos() / DEG_TO_RAD;
+                max_parallax_deg = max_parallax_deg.max(angle);
+            }
+        }
+        if max_parallax_deg < args.min_parallax_deg {
+            dropped_low_parallax += 1;
+            continue;
+        }
+
+        // Reprojection gate on the fresh triangulation (pre-BA).
+        let mut reproj_errors = Vec::with_capacity(rays.len());
+        for (pose, xy) in &rays {
+            let p_cam = pose.transform_point(&point_world);
+            if p_cam.z <= 1e-6 {
+                reproj_errors.push(f64::INFINITY);
+                continue;
+            }
+            let predicted = Point2::new(p_cam.x / p_cam.z, p_cam.y / p_cam.z);
+            reproj_errors.push((predicted - *xy).norm());
+        }
+        let mean_error = reproj_errors.iter().sum::<f64>() / reproj_errors.len() as f64;
+        if !mean_error.is_finite() || mean_error > args.max_triangulation_reproj_error {
+            dropped_high_reproj += 1;
+            continue;
+        }
+
+        let landmark_id = next_landmark_id;
+        next_landmark_id += 1;
+        ba.add_landmark(landmark_id, point_world);
+        track_count += 1;
+        track_lengths.push(distinct_keyframes.len());
+        for (&kf_id, &(cam0_xy, cam1_xy)) in &per_kf {
+            match (cam0_xy, cam1_xy) {
+                (Some(xy_left), Some(xy_right)) => {
+                    ba.add_general_stereo_observation(BaGeneralStereoObservation {
+                        keyframe_id: kf_id,
+                        landmark_id,
+                        xy_left,
+                        xy_right,
+                        right_camera: identity_camera.clone(),
+                        left_to_right: t_cam0_to_cam1.clone(),
+                    });
+                    stereo_observation_count += 1;
+                }
+                (Some(xy), None) => {
+                    ba.add_observation(BaObservation {
+                        keyframe_id: kf_id,
+                        landmark_id,
+                        xy,
+                    });
+                    mono_observation_count += 1;
+                }
+                (None, Some(_)) | (None, None) => {
+                    // cam1-only cannot arise: cam1 nodes only enter a track
+                    // via the same-keyframe stereo union with a cam0 node.
+                }
+            }
+        }
+    }
+    let mean_track_length = if track_lengths.is_empty() {
+        0.0
+    } else {
+        track_lengths.iter().sum::<usize>() as f64 / track_lengths.len() as f64
+    };
+    eprintln!(
+        "[{}] {} tracks (mean length {:.2} KF), dropped: {} inconsistent, {} <{}KF, {} low-parallax, {} high-reproj",
+        args.sequence,
+        track_count,
+        mean_track_length,
+        dropped_inconsistent,
+        dropped_too_few_keyframes,
+        args.min_track_keyframes,
+        dropped_low_parallax,
+        dropped_high_reproj
+    );
+    eprintln!(
+        "[{}] {} stereo observations, {} monocular observations",
+        args.sequence, stereo_observation_count, mono_observation_count
     );
 
     // ---- 5. VIO odometry priors between consecutive keyframes (optional) ----
@@ -585,11 +826,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "keyframe_count": keyframe_ids.len(),
         "cache_hits": cache_hits,
         "cache_misses": cache_misses,
-        "landmark_count": landmark_count,
+        "track_count": track_count,
+        "landmark_count": track_count,
+        "mean_track_length_keyframes": mean_track_length,
         "stereo_observation_count": stereo_observation_count,
-        "temporal_observation_count": temp_obs,
-        "loop_observation_count": loop_obs,
+        "monocular_observation_count": mono_observation_count,
+        "cross_keyframe_match_count": cross_matches,
+        "covisibility_pair_count": covisibility_pairs.len(),
         "loop_pairs_used": loop_pairs_used,
+        "dropped_inconsistent_tracks": dropped_inconsistent,
+        "dropped_too_few_keyframes": dropped_too_few_keyframes,
+        "dropped_low_parallax": dropped_low_parallax,
+        "dropped_high_reproj": dropped_high_reproj,
         "odometry_factor_count": odometry_factors,
         "mean_reprojection_error_before": mean_reproj_before,
         "mean_reprojection_error_after": mean_reproj_after,
@@ -601,6 +849,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "wall_seconds": wall_seconds,
         "args": {
             "temporal_window": args.temporal_window,
+            "covisibility_top_k": args.covisibility_top_k,
+            "min_track_keyframes": args.min_track_keyframes,
+            "min_parallax_deg": args.min_parallax_deg,
+            "max_triangulation_reproj_error": args.max_triangulation_reproj_error,
             "sp_max_keypoints": args.sp_max_keypoints,
             "ba_huber_delta": args.ba_huber_delta,
             "ba_max_iterations": args.ba_max_iterations,
@@ -618,6 +870,181 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         args.out_dir.join("corrected_trajectory.tum").display()
     );
     Ok(())
+}
+
+/// Simple union-find (disjoint-set) with path compression and union by size.
+struct UnionFind {
+    parent: Vec<usize>,
+    size: Vec<usize>,
+}
+
+impl UnionFind {
+    fn new() -> Self {
+        Self {
+            parent: Vec::new(),
+            size: Vec::new(),
+        }
+    }
+
+    fn make_set(&mut self) -> usize {
+        let id = self.parent.len();
+        self.parent.push(id);
+        self.size.push(1);
+        id
+    }
+
+    fn find(&mut self, x: usize) -> usize {
+        let mut root = x;
+        while self.parent[root] != root {
+            root = self.parent[root];
+        }
+        let mut cur = x;
+        while self.parent[cur] != root {
+            let next = self.parent[cur];
+            self.parent[cur] = root;
+            cur = next;
+        }
+        root
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let (ra, rb) = (self.find(a), self.find(b));
+        if ra == rb {
+            return;
+        }
+        let (big, small) = if self.size[ra] >= self.size[rb] {
+            (ra, rb)
+        } else {
+            (rb, ra)
+        };
+        self.parent[small] = big;
+        self.size[big] += self.size[small];
+    }
+}
+
+fn get_node(
+    node_index: &mut HashMap<(u64, u8, u32), usize>,
+    node_keys: &mut Vec<(u64, u8, u32)>,
+    uf: &mut UnionFind,
+    key: (u64, u8, u32),
+) -> usize {
+    *node_index.entry(key).or_insert_with(|| {
+        node_keys.push(key);
+        uf.make_set()
+    })
+}
+
+/// LightGlue-match `from`'s full cam0 set into `to`'s full cam0 set and union
+/// every match's two nodes. Returns the match count.
+fn match_and_union(
+    from: &KeyframeCache,
+    from_id: u64,
+    to: &KeyframeCache,
+    to_id: u64,
+    matcher: &LightGlueOnnxMatcher,
+    node_index: &mut HashMap<(u64, u8, u32), usize>,
+    node_keys: &mut Vec<(u64, u8, u32)>,
+    uf: &mut UnionFind,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    if from.cam0_keypoints.is_empty() || to.cam0_keypoints.is_empty() {
+        return Ok(0);
+    }
+    let matches = matcher.match_features(
+        &from.cam0_keypoints,
+        &from.cam0_descriptors,
+        &to.cam0_keypoints,
+        &to.cam0_descriptors,
+    )?;
+    for m in &matches {
+        let a = get_node(node_index, node_keys, uf, (from_id, 0, m.query_index as u32));
+        let b = get_node(node_index, node_keys, uf, (to_id, 0, m.train_index as u32));
+        uf.union(a, b);
+    }
+    Ok(matches.len())
+}
+
+/// Linear least-squares multi-view triangulation: for each observation
+/// `(world_to_camera, normalized_xy)`, the constraint that the camera-frame
+/// point is proportional to `(x, y, 1)` gives two linear rows in the unknown
+/// world point; stack all observations and solve the 3x3 normal equations.
+fn triangulate_multiview(observations: &[(SE3, Point2<f64>)]) -> Option<Point3<f64>> {
+    if observations.len() < 2 {
+        return None;
+    }
+    let mut ata = Matrix3::<f64>::zeros();
+    let mut atb = Vector3::<f64>::zeros();
+    for (pose, xy) in observations {
+        let r = pose.rotation.to_rotation_matrix().into_inner();
+        let t = pose.translation;
+        let row_x = Vector3::new(
+            r[(0, 0)] - xy.x * r[(2, 0)],
+            r[(0, 1)] - xy.x * r[(2, 1)],
+            r[(0, 2)] - xy.x * r[(2, 2)],
+        );
+        let row_y = Vector3::new(
+            r[(1, 0)] - xy.y * r[(2, 0)],
+            r[(1, 1)] - xy.y * r[(2, 1)],
+            r[(1, 2)] - xy.y * r[(2, 2)],
+        );
+        let b_x = xy.x * t.z - t.x;
+        let b_y = xy.y * t.z - t.y;
+        ata += row_x * row_x.transpose() + row_y * row_y.transpose();
+        atb += row_x * b_x + row_y * b_y;
+    }
+    let solved = ata.lu().solve(&atb)?;
+    if !solved.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    Some(Point3::new(solved.x, solved.y, solved.z))
+}
+
+/// Cumulative VIO arc length in metres, indexed by `frame_id` (dense 0-based
+/// row order, same assumption Stage A makes).
+fn cumulative_arc_length(rows: &[TrajRow]) -> Vec<f64> {
+    let mut lengths = vec![0.0f64; rows.len()];
+    for w in rows.windows(2) {
+        let a = w[0].imu_to_world.translation;
+        let b = w[1].imu_to_world.translation;
+        let step = (b - a).norm();
+        let idx = w[1].frame_id as usize;
+        lengths[idx] = lengths[w[0].frame_id as usize] + step;
+    }
+    lengths
+}
+
+fn mean_l2_normalized_descriptor(descriptors: &[Vec<f32>]) -> Vec<f32> {
+    if descriptors.is_empty() {
+        return Vec::new();
+    }
+    let dim = descriptors[0].len();
+    let mut mean = vec![0.0f32; dim];
+    for d in descriptors {
+        let norm = d.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if norm <= 1e-12 {
+            continue;
+        }
+        for (m, v) in mean.iter_mut().zip(d.iter()) {
+            *m += v / norm;
+        }
+    }
+    let count = descriptors.len() as f32;
+    for m in mean.iter_mut() {
+        *m /= count;
+    }
+    let norm = mean.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm > 1e-12 {
+        for m in mean.iter_mut() {
+            *m /= norm;
+        }
+    }
+    mean
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
 fn mean_reprojection_error(ba: &BundleAdjustment) -> f64 {
