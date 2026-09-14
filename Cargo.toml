@@ -189,6 +189,11 @@ path = "examples/basalt_loop_closure_postprocess.rs"
 required-features = ["image-io", "onnx-inference"]
 
 [[example]]
+name = "basalt_global_ba_postprocess"
+path = "examples/basalt_global_ba_postprocess.rs"
+required-features = ["image-io", "onnx-inference"]
+
+[[example]]
 name = "fixed_sift_descriptor_probe"
 path = "examples/fixed_sift_descriptor_probe.rs"
 required-features = ["image-io"]
