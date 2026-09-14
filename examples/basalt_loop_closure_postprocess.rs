@@ -96,6 +96,7 @@ struct Args {
     proximity_drift_frac: f64,
     max_viewing_angle_deg: f64,
     appearance_rank_top_k: usize,
+    nms_window_s: f64,
     min_inliers: usize,
     min_inlier_ratio: f64,
     reprojection_threshold: f64,
@@ -136,7 +137,8 @@ impl Args {
         let mut proximity_base_m = 1.0f64;
         let mut proximity_drift_frac = 0.03f64;
         let mut max_viewing_angle_deg = 45.0f64;
-        let mut appearance_rank_top_k = 8usize;
+        let mut appearance_rank_top_k = 3usize;
+        let mut nms_window_s = 3.0f64;
         let mut min_inliers = 40usize;
         let mut min_inlier_ratio = 0.4f64;
         let mut reprojection_threshold = 0.012f64;
@@ -146,7 +148,7 @@ impl Args {
         let mut vio_consistency_rotation_per_10m_deg = 0.5f64;
         let mut max_candidates = 4000usize;
         let mut max_keyframes = None;
-        let mut sp_max_keypoints = 800usize;
+        let mut sp_max_keypoints = 512usize;
 
         while let Some(flag) = args.next() {
             macro_rules! value {
@@ -184,6 +186,7 @@ impl Args {
                 "--appearance-rank-top-k" => {
                     appearance_rank_top_k = value!().parse().map_err(|e| format!("{e}"))?
                 }
+                "--nms-window-s" => nms_window_s = value!().parse().map_err(|e| format!("{e}"))?,
                 "--min-inliers" => min_inliers = value!().parse().map_err(|e| format!("{e}"))?,
                 "--min-inlier-ratio" => {
                     min_inlier_ratio = value!().parse().map_err(|e| format!("{e}"))?
@@ -244,6 +247,7 @@ impl Args {
             proximity_drift_frac,
             max_viewing_angle_deg,
             appearance_rank_top_k,
+            nms_window_s,
             min_inliers,
             min_inlier_ratio,
             reprojection_threshold,
@@ -407,8 +411,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     graph.anchor(keyframe_ids[0]);
 
-    let (accepted, candidate_pair_count, verified_count): (Vec<AcceptedLoop>, usize, usize) =
-        if let Some(reuse_path) = &args.reuse_loops {
+    let (accepted, candidate_pair_count, verified_count, profile): (
+        Vec<AcceptedLoop>,
+        usize,
+        usize,
+        Option<ProfileStats>,
+    ) = if let Some(reuse_path) = &args.reuse_loops {
         // ---- Fast-iteration path: rebuild loop edges from a cached loops.json ----
         eprintln!(
             "[{}] reusing accepted loops from {} (weight_scale={} weight_max={})",
@@ -447,7 +455,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             args.sequence,
             accepted.len()
         );
-        (accepted, candidate_pair_count, verified_count)
+        (accepted, candidate_pair_count, verified_count, None)
     } else {
 
     eprintln!("[{}] loading calibration", args.sequence);
@@ -495,26 +503,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let matcher = LightGlueOnnxMatcher::load_from_path(lightglue_model)?;
     let identity_camera = GenericCamera::pinhole(0, cam0.width, cam0.height, 1.0, 1.0, 0.0, 0.0);
 
+    let mut sp_extract_total = std::time::Duration::ZERO;
+    let mut stereo_lg_total = std::time::Duration::ZERO;
+    let mut image_load_total = std::time::Duration::ZERO;
     let mut keyframes: Vec<KeyframeData> = Vec::with_capacity(keyframe_ids.len());
     for (i, &frame_id) in keyframe_ids.iter().enumerate() {
         let row = *pose_by_frame
             .get(&frame_id)
             .ok_or_else(|| format!("keyframe frame_id {frame_id} missing from trajectory.csv"))?;
+        let t = Instant::now();
         let cam0_image = load_gray_image(&args.dataset_dir, "cam0", row.timestamp_ns)?;
         let cam1_image = load_gray_image(&args.dataset_dir, "cam1", row.timestamp_ns)?;
+        image_load_total += t.elapsed();
+        let t = Instant::now();
         let cam0_features = extractor.extract_deep(&cam0_image)?;
         let cam1_features = extractor.extract_deep(&cam1_image)?;
+        sp_extract_total += t.elapsed();
 
         let cam0_normalized = ds_normalize(&cam0, &cam0_features.keypoints);
         let cam1_normalized = ds_normalize(&cam1, &cam1_features.keypoints);
         let mean_descriptor = mean_l2_normalized_descriptor(&cam0_features.descriptors);
 
+        let t = Instant::now();
         let stereo_matches = matcher.match_features(
             &cam0_features.keypoints,
             &cam0_features.descriptors,
             &cam1_features.keypoints,
             &cam1_features.descriptors,
         )?;
+        stereo_lg_total += t.elapsed();
 
         let mut landmarks = Vec::with_capacity(stereo_matches.len());
         for m in &stereo_matches {
@@ -566,6 +583,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             viewing_direction_world,
         });
     }
+
+    eprintln!(
+        "[{}] profile: image_load={:.1}s sp_extract={:.1}s ({} calls) stereo_lightglue={:.1}s ({} calls)",
+        args.sequence,
+        image_load_total.as_secs_f64(),
+        sp_extract_total.as_secs_f64(),
+        keyframe_ids.len() * 2,
+        stereo_lg_total.as_secs_f64(),
+        keyframe_ids.len()
+    );
 
     // ---- 3. Loop candidates: VIO pose proximity (DROID-style), not appearance ----
     let min_temporal_gap_ns = (args.min_temporal_gap_s * 1.0e9) as i64;
@@ -636,17 +663,43 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         confidence: None,
     };
 
+    let nms_window_ns = (args.nms_window_s * 1.0e9) as i64;
+    let mut accepted_timestamp_pairs: Vec<(i64, i64)> = Vec::new();
     let mut accepted: Vec<AcceptedLoop> = Vec::new();
     let mut verified_count = 0usize;
+    let mut forward_timing = SolveTiming {
+        lightglue: std::time::Duration::ZERO,
+        pnp: std::time::Duration::ZERO,
+    };
+    let mut backward_timing = SolveTiming {
+        lightglue: std::time::Duration::ZERO,
+        pnp: std::time::Duration::ZERO,
+    };
+    let mut forward_attempts = 0usize;
+    let mut backward_attempts = 0usize;
+    let mut nms_skipped = 0usize;
     for &(i, j, _appearance) in &candidate_pairs {
         let kf_a = &keyframes[i];
         let kf_b = &keyframes[j];
         if kf_a.landmarks.is_empty() || kf_b.landmarks.is_empty() {
             continue;
         }
+        // Temporal NMS: skip candidates whose keyframe pair sits within
+        // `nms_window_s` of an already-accepted pair (both sides) -- almost
+        // certainly the same physical place pair, so verifying it again
+        // (a LightGlue + PnP call, in both directions) buys no new
+        // information for the pose graph, only wall time.
+        if accepted_timestamp_pairs.iter().any(|&(ta, tb)| {
+            (kf_a.timestamp_ns - ta).abs() < nms_window_ns
+                && (kf_b.timestamp_ns - tb).abs() < nms_window_ns
+        }) {
+            nms_skipped += 1;
+            continue;
+        }
 
+        forward_attempts += 1;
         let Some((forward_report, forward_corr)) =
-            solve_relative_pose(kf_a, kf_b, &matcher, &pnp_ransac, &identity_camera)
+            solve_relative_pose(kf_a, kf_b, &matcher, &pnp_ransac, &identity_camera, &mut forward_timing)
         else {
             continue;
         };
@@ -655,8 +708,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         {
             continue;
         }
+        backward_attempts += 1;
         let Some((backward_report, backward_corr)) =
-            solve_relative_pose(kf_b, kf_a, &matcher, &pnp_ransac, &identity_camera)
+            solve_relative_pose(kf_b, kf_a, &matcher, &pnp_ransac, &identity_camera, &mut backward_timing)
         else {
             continue;
         };
@@ -720,6 +774,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             nalgebra::Matrix6::identity() * loop_weight,
         );
         let q = measurement_body.rotation.quaternion();
+        accepted_timestamp_pairs.push((kf_a.timestamp_ns, kf_b.timestamp_ns));
         accepted.push(AcceptedLoop {
             from_frame_id: kf_a.frame_id,
             to_frame_id: kf_b.frame_id,
@@ -745,13 +800,40 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     eprintln!(
-        "[{}] {} candidates, {} PnP-verified (both directions), {} accepted (VIO-consistency + reciprocal)",
+        "[{}] {} candidates, {} NMS-skipped, {} forward attempts, {} backward (reciprocal) attempts, {} PnP-verified (both directions), {} accepted",
         args.sequence,
         candidate_pairs.len(),
+        nms_skipped,
+        forward_attempts,
+        backward_attempts,
         verified_count,
         accepted.len()
     );
-        (accepted, candidate_pairs.len(), verified_count)
+    eprintln!(
+        "[{}] profile: forward lightglue={:.1}s pnp={:.1}s ({} calls); backward(reciprocal) lightglue={:.1}s pnp={:.1}s ({} calls)",
+        args.sequence,
+        forward_timing.lightglue.as_secs_f64(),
+        forward_timing.pnp.as_secs_f64(),
+        forward_attempts,
+        backward_timing.lightglue.as_secs_f64(),
+        backward_timing.pnp.as_secs_f64(),
+        backward_attempts
+    );
+        let profile = ProfileStats {
+            image_load_s: image_load_total.as_secs_f64(),
+            sp_extract_s: sp_extract_total.as_secs_f64(),
+            sp_extract_calls: keyframe_ids.len() * 2,
+            stereo_lightglue_s: stereo_lg_total.as_secs_f64(),
+            stereo_lightglue_calls: keyframe_ids.len(),
+            nms_skipped,
+            forward_attempts,
+            forward_lightglue_s: forward_timing.lightglue.as_secs_f64(),
+            forward_pnp_s: forward_timing.pnp.as_secs_f64(),
+            backward_attempts,
+            backward_lightglue_s: backward_timing.lightglue.as_secs_f64(),
+            backward_pnp_s: backward_timing.pnp.as_secs_f64(),
+        };
+        (accepted, candidate_pairs.len(), verified_count, Some(profile))
     };
 
     // ---- 5. Optimize the SE(3) pose graph with GNC ----
@@ -859,7 +941,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "vio_consistency_rotation_per_10m_deg": args.vio_consistency_rotation_per_10m_deg,
             "loop_weight_scale": args.loop_weight_scale,
             "loop_weight_max": args.loop_weight_max,
+            "nms_window_s": args.nms_window_s,
+            "sp_max_keypoints": args.sp_max_keypoints,
         },
+        "profile": profile.as_ref().map(|p| serde_json::json!({
+            "image_load_s": p.image_load_s,
+            "sp_extract_s": p.sp_extract_s,
+            "sp_extract_calls": p.sp_extract_calls,
+            "stereo_lightglue_s": p.stereo_lightglue_s,
+            "stereo_lightglue_calls": p.stereo_lightglue_calls,
+            "nms_skipped": p.nms_skipped,
+            "forward_attempts": p.forward_attempts,
+            "forward_lightglue_s": p.forward_lightglue_s,
+            "forward_pnp_s": p.forward_pnp_s,
+            "backward_attempts": p.backward_attempts,
+            "backward_lightglue_s": p.backward_lightglue_s,
+            "backward_pnp_s": p.backward_pnp_s,
+        })),
     });
     fs::write(
         args.out_dir.join("stats.json"),
@@ -881,12 +979,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// correspondences in the DS normalized plane, and run PnP RANSAC. Returns
 /// the RANSAC report plus the correspondence count (for the inlier-ratio
 /// gate) or `None` if there are too few matches to attempt PnP.
+struct SolveTiming {
+    lightglue: std::time::Duration,
+    pnp: std::time::Duration,
+}
+
+/// Wall-time / call-count profile of the full (non-`--reuse-loops`) pass,
+/// written to `stats.json` for the per-sequence timing report.
+struct ProfileStats {
+    image_load_s: f64,
+    sp_extract_s: f64,
+    sp_extract_calls: usize,
+    stereo_lightglue_s: f64,
+    stereo_lightglue_calls: usize,
+    nms_skipped: usize,
+    forward_attempts: usize,
+    forward_lightglue_s: f64,
+    forward_pnp_s: f64,
+    backward_attempts: usize,
+    backward_lightglue_s: f64,
+    backward_pnp_s: f64,
+}
+
 fn solve_relative_pose(
     reference: &KeyframeData,
     query: &KeyframeData,
     matcher: &LightGlueOnnxMatcher,
     pnp_ransac: &PnPRansac,
     identity_camera: &GenericCamera,
+    timing: &mut SolveTiming,
 ) -> Option<(visloc_rs::RansacReport, usize)> {
     let ref_keypoints: Vec<Point2<f64>> = reference
         .landmarks
@@ -898,6 +1019,7 @@ fn solve_relative_pose(
         .iter()
         .map(|lm| reference.cam0_features.descriptors[lm.keypoint_index].clone())
         .collect();
+    let t = Instant::now();
     let matches = matcher
         .match_features(
             &ref_keypoints,
@@ -906,6 +1028,7 @@ fn solve_relative_pose(
             &query.cam0_features.descriptors,
         )
         .ok()?;
+    timing.lightglue += t.elapsed();
 
     let mut correspondences = Vec::with_capacity(matches.len());
     for m in &matches {
@@ -922,7 +1045,9 @@ fn solve_relative_pose(
     if count < pnp_ransac.pose_estimator.min_correspondences {
         return None;
     }
+    let t = Instant::now();
     let report = pnp_ransac.estimate(&correspondences, identity_camera)?;
+    timing.pnp += t.elapsed();
     Some((report, count))
 }
 
