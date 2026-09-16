@@ -423,6 +423,14 @@ pub struct BasaltVioEstimator {
     prior: Option<WindowPrior>,
     anchor_point: Option<DVector<f64>>,
     gravity_world: Option<Vector3<f64>>,
+    /// Optional override for the body-frame "up" (specific-force) direction
+    /// used to set the first camera's roll/pitch.  `None` keeps the upstream
+    /// single-sample initialization; callers can populate it from a
+    /// gyro-compensated accelerometer window (see
+    /// [`crate::initialization::estimate_up_body_from_window`]) so a sequence
+    /// that starts while the device is still rotating does not bake several
+    /// degrees of gravity misalignment into the world frame.
+    pub initial_up_body_override: Option<Vector3<f64>>,
     /// Mirrors upstream `SqrtKeypointVioEstimator::opt_started`: the first
     /// four inserted states are prediction/observation accumulation only;
     /// optimization starts once the fifth state makes `frame_states.size() >
@@ -542,6 +550,7 @@ impl BasaltVioEstimator {
             // option preserves the existing test/configuration seam, while
             // the production default is the upstream constant.
             gravity_world: Some(Vector3::new(0.0, 0.0, -9.81)),
+            initial_up_body_override: None,
             opt_started: false,
             take_kf: true,
             frames_after_kf: 0,
@@ -889,6 +898,7 @@ impl BasaltVioEstimator {
                 timestamp_ns,
                 initialization_samples,
                 self.config.scalar_mode,
+                self.initial_up_body_override,
             );
         }
         let initialization_output =
@@ -4124,12 +4134,23 @@ fn initial_nav_from_imu(
     timestamp_ns: i64,
     samples: &[ImuSample],
     scalar_mode: ScalarMode,
+    up_override: Option<Vector3<f64>>,
 ) -> BasaltNavState {
     let sample = samples
         .iter()
         .find(|sample| sample.timestamp_ns >= timestamp_ns)
         .or_else(|| samples.last());
-    let rotation = if scalar_mode == ScalarMode::UpstreamF32 {
+    let rotation = if let Some(up) = up_override {
+        // Caller-supplied body "up" (e.g. a gyro-compensated accelerometer
+        // window).  The override is outside the pinned upstream
+        // initialization, so it always uses the f64 path.
+        if up.norm_squared() > 1.0e-18 && up.iter().all(|value| value.is_finite()) {
+            UnitQuaternion::rotation_between(&up.normalize(), &Vector3::z_axis())
+                .unwrap_or_else(UnitQuaternion::identity)
+        } else {
+            UnitQuaternion::identity()
+        }
+    } else if scalar_mode == ScalarMode::UpstreamF32 {
         sample
             .and_then(|sample| {
                 let accel = sample.accel_m_s2.map(|value| value as f32);
@@ -6272,7 +6293,7 @@ mod tests {
                 Vector3::new(0.0, 2.0, 0.0),
             ),
         ];
-        let state = initial_nav_from_imu(100, &samples, ScalarMode::ExtendedF64);
+        let state = initial_nav_from_imu(100, &samples, ScalarMode::ExtendedF64, None);
         let aligned = state
             .imu_to_world
             .rotation

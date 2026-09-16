@@ -100,6 +100,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut adapter =
         BasaltVioEstimatorAdapter::from_config(dataset.calibration(), dataset.config())?;
+    // Opt-in: derive the initial body "up" from a short gyro-compensated
+    // accelerometer window instead of the single sample upstream uses, so a
+    // sequence that starts while the device is still rotating does not bake a
+    // gravity misalignment into the world frame.
+    if let Ok(window_ms) = env::var("BASALT_INIT_GRAVITY_WINDOW_MS") {
+        let window_ms: i64 = window_ms.parse().map_err(|_| {
+            "BASALT_INIT_GRAVITY_WINDOW_MS must be an integer number of milliseconds".to_string()
+        })?;
+        if window_ms > 0 {
+            let first_timestamp_ns = dataset.frame(0)?.timestamp_ns;
+            if let Some(up) = visloc_basalt::initialization::estimate_up_body_from_window(
+                dataset.imu_samples(),
+                first_timestamp_ns,
+                window_ms * 1_000_000,
+            ) {
+                eprintln!(
+                    "basalt_euroc_vio_demo: initial up override from {window_ms} ms gyro-compensated window: {:?}",
+                    up.normalize()
+                );
+                adapter.estimator.initial_up_body_override = Some(up);
+            } else {
+                eprintln!(
+                    "basalt_euroc_vio_demo: BASALT_INIT_GRAVITY_WINDOW_MS={window_ms} produced no estimate; using single-sample init"
+                );
+            }
+        }
+    }
     let frame_limit = args
         .max_frames
         .unwrap_or(dataset.frame_count())

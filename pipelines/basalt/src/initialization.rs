@@ -98,6 +98,65 @@ pub fn estimate_initial_state(
     })
 }
 
+/// Estimate the body-frame "up" (specific-force) direction over a window that
+/// starts at `start_timestamp_ns`, compensating for device rotation.
+///
+/// Upstream Basalt derives the world frame's roll/pitch from a *single* IMU
+/// sample, which assumes the device is static at the first camera.  On
+/// sequences that start while the wearer is already rotating (LaMAria's
+/// head-worn capture), that one sample can be several degrees off true
+/// gravity.  Here every accelerometer sample in the window is rotated into the
+/// start frame with the gyro before averaging, so a pure rotation cancels out
+/// and the mean is a much more stable estimate.  It is still biased by genuine
+/// linear acceleration, so callers should keep the window short (~0.2 s) and
+/// treat the result as an opt-in improvement over the single-sample default.
+pub fn estimate_up_body_from_window(
+    samples: &[ImuSample],
+    start_timestamp_ns: i64,
+    window_ns: i64,
+) -> Option<Vector3<f64>> {
+    if window_ns <= 0 {
+        return None;
+    }
+    let end_timestamp_ns = start_timestamp_ns.saturating_add(window_ns);
+    let mut rotation = UnitQuaternion::identity();
+    let mut previous: Option<ImuSample> = None;
+    let mut accel_sum = Vector3::zeros();
+    let mut count = 0usize;
+    for sample in samples {
+        if sample.timestamp_ns < start_timestamp_ns {
+            previous = Some(*sample);
+            continue;
+        }
+        if sample.timestamp_ns > end_timestamp_ns {
+            break;
+        }
+        if let Some(previous) = previous {
+            let dt = (sample.timestamp_ns - previous.timestamp_ns) as f64 * 1e-9;
+            if dt > 0.0 && dt.is_finite() {
+                rotation *= UnitQuaternion::from_scaled_axis(sample.gyro_rad_s * dt);
+            }
+        }
+        let accel = sample.accel_m_s2;
+        if accel.iter().all(|value| value.is_finite()) && accel.norm_squared() > 1.0e-18 {
+            // `rotation` maps body@start vectors to body@sample-relative-to-start,
+            // so rotating the measured specific force by it returns the start-frame
+            // direction.
+            accel_sum += rotation.transform_vector(&accel);
+            count += 1;
+        }
+        previous = Some(*sample);
+    }
+    if count < 2 {
+        return None;
+    }
+    let mean = accel_sum / count as f64;
+    if !mean.iter().all(|value| value.is_finite()) || mean.norm_squared() <= 1.0e-18 {
+        return None;
+    }
+    Some(mean)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +229,33 @@ mod tests {
             estimate_initial_state(&samples, 500_000_000, InitializationConfig::default()).unwrap();
         assert!((x.preintegrated_to_camera.delta_time - 0.5).abs() < 1e-12);
         assert!((x.preintegrated_to_camera.delta_velocity.x - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn gyro_compensated_window_recovers_up_during_rotation() {
+        // Device rotates about X while gravity stays fixed in the world; the
+        // measured specific force is gravity expressed in the rotating body
+        // frame.  The gyro-compensated mean must recover the body-frame up at
+        // the window start (the axis-angle of `R(t)` applied to world up).
+        let omega = Vector3::new(0.7, 0.0, 0.3); // rad/s
+        let mut samples = Vec::new();
+        for k in 0..=200 {
+            let t = k as i64 * 1_000_000; // 1 kHz, 200 ms
+            let rotation = UnitQuaternion::from_scaled_axis(omega * (t as f64 * 1e-9));
+            let accel = rotation.inverse_transform_vector(&Vector3::new(0.0, 0.0, 9.806));
+            samples.push(s(t, omega, accel));
+        }
+        let up = estimate_up_body_from_window(&samples, 0, 200_000_000).unwrap();
+        let expected = UnitQuaternion::from_scaled_axis(omega * 0.0)
+            .inverse_transform_vector(&Vector3::new(0.0, 0.0, 1.0));
+        assert!(
+            (up.normalize() - expected).norm() < 2.0e-3,
+            "recovered {:?} vs {:?}",
+            up.normalize(),
+            expected
+        );
+        // The naive single-sample direction would be off once rotation is large.
+        let naive = samples[samples.len() - 1].accel_m_s2.normalize();
+        assert!((naive - expected).norm() > 0.1);
     }
 }
