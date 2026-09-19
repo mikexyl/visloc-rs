@@ -1,0 +1,6 @@
+# Add online browser publishing to the already-built RealSense image.
+# No compilation, camera access, or estimator execution during deployment.
+FROM visloc-rs:realsense
+COPY --from=visloc-rs:jetson /usr/local/bin/basalt_stream_vio /usr/local/bin/basalt_stream_vio
+COPY scripts/realsense/live.py scripts/realsense/browser_stream.py /opt/visloc-rs/scripts/realsense/
+COPY tools/browser_viewer/*.py tools/browser_viewer/*.html tools/browser_viewer/*.js tools/browser_viewer/*.css /opt/visloc-rs/tools/browser_viewer/

@@ -230,6 +230,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "image"
+version = "0.25.5"
+source = "git+https://github.com/image-rs/image?rev=317bc1692c134d750360ca9c8e108a08ff534d93#317bc1692c134d750360ca9c8e108a08ff534d93"
+dependencies = [
+ "bytemuck",
+ "byteorder-lite",
+ "num-traits",
+ "png",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -845,7 +856,7 @@ name = "visloc-basalt"
 version = "0.2.0"
 dependencies = [
  "base64",
- "image",
+ "image 0.25.5 (git+https://github.com/image-rs/image?rev=317bc1692c134d750360ca9c8e108a08ff534d93)",
  "nalgebra",
  "serde",
  "serde_json",
@@ -881,7 +892,7 @@ dependencies = [
 name = "visloc-io"
 version = "0.2.0"
 dependencies = [
- "image",
+ "image 0.25.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "nalgebra",
  "thiserror",
  "visloc-core",
@@ -913,7 +924,7 @@ dependencies = [
 name = "visloc-rs"
 version = "0.2.0"
 dependencies = [
- "image",
+ "image 0.25.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "memmap2",
  "nalgebra",
  "ndarray",
@@ -946,6 +957,13 @@ dependencies = [
  "visloc-mapping",
  "visloc-tracking",
  "visloc-vision",
+]
+
+[[package]]
+name = "visloc-tensorrt"
+version = "0.1.0"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

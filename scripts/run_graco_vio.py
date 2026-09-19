@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""Replay a GRACO aerial ROS2 SQLite bag through visloc's Rust VIO.
+
+Reads the source bag without modification or image extraction. Only selected
+grayscale cameras and IMU gyro/acceleration enter the estimator. Ground truth is
+used separately by visualization and by the final trajectory evaluation.
+"""
+import argparse
+import csv
+import hashlib
+import json
+from pathlib import Path
+import sqlite3
+import struct
+import subprocess
+import time
+
+import cv2
+import numpy as np
+import rerun as rr
+import rerun.blueprint as rrb
+from rosbags.typesys import Stores, get_typestore
+from scipy.spatial.transform import Rotation
+import yaml
+
+from evaluate_euroc_trajectory import evaluate
+
+REPO = Path(__file__).resolve().parents[1]
+DEFAULT_CALIBRATION = Path('/data/graco/aerial-calibration-20251121T084428Z-1-001/aerial-calibration')
+
+
+def stamp_ns(message):
+    stamp = message.header.stamp
+    return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+
+
+def xyz(value):
+    return [value.x, value.y, value.z]
+
+
+def prepare_calibration(source, output, width, stereo_refinement=None, rectify=False):
+    names = ('stereo.yaml', 'stereo-imu.yaml', 'imu.yaml')
+    stereo, extrinsics, imu = [yaml.safe_load((source / n).read_text()) for n in names]
+    source_hashes = {n: hashlib.sha256((source / n).read_bytes()).hexdigest() for n in names}
+    refinement = json.loads(stereo_refinement.read_text()) if stereo_refinement else None
+    if refinement and refinement.get('schema') != 'visloc.graco.stereo_rotation_refinement.v1':
+        raise ValueError('Unsupported stereo refinement schema')
+    if refinement and refinement['source_sha256'] != source_hashes:
+        raise ValueError('Stereo refinement does not match the source calibration')
+    if refinement:
+        correction_vector = np.asarray(refinement['right_rotation_correction_rotvec'])
+        if correction_vector.shape != (3,) or not np.isfinite(correction_vector).all() or np.linalg.norm(correction_vector) > np.deg2rad(2):
+            raise ValueError('Invalid stereo rotation correction')
+    transforms, intrinsics, maps, resolutions = [], [], [], []
+    for i in range(2):
+        camera = stereo[f'cam{i}']
+        if camera['camera_model'] != 'pinhole' or camera['distortion_model'] != 'radial-tangential':
+            raise ValueError('Expected GRACO pinhole/radial-tangential calibration')
+        w, h = camera['resolution']
+        height = round(h * width / w)
+        fx, fy, cx, cy = camera['intrinsics']
+        k = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1.]])
+        # Resize first using area filtering. OpenCV's resize pixel centers are
+        # (p + .5) * scale - .5; carry that convention into the intrinsics.
+        scaled = k.copy()
+        scaled[0] *= width / w
+        scaled[1] *= height / h
+        scaled[0, 2] += .5 * (width / w - 1)
+        scaled[1, 2] += .5 * (height / h - 1)
+        maps.append(cv2.initUndistortRectifyMap(
+            scaled, np.array(camera['distortion_coeffs']), np.eye(3), scaled,
+            (width, height), cv2.CV_32FC1))
+        transform = np.array(extrinsics[f'T_Imu_cam{i}']['data']).reshape(4, 4)
+        if i == 1 and refinement:
+            # Rotate the right camera axes about its optical center. Keep both
+            # camera centers, the baseline, and the left camera/IMU transform.
+            correction = Rotation.from_rotvec(refinement['right_rotation_correction_rotvec']).as_matrix()
+            transform[:3, :3] = transform[:3, :3] @ correction.T
+        if not np.allclose(transform[3], [0, 0, 0, 1]) or not np.allclose(
+                transform[:3, :3].T @ transform[:3, :3], np.eye(3), atol=1e-6):
+            raise ValueError('Invalid camera-to-IMU rigid transform')
+        quaternion = Rotation.from_matrix(transform[:3, :3]).as_quat()
+        transforms.append(dict(zip(('px', 'py', 'pz', 'qx', 'qy', 'qz', 'qw'),
+                                   [*transform[:3, 3], *quaternion])))
+        intrinsics.append({'camera_type': 'ds', 'intrinsics': {
+            'fx': scaled[0, 0], 'fy': scaled[1, 1], 'cx': scaled[0, 2],
+            'cy': scaled[1, 2], 'xi': 0., 'alpha': 0.}})
+        resolutions.append([width, height])
+    if resolutions[0] != resolutions[1]:
+        raise ValueError('Stereo resolutions differ')
+    if rectify:
+        matrices, camera_transforms = [], []
+        for intr, pose in zip(intrinsics, transforms):
+            v = intr['intrinsics']
+            matrices.append(np.array([[v['fx'], 0, v['cx']], [0, v['fy'], v['cy']], [0, 0, 1.]]))
+            transform = np.eye(4)
+            transform[:3, :3] = Rotation.from_quat([pose[k] for k in ('qx', 'qy', 'qz', 'qw')]).as_matrix()
+            transform[:3, 3] = [pose[k] for k in ('px', 'py', 'pz')]
+            camera_transforms.append(transform)
+        relative = np.linalg.inv(camera_transforms[1]) @ camera_transforms[0]
+        distortion = [np.array(stereo[f'cam{i}']['distortion_coeffs']) for i in range(2)]
+        r0, r1, p0, p1, _, _, _ = cv2.stereoRectify(
+            matrices[0], distortion[0], matrices[1], distortion[1], tuple(resolutions[0]),
+            relative[:3, :3], relative[:3, 3], flags=cv2.CALIB_ZERO_DISPARITY, alpha=0)
+        for i, (rectification, projection) in enumerate(zip((r0, r1), (p0, p1))):
+            k = projection[:3, :3]
+            maps[i] = cv2.initUndistortRectifyMap(matrices[i], distortion[i], rectification,
+                                               k, tuple(resolutions[i]), cv2.CV_32FC1)
+            # Rectification maps original camera coordinates into virtual
+            # camera coordinates; invert it when placing that camera in IMU.
+            q = Rotation.from_matrix(camera_transforms[i][:3, :3] @ rectification.T).as_quat()
+            transforms[i].update(dict(zip(('qx', 'qy', 'qz', 'qw'), q)))
+            intrinsics[i]['intrinsics'].update(fx=k[0, 0], fy=k[1, 1], cx=k[0, 2], cy=k[1, 2])
+    identity = dict(px=0., py=0., pz=0., qx=0., qy=0., qz=0., qw=1.)
+    calibration = {
+        'T_imu_cam': transforms, 'intrinsics': intrinsics, 'resolution': resolutions,
+        'calib_accel_bias': [0.] * 9, 'calib_gyro_bias': [0.] * 12,
+        'imu_update_rate': imu['rate_hz'],
+        'accel_noise_std': [imu['accelerometer_noise_density']] * 3,
+        'gyro_noise_std': [imu['gyroscope_noise_density']] * 3,
+        'accel_bias_std': [imu['accelerometer_random_walk']] * 3,
+        'gyro_bias_std': [imu['gyroscope_random_walk']] * 3,
+        'T_mocap_world': identity, 'T_imu_marker': identity,
+        'mocap_time_offset_ns': 0, 'mocap_to_imu_offset_ns': 0, 'cam_time_offset_ns': 0,
+    }
+    (output / 'basalt_calibration.json').write_text(json.dumps({'value0': calibration}, indent=2) + '\n')
+    report = {
+        'source': str(source),
+        'source_sha256': source_hashes,
+        'baseline_m': float(np.linalg.norm(
+            [transforms[0][k] - transforms[1][k] for k in ('px', 'py', 'pz')])),
+        'resolution': resolutions, 'imu_rate_hz': imu['rate_hz'],
+        'image_processing': 'area resize then radtan undistortion; unchanged camera axes; exact pinhole DS (xi=alpha=0)',
+        'camera_time_offset_ns': 0,
+        'camera_time_offset_note': 'Use synchronized bag header timestamps; aerial calibration provides no time shift.',
+        'intrinsics_source': 'stereo.yaml, matching stereo-imu.yaml, rather than bag CameraInfo',
+        'stereo_refinement': str(stereo_refinement) if stereo_refinement else None,
+        'stereo_rectified': rectify,
+    }
+    if rectify:
+        report['image_processing'] = 'area resize then stereo rectification; virtual camera axes and common intrinsics carried into Basalt calibration'
+    if refinement:
+        (output / 'stereo_refinement.json').write_text(json.dumps(refinement, indent=2) + '\n')
+    (output / 'calibration_report.json').write_text(json.dumps(report, indent=2) + '\n')
+    return calibration, maps, [stereo[f'cam{i}']['resolution'] for i in range(2)]
+
+
+class Bag:
+    def __init__(self, path):
+        metadata = yaml.safe_load((path / 'metadata.yaml').read_text())['rosbag2_bagfile_information']
+        files = metadata['relative_file_paths']
+        if metadata['storage_identifier'] != 'sqlite3' or len(files) != 1:
+            raise ValueError('Expected one uncompressed ROS2 SQLite database')
+        self.connection = sqlite3.connect((path / files[0]).resolve().as_uri() + '?mode=ro', uri=True)
+        self.types = get_typestore(Stores.ROS2_HUMBLE)
+        self.topics = {name: (tid, typ) for tid, name, typ in self.connection.execute('SELECT id,name,type FROM topics')}
+
+    def messages(self, topic):
+        tid, typ = self.topics[topic]
+        for (data,) in self.connection.execute('SELECT data FROM messages WHERE topic_id=? ORDER BY timestamp', (tid,)):
+            yield self.types.deserialize_cdr(data, typ)
+
+    def stereo_index(self):
+        # Index small row IDs; image blobs are fetched only for the current pair.
+        indices = []
+        for side in ('left', 'right'):
+            tid, _ = self.topics[f'/camera_{side}/image_raw']
+            rows = self.connection.execute('SELECT timestamp,id FROM messages WHERE topic_id=? ORDER BY timestamp', (tid,)).fetchall()
+            index = dict(rows)
+            if len(index) != len(rows):
+                raise ValueError(f'Duplicate {side} image timestamps')
+            indices.append(index)
+        if indices[0].keys() != indices[1].keys() or not indices[0]:
+            raise ValueError('Stereo images must have exactly matching bag timestamps')
+        return [(t, indices[0][t], indices[1][t]) for t in sorted(indices[0])]
+
+    def image(self, row_id, expected_stamp, resolution):
+        data = self.connection.execute('SELECT data FROM messages WHERE id=?', (row_id,)).fetchone()[0]
+        message = self.types.deserialize_cdr(data, 'sensor_msgs/msg/Image')
+        if stamp_ns(message) != expected_stamp:
+            raise ValueError('Image header and bag timestamps differ; explicit synchronization required')
+        if message.encoding != 'mono8' or [message.width, message.height] != resolution:
+            raise ValueError('Expected mono8 images at the calibrated resolution')
+        return np.asarray(message.data).reshape(message.height, message.step)[:, :message.width]
+
+
+def load_imu(bag):
+    samples = [[stamp_ns(m), *xyz(m.angular_velocity), *xyz(m.linear_acceleration)]
+               for m in bag.messages('/gnss/imu')]
+    stamps = np.array([s[0] for s in samples], dtype=np.int64)
+    if len(samples) < 2 or np.any(np.diff(stamps) <= 0) or not np.isfinite(np.array(samples)[:, 1:]).all():
+        raise ValueError('IMU samples must be finite and strictly ordered')
+    return samples, stamps
+
+
+def load_truth(bag, output):
+    truth = []
+    if '/gnss/ground_truth' not in bag.topics:
+        return truth
+    with (output / 'ground_truth.csv').open('w') as stream:
+        writer = csv.writer(stream)
+        writer.writerow(['#timestamp_ns', 'px', 'py', 'pz', 'qw', 'qx', 'qy', 'qz'])
+        for m in bag.messages('/gnss/ground_truth'):
+            p, q = m.pose.pose.position, m.pose.pose.orientation
+            t = stamp_ns(m)
+            truth.append((t, np.array(xyz(p)), Rotation.from_quat([q.x, q.y, q.z, q.w]).as_matrix()))
+            writer.writerow([t, *xyz(p), q.w, q.x, q.y, q.z])
+    return truth
+
+
+def init_rerun(args, calibration):
+    rr.init(f'visloc_GRACO_{args.bag.name}')
+    sinks = [rr.FileSink(args.output / 'playback.rrd')]
+    if args.rerun_connect:
+        sinks.append(rr.GrpcSink(args.rerun_connect))
+    rr.set_sinks(*sinks)
+    rr.send_blueprint(rrb.Blueprint(
+        rrb.Horizontal(
+            rrb.Spatial3DView(origin='world', name='VIO, active landmarks, and reference'),
+            rrb.Vertical(
+                rrb.Spatial2DView(origin='stereo/cam0', name='Left camera (undistorted)'),
+                rrb.Spatial2DView(origin='stereo/cam1', name=(
+                    'Right camera (preview only)' if args.camera_mode == 'mono' else 'Right camera (undistorted)')),
+                rrb.TimeSeriesView(origin='metrics/tracks', name='Visual observations'),
+                rrb.TimeSeriesView(origin='metrics/timing', name='VIO processing (ms)')),
+            column_shares=[2, 1]),
+        rrb.TimePanel(state='expanded', timeline='elapsed', play_state='Following')))
+    rr.log('world', rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
+    rr.log('notes', rr.TextDocument(
+        f'Blue: sensor-only visloc/Basalt {args.camera_mode} VIO. Orange: active landmarks. '
+        'Gray: GRACO ground truth transformed to match the first VIO body pose, '
+        'for display only. Final evaluation uses full-run rigid SE(3) alignment. '
+        'Images are resized and undistorted using the aerial calibration. '
+        'GNSS position and IMU orientation are never sent to the estimator. '
+        + ('Mono mode uses the left camera and IMU; the right image is a preview only.'
+           if args.camera_mode == 'mono' else 'Stereo mode uses both cameras and IMU.')), static=True)
+    for i, transform in enumerate(calibration['T_imu_cam']):
+        path = f'world/body/cam{i}'
+        rr.log(path, rr.Transform3D(
+            translation=[transform[k] for k in ('px', 'py', 'pz')],
+            quaternion=rr.Quaternion(xyzw=[transform[k] for k in ('qx', 'qy', 'qz', 'qw')])), static=True)
+        intrinsics = calibration['intrinsics'][i]['intrinsics']
+        rr.log(path + '/frustum', rr.Pinhole(
+            focal_length=[intrinsics['fx'], intrinsics['fy']],
+            principal_point=[intrinsics['cx'], intrinsics['cy']],
+            resolution=calibration['resolution'][i], image_plane_distance=.5), static=True)
+
+
+def replay(args):
+    args.output.mkdir(parents=True, exist_ok=False)
+    cv2.setNumThreads(2)
+    calibration, maps, raw_sizes = prepare_calibration(args.calibration_dir, args.output, args.width, args.stereo_refinement, args.rectify)
+    config = json.loads(args.config.read_text())
+    (args.output / 'basalt_config.json').write_text(json.dumps(config, indent=2) + '\n')
+    bag = Bag(args.bag)
+    try:
+        frames = bag.stereo_index()
+        imu, imu_stamps = load_imu(bag)
+        truth = load_truth(bag, args.output)
+        truth_stamps = np.array([p[0] for p in truth], dtype=np.int64)
+        requested = len(frames)
+        if args.max_frames:
+            frames = frames[:args.max_frames]
+        if imu_stamps[0] > frames[0][0] or imu_stamps[-1] < frames[-1][0]:
+            raise ValueError('IMU does not cover the requested camera interval')
+        init_rerun(args, calibration)
+        width, height = calibration['resolution'][0]
+        print(f'Replaying {len(frames)}/{requested} stereo pairs, {len(imu)} IMU samples, {width}x{height}; estimator={args.camera_mode}', flush=True)
+        started = time.monotonic()
+        positions, estimates, timings, observations = [], [], [], []
+        imu_index = 0
+        initial_index = int(np.searchsorted(imu_stamps, frames[0][0], side='left'))
+        gt_rotation, gt_translation = np.eye(3), np.zeros(3)
+        with (args.output / 'vio_stderr.log').open('w') as error_log:
+            process = subprocess.Popen([
+                str(args.binary), str(args.output / 'basalt_calibration.json'),
+                str(args.output / 'basalt_config.json'), str(args.output),
+                '--scalar-mode', args.scalar_mode, '--camera-mode', args.camera_mode],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=error_log)
+            try:
+                for index, (stamp, left_id, right_id) in enumerate(frames):
+                    images = [cv2.remap(
+                        cv2.resize(bag.image(row, stamp, raw_sizes[i]), (width, height), interpolation=cv2.INTER_AREA),
+                        *maps[i], cv2.INTER_LINEAR) for i, row in enumerate((left_id, right_id))]
+                    end = int(np.searchsorted(imu_stamps, stamp, side='right'))
+                    header = json.dumps({
+                        'timestamp_ns': stamp, 'width': width, 'height': height,
+                        'imu': imu[imu_index:end], 'initialization_imu': imu[initial_index],
+                    }, allow_nan=False).encode()
+                    process.stdin.write(struct.pack('<I', len(header)) + header)
+                    for image in images:
+                        process.stdin.write(image.tobytes())
+                    process.stdin.flush()
+                    line = process.stdout.readline()
+                    if not line:
+                        raise RuntimeError(f'VIO stopped at frame {index}; see {args.output / "vio_stderr.log"}')
+                    result = json.loads(line)
+                    if result['timestamp_ns'] != stamp or result['frame_id'] != index:
+                        raise RuntimeError('VIO acknowledgement does not match the sensor frame')
+                    imu_index = end
+                    p = np.array(result['position'])
+                    rotation = Rotation.from_quat(result['quaternion_xyzw']).as_matrix()
+                    positions.append(p)
+                    estimates.append((stamp, p, rotation))
+                    timings.append(result['process_ms'])
+                    observations.append(result['observations'])
+                    elapsed = (stamp - frames[0][0]) / 1e9
+                    rr.set_time('elapsed', duration=elapsed)
+                    if index == 0 and truth:
+                        nearest = int(np.argmin(np.abs(truth_stamps - stamp)))
+                        if abs(int(truth_stamps[nearest]) - stamp) > 10_000_000:
+                            raise ValueError('Ground truth does not match the initial image timestamp')
+                        gt_rotation = rotation @ truth[nearest][2].T
+                        gt_translation = p - gt_rotation @ truth[nearest][1]
+                        rr.log('world/ground_truth_trajectory', rr.LineStrips3D(
+                            [np.array([x[1] for x in truth]) @ gt_rotation.T + gt_translation],
+                            colors=[160, 160, 160]), static=True)
+                    rr.log('world/body', rr.Transform3D(translation=p, mat3x3=rotation))
+                    rr.log('world/current_vio', rr.Points3D([p], colors=[40, 160, 255], radii=.1))
+                    if index % 10 == 0 or index + 1 == len(frames):
+                        rr.log('world/vio_trajectory', rr.LineStrips3D([positions], colors=[40, 160, 255]))
+                    points = np.array([x[1:4] for x in result['map_points']]).reshape(-1, 3)
+                    rr.log('world/active_landmarks', rr.Points3D(points, colors=[255, 180, 60], radii=.045))
+                    for i, image in enumerate(images):
+                        preview = image
+                        if args.preview_width and image.shape[1] > args.preview_width:
+                            preview = cv2.resize(image, (args.preview_width, round(image.shape[0] * args.preview_width / image.shape[1])), interpolation=cv2.INTER_AREA)
+                        rr.log(f'stereo/cam{i}', rr.Image(preview).compress(jpeg_quality=85))
+                        rr.log(f'metrics/tracks/cam{i}', rr.Scalars(result['observations'][i]))
+                    rr.log('metrics/timing/process_ms', rr.Scalars(result['process_ms']))
+                    if truth:
+                        j = int(np.searchsorted(truth_stamps, stamp))
+                        nearest = min((k for k in (j - 1, j) if 0 <= k < len(truth)),
+                                      key=lambda k: abs(int(truth_stamps[k]) - stamp))
+                        if abs(int(truth_stamps[nearest]) - stamp) <= 10_000_000:
+                            rr.log('world/current_ground_truth', rr.Points3D(
+                                [gt_rotation @ truth[nearest][1] + gt_translation],
+                                colors=[160, 160, 160], radii=.1))
+                        else:
+                            rr.log('world/current_ground_truth', rr.Clear(recursive=True))
+                    if index == 0 or (index + 1) % 100 == 0 or index + 1 == len(frames):
+                        print(f'frame={index + 1}/{len(frames)} elapsed={elapsed:.2f}s '
+                              f'tracks={result["observations"]} landmarks={len(points)} '
+                              f'vio_ms={result["process_ms"]:.1f} position={p.round(2).tolist()}', flush=True)
+                process.stdin.close()
+                if process.wait(timeout=30):
+                    raise RuntimeError(f'VIO exited with {process.returncode}; see vio_stderr.log')
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                process.stdout.close()
+                if not process.stdin.closed:
+                    process.stdin.close()
+        summary = {
+            'bag': str(args.bag), 'frames_available': requested, 'frames_processed': len(estimates),
+            'sensor_only': True, 'imu_samples_loaded': len(imu), 'imu_samples_delivered': imu_index,
+            'scalar_mode': args.scalar_mode,
+            'camera_mode': args.camera_mode,
+            'sensor_duration_s': (frames[-1][0] - frames[0][0]) / 1e9,
+            'wall_seconds': time.monotonic() - started,
+            'vio_ms_median': float(np.median(timings)), 'vio_ms_p95': float(np.percentile(timings, 95)),
+            'observations_min': np.min(observations, axis=0).tolist(),
+            'recording': str(args.output / 'playback.rrd'),
+            'visualization_alignment': 'reference transformed to first estimated body pose, no scale correction',
+        }
+        if truth and len(estimates) >= 3:
+            evaluation = evaluate(truth, estimates, 10_000_000)
+            (args.output / 'evaluation.json').write_text(json.dumps(evaluation, indent=2) + '\n')
+            summary['ate_se3_rmse_m'] = evaluation['ate_translation_se3_m']['rmse']
+            summary['diagnostic_scale_to_reference'] = evaluation['sim3_scale']
+            summary['diagnostic_excess_scale_percent'] = (1 / evaluation['sim3_scale'] - 1) * 100
+        (args.output / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+        print(json.dumps(summary, indent=2), flush=True)
+    finally:
+        bag.connection.close()
+        rr.disconnect()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--bag', type=Path, default=Path('/data/graco/aerial-08-25m_ros2'))
+    parser.add_argument('--calibration-dir', type=Path, default=DEFAULT_CALIBRATION)
+    parser.add_argument('--stereo-refinement', type=Path, help='Image-only right-camera rotation refinement from refine_graco_stereo.py')
+    parser.add_argument('--rectify', action='store_true', help='Rectify the stereo pair and transform the camera calibration consistently')
+    parser.add_argument('--config', type=Path, default=REPO / 'configs/graco/aerial_vio.json')
+    parser.add_argument('--binary', type=Path, default=REPO / 'target/release/examples/basalt_stream_vio')
+    parser.add_argument('--output', type=Path, required=True, help='New directory; existing outputs are never overwritten')
+    parser.add_argument('--width', type=int, default=800)
+    parser.add_argument('--scalar-mode', choices=('f32', 'f64'), default='f32', help='Estimator arithmetic; f64 is experimental')
+    parser.add_argument('--camera-mode', choices=('stereo', 'mono'), default='stereo', help='Use both cameras or only the left camera and IMU; both images are previewed')
+    parser.add_argument('--preview-width', type=int, default=800, help='Rerun preview width; 0 keeps processing resolution')
+    parser.add_argument('--max-frames', type=int)
+    parser.add_argument('--rerun-connect', help='Optional viewer URL, e.g. rerun+http://127.0.0.1:9878/proxy')
+    args = parser.parse_args()
+    if args.width < 64 or args.preview_width < 0 or (args.max_frames is not None and args.max_frames < 1):
+        parser.error('width must be >=64 and max frames must be positive')
+    for name in ('bag', 'calibration_dir', 'config', 'binary', 'output'):
+        setattr(args, name, getattr(args, name).resolve())
+    replay(args)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,32 @@
+FROM ubuntu:24.04 AS sdk
+ARG REALSENSE_VERSION=v2.58.4
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake git ca-certificates libusb-1.0-0-dev libudev-dev \
+    python3-dev && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --branch ${REALSENSE_VERSION} https://github.com/realsenseai/librealsense.git /sdk
+RUN cmake -S /sdk -B /sdk/build -DCMAKE_BUILD_TYPE=Release \
+    -DFORCE_RSUSB_BACKEND=ON -DBUILD_PYTHON_BINDINGS=ON \
+    -DPYTHON_EXECUTABLE=/usr/bin/python3 -DBUILD_EXAMPLES=OFF \
+    -DBUILD_GRAPHICAL_EXAMPLES=OFF -DBUILD_TOOLS=OFF -DBUILD_UNIT_TESTS=OFF \
+    -DBUILD_WITH_DDS=OFF -DBUILD_WITH_CUDA=OFF \
+    && cmake --build /sdk/build -j3 && cmake --install /sdk/build \
+    && mkdir /python && find /sdk/build -name '*.so' -path '*/wrappers/python/*' -exec cp '{}' /python/ ';'
+RUN cp /sdk/build/Release/pyrealsense2*.so /python/ && cp /sdk/build/Release/pyrsutils*.so /python/
+FROM visloc-rs:jetson
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 PYTHONPATH=/opt/realsense-python
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-opencv python3-scipy python3-yaml libusb-1.0-0 libudev1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=sdk /usr/local/lib/ /usr/local/lib/
+COPY --from=sdk /python/ /opt/realsense-python/
+RUN ldconfig && python3 -c 'import pyrealsense2'
+COPY scripts/realsense/ /opt/visloc-rs/scripts/realsense/
+COPY configs/realsense/ /opt/visloc-rs/configs/realsense/
+RUN apt-get update && apt-get install -y --no-install-recommends python3-venv \
+    && rm -rf /var/lib/apt/lists/* && python3 -m venv /opt/visloc-python
+RUN --mount=type=bind,source=native/rerun-wheels,target=/wheels \
+    /opt/visloc-python/bin/pip install --no-index --find-links=/wheels \
+    rerun-sdk==0.37.2 opencv-python-headless==5.0.0.93 scipy==1.18.1 PyYAML==6.0.3
+ENTRYPOINT ["/opt/visloc-python/bin/python", "/opt/visloc-rs/scripts/realsense/live.py"]
+CMD ["--help"]

@@ -1,0 +1,18 @@
+[Unit]
+Description=Visloc live viewer and controls
+After=network.target
+Wants=docker.service
+
+[Service]
+Type=simple
+User=mikexyl
+Group=mikexyl
+SupplementaryGroups=docker
+WorkingDirectory=/home/mikexyl/workspaces/visloc-rs
+ExecStart=/usr/bin/python3 /home/mikexyl/workspaces/visloc-rs/tools/browser_viewer/live_server.py --port 8090 --controls
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

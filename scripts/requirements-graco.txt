@@ -1,0 +1,5 @@
+-r requirements-rerun.txt
+opencv-python-headless>=4.11,<5
+rosbags>=0.10,<0.12
+PyYAML>=6,<7
+scipy>=1.11,<2

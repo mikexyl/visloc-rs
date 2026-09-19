@@ -1,0 +1,14 @@
+**
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!src/**
+!crates/**
+!pipelines/**
+!examples/**
+!configs/**
+!scripts/evaluate_euroc_trajectory.py
+!docker/jetson/**
+!scripts/realsense/**
+
+!native/rerun-wheels/**

@@ -1,0 +1,109 @@
+{
+  "schema": "visloc.graco.stereo_rotation_refinement.v1",
+  "bag": "/data/graco/aerial-08-25m_ros2",
+  "ground_truth_used": false,
+  "source_sha256": {
+    "stereo.yaml": "2a79f36b811d905e807de5540965497ff85def63632d166c2c9a3c6b8004307e",
+    "stereo-imu.yaml": "a0bcf6582bfe6c92824f02656d8a2a53fb964825554ada6856ea7c9981da05e1",
+    "imu.yaml": "52cf3f88c2a579bb672a637ef905d2ea0a742c9c866c36f2206b5912c8008e04"
+  },
+  "right_rotation_correction_rotvec": [
+    0.0005189015503722324,
+    0.002284928446060133,
+    -0.009451044217461789
+  ],
+  "rotation_correction_degrees": 0.5578984924208299,
+  "preserved": [
+    "intrinsics",
+    "distortion",
+    "camera centers",
+    "baseline",
+    "left camera/IMU transform"
+  ],
+  "checks": [
+    {
+      "frame_index": 200,
+      "timestamp_ns": 1662347502549999952,
+      "split": "train",
+      "inliers": 707,
+      "before_median_p95_px": [
+        3.5750946131894112,
+        7.038157662047689
+      ],
+      "after_median_p95_px": [
+        0.3076401623586908,
+        0.7490605882402204
+      ]
+    },
+    {
+      "frame_index": 400,
+      "timestamp_ns": 1662347512549999952,
+      "split": "train",
+      "inliers": 1238,
+      "before_median_p95_px": [
+        3.3855164757741143,
+        7.36497193502132
+      ],
+      "after_median_p95_px": [
+        0.24314009087413974,
+        0.6977108239105586
+      ]
+    },
+    {
+      "frame_index": 800,
+      "timestamp_ns": 1662347532549999952,
+      "split": "train",
+      "inliers": 1477,
+      "before_median_p95_px": [
+        1.4511644770660275,
+        4.607586818500014
+      ],
+      "after_median_p95_px": [
+        0.3249136552295215,
+        0.781700034247334
+      ]
+    },
+    {
+      "frame_index": 1600,
+      "timestamp_ns": 1662347572549999952,
+      "split": "train",
+      "inliers": 890,
+      "before_median_p95_px": [
+        2.5454804227626897,
+        5.633911905964389
+      ],
+      "after_median_p95_px": [
+        0.1368442861664435,
+        0.731139722631522
+      ]
+    },
+    {
+      "frame_index": 3200,
+      "timestamp_ns": 1662347652549999952,
+      "split": "held_out",
+      "inliers": 1019,
+      "before_median_p95_px": [
+        2.6237237508815276,
+        6.488610041835237
+      ],
+      "after_median_p95_px": [
+        0.22118291368323778,
+        0.6786680896161406
+      ]
+    },
+    {
+      "frame_index": 5000,
+      "timestamp_ns": 1662347742549999952,
+      "split": "held_out",
+      "inliers": 954,
+      "before_median_p95_px": [
+        4.176097872132524,
+        6.776203475326011
+      ],
+      "after_median_p95_px": [
+        0.374300348957765,
+        0.912061335320799
+      ]
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+[package]
+name = "visloc-tensorrt"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+license = "MIT OR Apache-2.0"
+description = "Owned Rust inference sessions over the TensorRT 10/11 C++ runtime"
+
+[features]
+default = []
+native = ["dep:cc"]
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+
+[[example]]
+name = "infer"
+required-features = ["native"]
+
+[[example]]
+name = "validate_megaloc"
+required-features = ["native"]

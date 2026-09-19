@@ -1,0 +1,1 @@
+TensorRT header version: 101302; tensors: [TensorInfo { name: "images", dtype: F32, is_input: true, shape: [1, 3, 322, 322] }, TensorInfo { name: "descriptor", dtype: F32, is_input: false, shape: [1, 8448] }]

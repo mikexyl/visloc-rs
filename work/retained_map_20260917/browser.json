@@ -1,0 +1,38 @@
+{
+  "passed": true,
+  "tests": [
+    "retired points retained",
+    "position correction",
+    "empty window",
+    "cached binary response",
+    "stream isolation",
+    "late join/reload",
+    "30000-point rendering cache",
+    "phone layout",
+    "adaptive capacity preserves old/new coverage",
+    "new-session reset"
+  ],
+  "stats": {
+    "count": 30000,
+    "geometryBytes": 360000,
+    "projectionMs": 15,
+    "cachedRebuilds": 0,
+    "draw20Ms": 19.80000000447035
+  },
+  "bounds": {
+    "count": 16082,
+    "bounds": {
+      "low": [
+        0,
+        0,
+        -1
+      ],
+      "high": [
+        99.80000305175781,
+        29.799999237060547,
+        1
+      ]
+    },
+    "voxel": 0.4
+  }
+}

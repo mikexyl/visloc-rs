@@ -1,0 +1,97 @@
+Loaded model and preprocessed images
+Saved PyTorch reference descriptors
+/home/mikexyl/workspaces/fast_livo2_ws/src/.ros2/research-models/megaloc/megaloc_model.py:456: TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if h % 14 != 0 or w % 14 != 0:
+/home/mikexyl/workspaces/fast_livo2_ws/src/.ros2/research-models/megaloc/megaloc_model.py:318: TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if npatch == N and w == h:
+/home/mikexyl/workspaces/fast_livo2_ws/src/.ros2/research-models/megaloc/megaloc_model.py:328: TracerWarning: Converting a tensor to a Python float might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  M = int(math.sqrt(N))
+/home/mikexyl/workspaces/fast_livo2_ws/src/.ros2/research-models/megaloc/megaloc_model.py:330: TracerWarning: Converting a tensor to a Python float might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  sx = float(w0 + self.interpolate_offset) / M
+/home/mikexyl/workspaces/fast_livo2_ws/src/.ros2/research-models/megaloc/megaloc_model.py:331: TracerWarning: Converting a tensor to a Python float might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  sy = float(h0 + self.interpolate_offset) / M
+/home/mikexyl/workspaces/fast_livo2_ws/src/.ros2/research-models/megaloc/megaloc_model.py:340: TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  assert (w0, h0) == patch_pos_embed.shape[-2:]
+/home/mikexyl/workspaces/fast_livo2_ws/src/.ros2/research-models/megaloc/megaloc_model.py:59: TracerWarning: Converting a tensor to a Python float might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  norm = -torch.tensor(math.log(n + m), device=S.device)
+/home/mikexyl/workspaces/fast_livo2_ws/src/.ros2/research-models/megaloc/megaloc_model.py:59: TracerWarning: torch.tensor results are registered as constants in the trace. You can safely ignore this warning if you use this function to create tensors out of constant variables that would be the same every time you call this function. In any other case, this might cause the trace to be incorrect.
+  norm = -torch.tensor(math.log(n + m), device=S.device)
+/home/mikexyl/workspaces/fast_livo2_ws/src/.ros2/research-models/megaloc/megaloc_model.py:61: TracerWarning: Converting a tensor to a Python float might cause the trace to be incorrect. We can't record the data flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  log_a[-1] = log_a[-1] + math.log(n - m)
+/home/mikexyl/workspaces/dpvo_cbs_ws/src/DPVO/.pixi/envs/default/lib/python3.10/site-packages/torch/onnx/utils.py:631: UserWarning: ONNX Preprocess - Removing mutation from node aten::fill_ on block input: 'aggregator.agg.dust_bin'. This changes graph semantics. (Triggered internally at /opt/conda/conda-bld/pytorch_1716905979055/work/torch/csrc/jit/passes/onnx/remove_inplace_ops_for_onnx.cpp:350.)
+  _C._jit_pass_onnx_remove_inplace_ops_for_onnx(graph, module)
+{
+  "torch": "2.3.1",
+  "onnx": "1.17.0",
+  "gpu": "NVIDIA GeForce RTX 4070 Laptop GPU",
+  "shape": [
+    1,
+    3,
+    322,
+    322
+  ],
+  "output_shape": [
+    1,
+    8448
+  ],
+  "model_source": "/home/mikexyl/workspaces/fast_livo2_ws/src/.ros2/research-models/megaloc",
+  "source_sha256": "e3a66ae823abbbbc5e7975c649419a33036400eaa9fa5a955dd97eaa37f46c75",
+  "weights": "/home/mikexyl/workspaces/fast_livo2_ws/src/.ros2/research-models/megaloc/model.safetensors",
+  "weights_sha256": "d4f9f2bcb60018f91eb6a8e061ed054fd55654e10c2569cf13841ea986ffb4f8",
+  "onnx_sha256": "37dc841cd7891693f17d9e19b0d18608c094169ed88d5e34c4e4126f2498bf31",
+  "images": [
+    {
+      "path": "/data/euroc/MH_03_medium/mav0/cam0/data/1403637130538319104.png",
+      "sha256": "f695c8fef024d384eea83d6cc173c4f7758620ecb9a6467723af7c1552fa8482"
+    },
+    {
+      "path": "/data/euroc/MH_03_medium/mav0/cam0/data/1403637149788318976.png",
+      "sha256": "fcf40340ed1cabd7ca72bc1a05f0fc032b0f0d7ab84838758ab8814503a6c8a1"
+    },
+    {
+      "path": "/data/euroc/MH_03_medium/mav0/cam0/data/1403637169088318976.png",
+      "sha256": "4bf9ca3e29a2bb22b261568f87dd31753c3526175aa06cd461feaf9383a49e88"
+    },
+    {
+      "path": "/data/euroc/MH_03_medium/mav0/cam0/data/1403637188338319104.png",
+      "sha256": "c0f3ca79c08afe127a797f84dd4f72e34ebcb560696756abaa3b4dde100ad146"
+    },
+    {
+      "path": "/data/euroc/MH_03_medium/mav0/cam0/data/1403637207638319104.png",
+      "sha256": "1da6c95d80e74a5a9ce2819d1725ef54e5ae8b75bdb1cc6b115330bd6f1e069a"
+    },
+    {
+      "path": "/data/euroc/MH_03_medium/mav0/cam0/data/1403637226888318976.png",
+      "sha256": "d2d5f070b3a2a561684c1f74ae37dc08cd96b8e691e58d58769c2446509160c6"
+    },
+    {
+      "path": "/data/euroc/MH_03_medium/mav0/cam0/data/1403637246188318976.png",
+      "sha256": "26803a0a287d8832f0b8f142fffed98ba738f4f49ee7c8f86145bc641f463030"
+    },
+    {
+      "path": "/data/euroc/MH_03_medium/mav0/cam0/data/1403637265488318976.png",
+      "sha256": "f075357b07c5093d99a2a1138a87b8c7b1d80d6347082ac4bf57511817049dc6"
+    }
+  ],
+  "preprocessing": "RGB; ToTensor; ImageNet Normalize; Resize 322x322 bilinear antialias=True",
+  "pytorch_host_to_host_ms": [
+    24.840255002345657,
+    25.086720001127105,
+    21.01775199844269,
+    27.902485002414323,
+    27.88263399997959,
+    25.032241999724647,
+    25.180617998557864,
+    22.792575000494253
+  ],
+  "reference_norms": [
+    0.9999999403953552,
+    1.0,
+    1.0,
+    0.9999999403953552,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "passed": true,
+  "start_visible": true,
+  "start_enabled": true,
+  "stop_visible": true,
+  "stop_enabled": false,
+  "resources": {
+    "sequence": 92,
+    "timestamp": 1789661843.483165,
+    "cpu_percent": 57.12451861360719,
+    "memory": {
+      "used_bytes": 1918398464,
+      "total_bytes": 16355569664,
+      "percent": 11.729328316962008
+    },
+    "gpus": [
+      {
+        "id": "jetson-integrated",
+        "name": "Jetson integrated GPU",
+        "percent": 0,
+        "memory": null,
+        "memory_kind": "shared",
+        "temperature_c": null,
+        "source": "sysfs"
+      }
+    ],
+    "errors": []
+  },
+  "errors": []
+}

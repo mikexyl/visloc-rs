@@ -1,0 +1,38 @@
+{
+  "images": 8,
+  "descriptor_dimensions": 8448,
+  "minimum_descriptor_cosine": 0.9999999999590219,
+  "max_absolute_descriptor_error": 4.055909812450409e-07,
+  "descriptor_rmse": 7.92923186860642e-08,
+  "maximum_output_norm_error": 6.113209072289294e-08,
+  "max_pairwise_cosine_error": 9.319129334883769e-07,
+  "nearest_neighbor_agreement_excluding_self": 8,
+  "reference_nearest_neighbors": [
+    1,
+    0,
+    3,
+    2,
+    5,
+    4,
+    3,
+    0
+  ],
+  "tensorrt_nearest_neighbors": [
+    1,
+    0,
+    3,
+    2,
+    5,
+    4,
+    3,
+    0
+  ],
+  "median_of_per_image_median_host_to_host_ms": 17.0048,
+  "thresholds": {
+    "min_cosine": 0.9999,
+    "max_absolute_error": 0.001,
+    "max_norm_error": 0.0001
+  },
+  "passed": true,
+  "scope": "Numerical parity on eight sampled frames, not a VPR recall benchmark. Timing includes host/device copies and synchronization, excludes preprocessing and engine loading."
+}

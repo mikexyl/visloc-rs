@@ -116,8 +116,20 @@ pub struct EstimatorStateTrace {
     pub imu_integration_fallback: bool,
 }
 
+/// Optimized T_world_imu, captured before marginalization can erase a keyframe.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyframePoseOutput {
+    pub frame_id: u64,
+    pub timestamp_ns: i64,
+    /// Monotonic sensor-frame version, including unchanged poses.
+    pub version: u64,
+    pub pose: SE3,
+    pub departing: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct EstimatorOutput {
+    pub keyframe_poses: Vec<KeyframePoseOutput>,
     pub frame_id: u64,
     pub state: BasaltNavState,
     pub is_keyframe: bool,
@@ -388,6 +400,7 @@ fn append_triangulation_trace(
 /// all observations of a track before landmark QR elimination.
 #[derive(Debug)]
 pub struct BasaltVioEstimator {
+    keyframe_pose_output_enabled: bool,
     pub camera: DoubleSphereCamera,
     pub config: EstimatorConfig,
     pub stream: BasaltStream,
@@ -525,6 +538,7 @@ impl BasaltVioEstimator {
             calib_gyro_bias: vec![0.0; 12],
             last_timestamp_ns: None,
             last_rows: Vec::new(),
+            keyframe_pose_output_enabled: false,
             window_poses: Vec::new(),
             window_states: Vec::new(),
             of_images: BTreeMap::new(),
@@ -633,12 +647,47 @@ impl BasaltVioEstimator {
         Ok(self)
     }
 
+    /// Opt-in read-only snapshots; does not enable image or MargData retention.
+    pub fn enable_keyframe_pose_output(&mut self, enabled: bool) {
+        self.keyframe_pose_output_enabled = enabled;
+    }
+
+    fn capture_keyframe_poses(&self, version: u64, departing: &[u64]) -> Vec<KeyframePoseOutput> {
+        if !self.keyframe_pose_output_enabled {
+            return Vec::new();
+        }
+        self.window_poses
+            .iter()
+            .filter(|p| p.is_keyframe)
+            .map(|p| (p.frame_id, p.timestamp_ns, p.pose.clone()))
+            .chain(
+                self.window_states
+                    .iter()
+                    .filter(|s| s.is_keyframe)
+                    .map(|s| (s.frame_id, s.timestamp_ns, s.nav.imu_to_world.clone())),
+            )
+            .map(|(frame_id, timestamp_ns, pose)| KeyframePoseOutput {
+                frame_id,
+                timestamp_ns,
+                version,
+                pose,
+                departing: departing.contains(&frame_id),
+            })
+            .collect()
+    }
+
     pub fn active_state_count(&self) -> usize {
         self.window_states.len()
     }
 
     pub fn active_pose_count(&self) -> usize {
         self.window_poses.len()
+    }
+
+    /// Current triangulated landmarks in the estimator's world frame.
+    /// Entries are updated by optimization and removed with the active window.
+    pub fn map_points(&self) -> &BTreeMap<TrackId, Point3<f64>> {
+        &self.landmark_world
     }
 
     pub(crate) fn no_output_mode_active(&self) -> bool {
@@ -951,6 +1000,7 @@ impl BasaltVioEstimator {
         // otherwise a track created by this frame would count as already
         // connected and suppress the keyframe decision.
         let (connected_cam0, unconnected_cam0) = self.cam0_connectivity(observations);
+        let keyframe_poses;
         let is_keyframe = self.decide_keyframe(connected_cam0, unconnected_cam0);
         self.collect_observations(
             frame_id,
@@ -1024,6 +1074,7 @@ impl BasaltVioEstimator {
             // `opt_started || frame_states.size() > 4` gate is false for
             // frames 0..3.  Keep these states and observations causal, while
             // avoiding both solve and landmark writeback until frame 4.
+            keyframe_poses = self.capture_keyframe_poses(frame_id, &[]);
             self.last_rows.clear();
             window_diagnostics = WindowDiagnostics {
                 attempted: false,
@@ -1104,6 +1155,7 @@ impl BasaltVioEstimator {
             self.window_states = problem.states.clone();
             self.apply_landmark_writeback(&problem.landmarks);
             let plan = self.marginalization_plan(frame_id);
+            keyframe_poses = self.capture_keyframe_poses(frame_id, &plan.drop_poses);
             let needs_marginalization = !plan.drop_states.is_empty()
                 || !plan.convert_states.is_empty()
                 || !plan.drop_poses.is_empty();
@@ -1381,6 +1433,7 @@ impl BasaltVioEstimator {
         }
         self.append_lifecycle_trace(frame_id, timestamp_ns, is_keyframe, marginalized);
         Ok(EstimatorOutput {
+            keyframe_poses,
             frame_id,
             state: self.nav.clone(),
             is_keyframe,

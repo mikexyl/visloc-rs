@@ -78,7 +78,7 @@ jobs:
 
       - name: Python tests
         run: |
-          python3 -m pip install --quiet --disable-pip-version-check pillow numpy pytest opencv-python-headless py7zr
+          python3 -m pip install --quiet --disable-pip-version-check pillow numpy pytest opencv-python-headless py7zr -r scripts/requirements-graco.txt
           python3 -m unittest discover -s tests -p 'test_*.py'
           python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
