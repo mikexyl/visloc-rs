@@ -20,8 +20,8 @@ Choose a fresh output directory each time. The setup script creates
 release estimator with AVX2/FMA and LM workspace reuse.
 
 The command above uses **left-camera + IMU VIO**, retaining the supplied
-intrinsics and camera/IMU extrinsics. The right image is previewed but excluded
-from estimation. This avoids the excessive scale seen with stereo constraints
+intrinsics and camera/IMU extrinsics. Only the left image is decoded, displayed,
+and used for estimation. This avoids the excessive scale seen with stereo constraints
 on this sequence; no baseline or trajectory scale adjustment is applied.
 For stereo comparisons, explicitly select `--camera-mode stereo` and optionally
 add `--stereo-refinement configs/graco/aerial-08-25m_stereo_refinement.json`.
@@ -57,9 +57,18 @@ and do **not** validate metric scale during flight.
 
 The default replay processes every stereo pair at 800 × 550 pixels. `--width`
 changes image size with matching intrinsics. The display contains undistorted
-left/right images, blue VIO poses, orange active landmarks, a gray reference
+images from the selected cameras, blue VIO poses, orange active landmarks, a gray reference
 trajectory, observation counts, and estimator processing time. The timeline
 uses sensor time, independent of replay processing speed.
+
+The camera views overlay the frontend's measured **KLT feature tracks**: colored
+points with 12-frame motion trails. Colors follow persistent track IDs, which
+are available when inspecting a point. Lost tracks disappear immediately.
+Overlays follow the preview's resize transform and can be toggled using the
+`features/points` and `features/trails` entities. Mono mode displays tracks on
+the left camera only, with no right-camera pane or frustum; stereo mode displays
+both cameras. Rebuild the stream example
+and replay to add overlays to a recording made before this feature was added.
 
 ## Sensor and coordinate conventions
 

@@ -230,10 +230,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .take(3000)
             .map(|(id, point)| json!([id, point.x, point.y, point.z]))
             .collect();
+        // Export the frontend's measured pixels and persistent IDs for
+        // visualization in the same undistorted image used by tracking.
+        let feature_tracks: Vec<_> = result
+            .tracks
+            .observations
+            .iter()
+            .map(|o| json!([o.camera_id, o.track_id, o.pixel.x, o.pixel.y]))
+            .collect();
         writeln!(
             output,
             "{}",
-            json!({"frame_id":frame_id,"timestamp_ns":t,"position":[p.x,p.y,p.z],"quaternion_xyzw":[q.i,q.j,q.k,q.w],"observations":[c0,c1],"imu_samples":result.imu_count,"process_ms":process_ms,"map_points":map_points})
+            json!({"frame_id":frame_id,"timestamp_ns":t,"position":[p.x,p.y,p.z],"quaternion_xyzw":[q.i,q.j,q.k,q.w],"observations":[c0,c1],"imu_samples":result.imu_count,"process_ms":process_ms,"map_points":map_points,"feature_tracks":feature_tracks})
         )?;
         output.flush()?;
         previous = Some(t);

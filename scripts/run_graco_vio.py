@@ -6,6 +6,8 @@ grayscale cameras and IMU gyro/acceleration enter the estimator. Ground truth is
 used separately by visualization and by the final trajectory evaluation.
 """
 import argparse
+from collections import deque
+import colorsys
 import csv
 import hashlib
 import json
@@ -208,23 +210,29 @@ def load_truth(bag, output):
     return truth
 
 
+def viewer_blueprint(camera_mode):
+    camera_views = [rrb.Spatial2DView(origin='stereo/cam0', name='Left camera + feature tracks')]
+    if camera_mode == 'stereo':
+        camera_views.append(rrb.Spatial2DView(origin='stereo/cam1', name='Right camera + feature tracks'))
+    return rrb.Blueprint(
+        rrb.Horizontal(
+            rrb.Spatial3DView(origin='world', name='VIO, active landmarks, and reference'),
+            rrb.Vertical(
+                *camera_views,
+                rrb.TimeSeriesView(origin='metrics/tracks', name='Visual observations'),
+                rrb.TimeSeriesView(origin='metrics/timing', name='VIO processing (ms)'),
+                row_shares=[3] * len(camera_views) + [1, 1]),
+            column_shares=[1, 1] if camera_mode == 'mono' else [2, 1]),
+        rrb.TimePanel(state='expanded', timeline='elapsed', play_state='Following'))
+
+
 def init_rerun(args, calibration):
     rr.init(f'visloc_GRACO_{args.bag.name}')
     sinks = [rr.FileSink(args.output / 'playback.rrd')]
     if args.rerun_connect:
         sinks.append(rr.GrpcSink(args.rerun_connect))
     rr.set_sinks(*sinks)
-    rr.send_blueprint(rrb.Blueprint(
-        rrb.Horizontal(
-            rrb.Spatial3DView(origin='world', name='VIO, active landmarks, and reference'),
-            rrb.Vertical(
-                rrb.Spatial2DView(origin='stereo/cam0', name='Left camera (undistorted)'),
-                rrb.Spatial2DView(origin='stereo/cam1', name=(
-                    'Right camera (preview only)' if args.camera_mode == 'mono' else 'Right camera (undistorted)')),
-                rrb.TimeSeriesView(origin='metrics/tracks', name='Visual observations'),
-                rrb.TimeSeriesView(origin='metrics/timing', name='VIO processing (ms)')),
-            column_shares=[2, 1]),
-        rrb.TimePanel(state='expanded', timeline='elapsed', play_state='Following')))
+    rr.send_blueprint(viewer_blueprint(args.camera_mode))
     rr.log('world', rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
     rr.log('notes', rr.TextDocument(
         f'Blue: sensor-only visloc/Basalt {args.camera_mode} VIO. Orange: active landmarks. '
@@ -232,9 +240,10 @@ def init_rerun(args, calibration):
         'for display only. Final evaluation uses full-run rigid SE(3) alignment. '
         'Images are resized and undistorted using the aerial calibration. '
         'GNSS position and IMU orientation are never sent to the estimator. '
-        + ('Mono mode uses the left camera and IMU; the right image is a preview only.'
+        + ('Mono mode uses and displays only the left camera and IMU.'
            if args.camera_mode == 'mono' else 'Stereo mode uses both cameras and IMU.')), static=True)
-    for i, transform in enumerate(calibration['T_imu_cam']):
+    camera_count = 1 if args.camera_mode == 'mono' else 2
+    for i, transform in enumerate(calibration['T_imu_cam'][:camera_count]):
         path = f'world/body/cam{i}'
         rr.log(path, rr.Transform3D(
             translation=[transform[k] for k in ('px', 'py', 'pz')],
@@ -244,6 +253,55 @@ def init_rerun(args, calibration):
             focal_length=[intrinsics['fx'], intrinsics['fy']],
             principal_point=[intrinsics['cx'], intrinsics['cy']],
             resolution=calibration['resolution'][i], image_plane_distance=.5), static=True)
+
+
+class FeatureTrackOverlay:
+    """Short, consecutive KLT histories, keyed by camera and persistent ID."""
+
+    def __init__(self, history_length=12):
+        self.history_length = history_length
+        self.histories = {}
+
+    def update(self, observations):
+        current = {}
+        for camera, track_id, x, y in observations:
+            if not np.isfinite([x, y]).all():
+                continue
+            key = (int(camera), int(track_id))
+            history = self.histories.get(key, deque(maxlen=self.history_length))
+            history.append([x, y])
+            current[key] = history
+        # Retire missing observations immediately; a reappearing ID starts
+        # a fresh trail rather than drawing a line across an untracked gap.
+        self.histories = current
+
+    def log(self, camera, source_size, preview_size):
+        path = f'stereo/cam{camera}/features'
+        tracks = [(track_id, history) for (cam, track_id), history in self.histories.items()
+                  if cam == camera]
+        if not tracks:
+            rr.log(path, rr.Clear(recursive=True))
+            return
+        scale = np.array(preview_size) / np.array(source_size)
+        positions, colors, labels, trails, trail_colors = [], [], [], [], []
+        for track_id, history in tracks:
+            hue = ((track_id * 2654435761) & 0xffffffff) / 2**32
+            color = [round(v * 255) for v in colorsys.hsv_to_rgb(hue, .65, 1.)]
+            pixels = (np.asarray(history) + .5) * scale - .5
+            positions.append(pixels[-1])
+            colors.append(color)
+            labels.append(str(track_id))
+            if len(pixels) > 1:
+                trails.append(pixels)
+                trail_colors.append([*color, 180])
+        rr.log(path + '/points', rr.Points2D(
+            positions, colors=colors, radii=rr.Radius.ui_points(2.5),
+            labels=labels, show_labels=False, draw_order=2))
+        if trails:
+            rr.log(path + '/trails', rr.LineStrips2D(
+                trails, colors=trail_colors, radii=rr.Radius.ui_points(.8), draw_order=1))
+        else:
+            rr.log(path + '/trails', rr.Clear(recursive=True))
 
 
 def replay(args):
@@ -265,9 +323,13 @@ def replay(args):
             raise ValueError('IMU does not cover the requested camera interval')
         init_rerun(args, calibration)
         width, height = calibration['resolution'][0]
-        print(f'Replaying {len(frames)}/{requested} stereo pairs, {len(imu)} IMU samples, {width}x{height}; estimator={args.camera_mode}', flush=True)
+        print(f'Replaying {len(frames)}/{requested} camera frames, {len(imu)} IMU samples, {width}x{height}; estimator={args.camera_mode}', flush=True)
+        # The stream wire format has two fixed-size image buffers. In mono
+        # mode its second buffer is discarded; do not decode the right camera.
+        unused_right_image = bytes(width * height) if args.camera_mode == 'mono' else None
         started = time.monotonic()
         positions, estimates, timings, observations = [], [], [], []
+        feature_overlay = FeatureTrackOverlay()
         imu_index = 0
         initial_index = int(np.searchsorted(imu_stamps, frames[0][0], side='left'))
         gt_rotation, gt_translation = np.eye(3), np.zeros(3)
@@ -279,9 +341,10 @@ def replay(args):
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=error_log)
             try:
                 for index, (stamp, left_id, right_id) in enumerate(frames):
+                    image_ids = (left_id,) if args.camera_mode == 'mono' else (left_id, right_id)
                     images = [cv2.remap(
                         cv2.resize(bag.image(row, stamp, raw_sizes[i]), (width, height), interpolation=cv2.INTER_AREA),
-                        *maps[i], cv2.INTER_LINEAR) for i, row in enumerate((left_id, right_id))]
+                        *maps[i], cv2.INTER_LINEAR) for i, row in enumerate(image_ids)]
                     end = int(np.searchsorted(imu_stamps, stamp, side='right'))
                     header = json.dumps({
                         'timestamp_ns': stamp, 'width': width, 'height': height,
@@ -290,6 +353,8 @@ def replay(args):
                     process.stdin.write(struct.pack('<I', len(header)) + header)
                     for image in images:
                         process.stdin.write(image.tobytes())
+                    if unused_right_image is not None:
+                        process.stdin.write(unused_right_image)
                     process.stdin.flush()
                     line = process.stdout.readline()
                     if not line:
@@ -297,6 +362,9 @@ def replay(args):
                     result = json.loads(line)
                     if result['timestamp_ns'] != stamp or result['frame_id'] != index:
                         raise RuntimeError('VIO acknowledgement does not match the sensor frame')
+                    if 'feature_tracks' not in result:
+                        raise RuntimeError('Rebuild basalt_stream_vio to enable feature-track overlays')
+                    feature_overlay.update(result['feature_tracks'])
                     imu_index = end
                     p = np.array(result['position'])
                     rotation = Rotation.from_quat(result['quaternion_xyzw']).as_matrix()
@@ -326,6 +394,7 @@ def replay(args):
                         if args.preview_width and image.shape[1] > args.preview_width:
                             preview = cv2.resize(image, (args.preview_width, round(image.shape[0] * args.preview_width / image.shape[1])), interpolation=cv2.INTER_AREA)
                         rr.log(f'stereo/cam{i}', rr.Image(preview).compress(jpeg_quality=85))
+                        feature_overlay.log(i, (width, height), (preview.shape[1], preview.shape[0]))
                         rr.log(f'metrics/tracks/cam{i}', rr.Scalars(result['observations'][i]))
                     rr.log('metrics/timing/process_ms', rr.Scalars(result['process_ms']))
                     if truth:
@@ -361,6 +430,7 @@ def replay(args):
             'sensor_only': True, 'imu_samples_loaded': len(imu), 'imu_samples_delivered': imu_index,
             'scalar_mode': args.scalar_mode,
             'camera_mode': args.camera_mode,
+            'feature_tracks': 'KLT observations with persistent ID colors and 12-frame trails',
             'sensor_duration_s': (frames[-1][0] - frames[0][0]) / 1e9,
             'wall_seconds': time.monotonic() - started,
             'vio_ms_median': float(np.median(timings)), 'vio_ms_p95': float(np.percentile(timings, 95)),
@@ -392,7 +462,7 @@ def main():
     parser.add_argument('--output', type=Path, required=True, help='New directory; existing outputs are never overwritten')
     parser.add_argument('--width', type=int, default=800)
     parser.add_argument('--scalar-mode', choices=('f32', 'f64'), default='f32', help='Estimator arithmetic; f64 is experimental')
-    parser.add_argument('--camera-mode', choices=('stereo', 'mono'), default='stereo', help='Use both cameras or only the left camera and IMU; both images are previewed')
+    parser.add_argument('--camera-mode', choices=('stereo', 'mono'), default='stereo', help='Use and display both cameras or only the left camera and IMU')
     parser.add_argument('--preview-width', type=int, default=800, help='Rerun preview width; 0 keeps processing resolution')
     parser.add_argument('--max-frames', type=int)
     parser.add_argument('--rerun-connect', help='Optional viewer URL, e.g. rerun+http://127.0.0.1:9878/proxy')
