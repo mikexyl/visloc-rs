@@ -13,6 +13,13 @@ native = ["dep:cc"]
 [build-dependencies]
 cc = { version = "1", optional = true }
 
+[dev-dependencies]
+serde_json = "1"
+
+[[example]]
+name = "infer_fixtures"
+required-features = ["native"]
+
 [[example]]
 name = "infer"
 required-features = ["native"]

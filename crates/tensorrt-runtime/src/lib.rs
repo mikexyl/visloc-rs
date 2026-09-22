@@ -119,6 +119,17 @@ pub struct Output {
     pub data: Vec<u8>,
 }
 impl Output {
+    /// Copies INT64 indices, including an empty data-dependent output.
+    pub fn to_i64(&self) -> Result<Vec<i64>> {
+        if self.info.dtype != DataType::I64 || self.data.len() % 8 != 0 {
+            return Err(Error("Output is not a valid INT64 buffer".into()));
+        }
+        Ok(self
+            .data
+            .chunks_exact(8)
+            .map(|b| i64::from_ne_bytes(b.try_into().unwrap()))
+            .collect())
+    }
     /// Copies FP32 values without requiring the byte buffer to be aligned.
     pub fn to_f32(&self) -> Result<Vec<f32>> {
         if self.info.dtype != DataType::F32 || self.data.len() % 4 != 0 {

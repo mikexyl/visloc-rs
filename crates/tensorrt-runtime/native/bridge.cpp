@@ -62,25 +62,47 @@ size_t byte_size(nvinfer1::Dims dims, nvinfer1::DataType type) {
     }
     return n;
 }
-struct Buffer {
+struct Buffer : nvinfer1::IOutputAllocator {
+    void* allocation = nullptr;
     void* device = nullptr;
     size_t capacity = 0;
     std::vector<uint8_t> host;
+    nvinfer1::Dims shape{};
     Buffer() = default;
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
-    Buffer(Buffer&& other) noexcept : device(other.device), capacity(other.capacity), host(std::move(other.host)) { other.device = nullptr; }
-    ~Buffer() { if (device) cudaFree(device); }
+    Buffer(Buffer&& other) noexcept : allocation(other.allocation), device(other.device), capacity(other.capacity), host(std::move(other.host)), shape(other.shape) { other.allocation = nullptr; other.device = nullptr; }
+    ~Buffer() { if (allocation) cudaFree(allocation); }
     void resize(size_t bytes) {
         if (capacity < std::max(size_t(1), bytes)) {
             void* next = nullptr;
             cuda_check(cudaMalloc(&next, std::max(size_t(1), bytes)));
-            if (device) cudaFree(device);
+            if (allocation) cudaFree(allocation);
+            allocation = next;
             device = next;
             capacity = std::max(size_t(1), bytes);
         }
         host.resize(bytes);
     }
+    void* reallocateOutput(const char*, void*, uint64_t bytes, uint64_t alignment) noexcept override {
+        try {
+            // Some TensorRT outputs require more than cudaMalloc's documented
+            // 256-byte minimum alignment. Retain the base pointer for cudaFree.
+            require(alignment > 0 && (alignment & (alignment-1)) == 0, "Invalid output alignment");
+            const auto wanted = std::max(uint64_t(1), bytes);
+            require(wanted <= std::numeric_limits<size_t>::max() - alignment, "Output allocation overflow");
+            if (capacity < wanted || reinterpret_cast<uintptr_t>(device) % alignment != 0) {
+                void* next = nullptr;
+                cuda_check(cudaMalloc(&next, wanted + alignment - 1));
+                if (allocation) cudaFree(allocation);
+                allocation = next;
+                device = reinterpret_cast<void*>((reinterpret_cast<uintptr_t>(next) + alignment - 1) & ~(alignment - 1));
+                capacity = wanted;
+            }
+            return device;
+        } catch (...) { capture(); return nullptr; }
+    }
+    void notifyShape(const char*, const nvinfer1::Dims& dims) noexcept override { shape = dims; }
 };
 struct Synchronize {
     cudaStream_t stream;
@@ -133,7 +155,7 @@ static void info(TrtSession* s, int i, TrtInfo* out, bool resolved) {
     out->name = s->engine->getIOTensorName(i);
     out->dtype = static_cast<int32_t>(s->engine->getTensorDataType(out->name));
     out->input = s->engine->getTensorIOMode(out->name) == nvinfer1::TensorIOMode::kINPUT;
-    auto dims = resolved ? s->context->getTensorShape(out->name) : s->engine->getTensorShape(out->name);
+    auto dims = resolved ? s->buffers[i].shape : s->engine->getTensorShape(out->name);
     require(dims.nbDims >= 0 && dims.nbDims <= 8, "Invalid tensor rank");
     out->rank = dims.nbDims;
     std::copy_n(dims.d, dims.nbDims, out->dims);
@@ -176,16 +198,33 @@ extern "C" int32_t vt_run(TrtSession* s, const TrtInput* inputs, size_t count, i
         require(s->context->inferShapes(0, nullptr) == 0, "Shape inference failed or has unspecified inputs");
         for (int i = 0; i < vt_count(s); ++i) {
             auto name = s->engine->getIOTensorName(i);
-            auto bytes = byte_size(s->context->getTensorShape(name), s->engine->getTensorDataType(name));
             auto& b = s->buffers[i];
-            b.resize(bytes);
+            b.shape = s->context->getTensorShape(name);
+            bool dynamic = false;
+            for (int d = 0; d < b.shape.nbDims; ++d) dynamic |= b.shape.d[d] < 0;
+            size_t bytes = 0;
+            if (dynamic) {
+                require(!by_index[i], "Unresolved input shape");
+                require(s->context->setOutputAllocator(name, &b), "Cannot set output allocator");
+            } else {
+                bytes = byte_size(b.shape, s->engine->getTensorDataType(name));
+                b.resize(bytes);
+            }
             require(s->context->setTensorAddress(name, b.device), "Cannot bind tensor address");
             if (by_index[i] && bytes) cuda_check(cudaMemcpyAsync(b.device, by_index[i]->data, bytes, cudaMemcpyHostToDevice, s->stream));
         }
         require(s->context->enqueueV3(s->stream), "TensorRT enqueueV3 failed");
+        // Data-dependent output dimensions (e.g. NonZero match indices) are
+        // supplied to notifyShape during execution. Wait before sizing copies.
+        cuda_check(cudaStreamSynchronize(s->stream));
         for (int i = 0; i < vt_count(s); ++i) {
             auto& b = s->buffers[i];
-            if (!by_index[i] && !b.host.empty()) cuda_check(cudaMemcpyAsync(b.host.data(), b.device, b.host.size(), cudaMemcpyDeviceToHost, s->stream));
+            if (!by_index[i]) {
+                auto bytes = byte_size(b.shape, s->engine->getTensorDataType(s->engine->getIOTensorName(i)));
+                require(bytes <= b.capacity, "Output exceeds allocated capacity");
+                b.host.resize(bytes);
+                if (bytes) cuda_check(cudaMemcpyAsync(b.host.data(), b.device, bytes, cudaMemcpyDeviceToHost, s->stream));
+            }
         }
         cuda_check(cudaStreamSynchronize(s->stream));
         s->ready = true;

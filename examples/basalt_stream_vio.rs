@@ -48,12 +48,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut scalar_mode = ScalarMode::UpstreamF32;
     let mut monocular = false;
+    let mut loop_config = None;
     for option in args[4..].chunks_exact(2) {
         match (option[0].as_str(), option[1].as_str()) {
             ("--scalar-mode", "f32") => scalar_mode = ScalarMode::UpstreamF32,
             ("--scalar-mode", "f64") => scalar_mode = ScalarMode::ExtendedF64,
             ("--camera-mode", "stereo") => monocular = false,
             ("--camera-mode", "mono") => monocular = true,
+            ("--online-loop-config", path) => loop_config = Some(PathBuf::from(path)),
             _ => return Err(format!("invalid option: {} {}", option[0], option[1]).into()),
         }
     }
@@ -66,6 +68,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     adapter.estimator.config.scalar_mode = scalar_mode;
     let out = PathBuf::from(&args[3]);
     fs::create_dir_all(&out)?;
+    #[cfg(not(feature = "tensorrt-loop"))]
+    if loop_config.is_some() {
+        return Err("rebuild basalt_stream_vio with --features tensorrt-loop".into());
+    }
+    #[cfg(feature = "tensorrt-loop")]
+    let mut loop_worker = if let Some(path) = loop_config {
+        let c = &calibration.cameras[0];
+        if c.xi != 0.0 || c.alpha != 0.0 {
+            return Err("online loop closure requires undistorted pinhole images".into());
+        }
+        let (w, h) = calibration.resolutions[0];
+        Some(visloc_online_loop::OnlineLoop::start(
+            visloc_online_loop::Config::from_path(path)?,
+            visloc_core::types::Camera::pinhole(0, w, h, c.fx, c.fy, c.cx, c.cy),
+            calibration.camera_to_imu(0).unwrap().clone(),
+            out.clone(),
+        )?)
+    } else {
+        None
+    };
+    #[cfg(feature = "tensorrt-loop")]
+    let (mut keyframe_index, mut published_keyframes, mut dense_poses) = (0u64, 0usize, Vec::new());
     let mut tum = BufWriter::new(
         fs::OpenOptions::new()
             .write(true)
@@ -154,7 +178,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             cam0: RawU16Image::new(
                 width,
                 height,
-                left.into_iter().map(|x| (x as u16) << 8).collect(),
+                left.iter().map(|&x| (x as u16) << 8).collect(),
             )?,
             cam1: (!monocular)
                 .then(|| {
@@ -221,6 +245,43 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         states.flush()?;
         let current_map = adapter.estimator.map_points();
+        #[allow(unused_mut)]
+        let mut loop_update = Value::Null;
+        #[cfg(feature = "tensorrt-loop")]
+        if let Some(worker) = &mut loop_worker {
+            dense_poses.push((t, pose.clone()));
+            // JIST sequences contain actual Basalt keyframes, never raw-frame
+            // intervals. Increment the ordinal even if the bounded queue drops.
+            if result.estimator.is_keyframe {
+                worker.submit(visloc_online_loop::Frame {
+                    id: frame_id,
+                    keyframe_index,
+                    timestamp_ns: t,
+                    width,
+                    height,
+                    gray: left,
+                    body_to_world: pose.clone(),
+                    observations: result
+                        .tracks
+                        .observations
+                        .iter()
+                        .filter(|o| o.camera_id == 0)
+                        .take(1024)
+                        .map(|o| visloc_online_loop::Observation {
+                            track_id: o.track_id,
+                            pixel: o.pixel,
+                            point_world: current_map.get(&o.track_id).copied(),
+                        })
+                        .collect(),
+                })?;
+                keyframe_index += 1;
+            }
+            let status = worker.snapshot()?;
+            if status.keyframes != published_keyframes {
+                loop_update = status.json();
+                published_keyframes = status.keyframes;
+            }
+        }
         let map_points: Vec<_> = current_map
             .iter()
             // Sample the whole active ID range if the visualization budget is
@@ -241,7 +302,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         writeln!(
             output,
             "{}",
-            json!({"frame_id":frame_id,"timestamp_ns":t,"position":[p.x,p.y,p.z],"quaternion_xyzw":[q.i,q.j,q.k,q.w],"observations":[c0,c1],"imu_samples":result.imu_count,"process_ms":process_ms,"map_points":map_points,"feature_tracks":feature_tracks})
+            json!({"frame_id":frame_id,"timestamp_ns":t,"position":[p.x,p.y,p.z],"quaternion_xyzw":[q.i,q.j,q.k,q.w],"observations":[c0,c1],"imu_samples":result.imu_count,"process_ms":process_ms,"map_points":map_points,"feature_tracks":feature_tracks,"is_keyframe":result.estimator.is_keyframe,"loop_closure":loop_update})
         )?;
         output.flush()?;
         previous = Some(t);
@@ -249,6 +310,51 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     if frame_id == 0 {
         return Err("sensor stream ended without frames".into());
+    }
+    #[cfg(feature = "tensorrt-loop")]
+    if let Some(worker) = loop_worker {
+        let final_loop = worker.finish()?;
+        fs::write(
+            out.join("loop_closure.json"),
+            serde_json::to_vec_pretty(&final_loop.json())?,
+        )?;
+        let mut corrected = BufWriter::new(
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(out.join("trajectory_loop.csv"))?,
+        );
+        let mut corrected_tum = BufWriter::new(
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(out.join("trajectory_loop.tum"))?,
+        );
+        writeln!(corrected, "timestamp_ns,tx,ty,tz,qx,qy,qz,qw")?;
+        for (timestamp, raw) in dense_poses {
+            let pose = final_loop.correction_at(timestamp).compose(&raw);
+            let p = pose.translation;
+            let q = pose.rotation.quaternion();
+            writeln!(
+                corrected,
+                "{timestamp},{},{},{},{},{},{},{}",
+                p.x, p.y, p.z, q.i, q.j, q.k, q.w
+            )?;
+            writeln!(
+                corrected_tum,
+                "{:.9} {} {} {} {} {} {} {}",
+                timestamp as f64 * 1e-9,
+                p.x,
+                p.y,
+                p.z,
+                q.i,
+                q.j,
+                q.k,
+                q.w
+            )?;
+        }
+        corrected.flush()?;
+        corrected_tum.flush()?;
     }
     fs::write(
         out.join("summary.json"),

@@ -128,7 +128,8 @@ impl Session {
 
     /// Run all named inputs with the selected optimization profile (usually 0).
     /// Supports static/dynamic execution shapes and LINEAR device I/O.
-    /// Shape-tensor I/O, packed types, and data-dependent output sizes return errors.
+    /// Data-dependent output sizes use an output allocator. Shape-tensor I/O
+    /// and packed types return errors.
     pub fn run(&mut self, inputs: &[Input<'_>], profile: i32) -> Result<Vec<Output>> {
         let mut names = Vec::with_capacity(inputs.len());
         for input in inputs {

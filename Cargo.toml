@@ -27,6 +27,7 @@ members = [
     "pipelines/tracking",
     "pipelines/mapping",
     "pipelines/slam",
+    "pipelines/online-loop",
     "pipelines/fusion",
     "pipelines/basalt",
 ]
@@ -54,6 +55,7 @@ thiserror = "2"
 
 [features]
 default = []
+tensorrt-loop = ["dep:visloc-online-loop", "visloc-online-loop/native"]
 image-io = ["visloc-io/image-io"]
 # Compile-time opt-in for the Basalt timing sidecar and instrumentation.
 # The environment variable is intentionally ignored by the canonical/default
@@ -73,6 +75,7 @@ onnx-inference = ["visloc-vision/onnx-inference", "visloc-slam/onnx-inference", 
 onnx-cuda = ["onnx-inference", "visloc-vision/onnx-cuda"]
 
 [dependencies]
+visloc-online-loop = { path = "pipelines/online-loop", optional = true }
 nalgebra = { workspace = true }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = { workspace = true }

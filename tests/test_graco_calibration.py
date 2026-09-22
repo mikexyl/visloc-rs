@@ -12,11 +12,20 @@ from scipy.spatial.transform import Rotation
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from run_graco_vio import prepare_calibration
+from run_graco_vio import DEFAULT_CALIBRATION, GROUND_CALIBRATION, calibration_for_bag, prepare_calibration
 from refine_graco_stereo import epipolar_error
 
 
 class CalibrationTests(unittest.TestCase):
+    def test_rig_selection_does_not_reuse_aerial_calibration_for_ground(self):
+        for name in ('ground-01', 'ground-03_ros2'):
+            self.assertEqual(calibration_for_bag(Path('/data/graco') / name), GROUND_CALIBRATION)
+        self.assertEqual(calibration_for_bag(Path('/data/graco/aerial-08-25m_ros2')), DEFAULT_CALIBRATION)
+        with self.assertRaisesRegex(ValueError, 'specify --calibration-dir'):
+            calibration_for_bag(Path('/data/renamed-sequence'))
+        override = Path('/custom/calibration')
+        self.assertEqual(calibration_for_bag(Path('/data/renamed-sequence'), override), override)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -52,6 +61,33 @@ class CalibrationTests(unittest.TestCase):
                                   np.array([-.1, .08, .001, .0002]))
         expected = (raw.ravel() + .5) / 2 - .5
         np.testing.assert_allclose([maps[0][0][v, u], maps[0][1][v, u]], expected, atol=2e-5)
+
+    def test_imu_uncertainty_scaling_preserves_geometry_and_source(self):
+        source = {name: (self.root / name).read_bytes() for name in ('imu.yaml', 'stereo.yaml', 'stereo-imu.yaml')}
+        baseline, maps, _ = prepare_calibration(self.root, self.root, 800)
+        for white_scale, bias_scale in ((2., 4.), (.75, .9)):
+            with self.subTest(white_scale=white_scale, bias_scale=bias_scale):
+                scaled, scaled_maps, _ = prepare_calibration(
+                    self.root, self.root, 800, imu_noise_scale=white_scale, imu_bias_scale=bias_scale)
+                scales = dict(accel_noise_std=white_scale, gyro_noise_std=white_scale,
+                              accel_bias_std=bias_scale, gyro_bias_std=bias_scale)
+                for key, value in baseline.items():
+                    if key in scales:
+                        np.testing.assert_allclose(scaled[key], np.array(value) * scales[key])
+                    else:
+                        self.assertEqual(scaled[key], value)
+                for before, after in zip(maps, scaled_maps):
+                    for a, b in zip(before, after):
+                        np.testing.assert_array_equal(a, b)
+                for name, value in source.items():
+                    self.assertEqual((self.root / name).read_bytes(), value)
+                report = json.loads((self.root / 'calibration_report.json').read_text())
+                for key in scales:
+                    self.assertEqual(report['imu_noise_scaling']['effective'][key], scaled[key])
+        for invalid in (0., -1., float('nan'), float('inf')):
+            for name in ('imu_noise_scale', 'imu_bias_scale'):
+                with self.subTest(name=name, value=invalid), self.assertRaisesRegex(ValueError, 'finite and positive'):
+                    prepare_calibration(self.root, self.root, 800, **{name: invalid})
 
     def test_refinement_rotates_right_axes_without_moving_camera_centers(self):
         prepare_calibration(self.root, self.root, 800)

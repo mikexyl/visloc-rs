@@ -1,0 +1,12 @@
+{
+  "engine": "../../.runtime/da3/da3-small-pose-5view-350x504-typed.engine",
+  "library": "../../.runtime/libvisloc_tensorrt.so",
+  "new_area_threshold": 0.3,
+  "history_depth_tolerance": 0.2,
+  "min_coverage_cells": 80,
+  "min_baseline_depth_ratio": 0.005,
+  "min_interval_keyframes": 5,
+  "queue_capacity": 4,
+  "min_confidence": 1.0,
+  "max_windows": 256
+}

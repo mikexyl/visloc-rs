@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay a GRACO aerial ROS2 SQLite bag through visloc's Rust VIO.
+"""Replay a GRACO aerial or ground ROS2 SQLite bag through visloc's Rust VIO.
 
 Reads the source bag without modification or image extraction. Only selected
 grayscale cameras and IMU gyro/acceleration enter the estimator. Ground truth is
@@ -26,9 +26,21 @@ from scipy.spatial.transform import Rotation
 import yaml
 
 from evaluate_euroc_trajectory import evaluate
+from online_da3 import Config as DepthConfig, OnlineDepth, keyframe_from_vio, log_result as log_depth_result
 
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_CALIBRATION = Path('/data/graco/aerial-calibration-20251121T084428Z-1-001/aerial-calibration')
+GROUND_CALIBRATION = Path('/data/graco/ground-calibration')
+
+
+def calibration_for_bag(bag, override=None):
+    if override is not None:
+        return override
+    if bag.name.startswith('ground-'):
+        return GROUND_CALIBRATION
+    if bag.name.startswith('aerial-'):
+        return DEFAULT_CALIBRATION
+    raise ValueError('Cannot infer the GRACO rig from the bag name; specify --calibration-dir')
 
 
 def stamp_ns(message):
@@ -40,7 +52,10 @@ def xyz(value):
     return [value.x, value.y, value.z]
 
 
-def prepare_calibration(source, output, width, stereo_refinement=None, rectify=False):
+def prepare_calibration(source, output, width, stereo_refinement=None, rectify=False,
+                        imu_noise_scale=1.0, imu_bias_scale=1.0):
+    if any(not np.isfinite(v) or v <= 0 for v in (imu_noise_scale, imu_bias_scale)):
+        raise ValueError('IMU noise and bias scales must be finite and positive')
     names = ('stereo.yaml', 'stereo-imu.yaml', 'imu.yaml')
     stereo, extrinsics, imu = [yaml.safe_load((source / n).read_text()) for n in names]
     source_hashes = {n: hashlib.sha256((source / n).read_bytes()).hexdigest() for n in names}
@@ -118,10 +133,10 @@ def prepare_calibration(source, output, width, stereo_refinement=None, rectify=F
         'T_imu_cam': transforms, 'intrinsics': intrinsics, 'resolution': resolutions,
         'calib_accel_bias': [0.] * 9, 'calib_gyro_bias': [0.] * 12,
         'imu_update_rate': imu['rate_hz'],
-        'accel_noise_std': [imu['accelerometer_noise_density']] * 3,
-        'gyro_noise_std': [imu['gyroscope_noise_density']] * 3,
-        'accel_bias_std': [imu['accelerometer_random_walk']] * 3,
-        'gyro_bias_std': [imu['gyroscope_random_walk']] * 3,
+        'accel_noise_std': [imu['accelerometer_noise_density'] * imu_noise_scale] * 3,
+        'gyro_noise_std': [imu['gyroscope_noise_density'] * imu_noise_scale] * 3,
+        'accel_bias_std': [imu['accelerometer_random_walk'] * imu_bias_scale] * 3,
+        'gyro_bias_std': [imu['gyroscope_random_walk'] * imu_bias_scale] * 3,
         'T_mocap_world': identity, 'T_imu_marker': identity,
         'mocap_time_offset_ns': 0, 'mocap_to_imu_offset_ns': 0, 'cam_time_offset_ns': 0,
     }
@@ -132,10 +147,16 @@ def prepare_calibration(source, output, width, stereo_refinement=None, rectify=F
         'baseline_m': float(np.linalg.norm(
             [transforms[0][k] - transforms[1][k] for k in ('px', 'py', 'pz')])),
         'resolution': resolutions, 'imu_rate_hz': imu['rate_hz'],
+        'imu_noise_scaling': {
+            'white_noise_std_scale': imu_noise_scale,
+            'bias_random_walk_std_scale': imu_bias_scale,
+            'effective': {k: calibration[k] for k in
+                          ('accel_noise_std', 'gyro_noise_std', 'accel_bias_std', 'gyro_bias_std')},
+            'note': 'Multipliers apply to standard deviations; covariance scales by their square. Source YAMLs remain unchanged.'},
         'image_processing': 'area resize then radtan undistortion; unchanged camera axes; exact pinhole DS (xi=alpha=0)',
         'camera_time_offset_ns': 0,
-        'camera_time_offset_note': 'Use synchronized bag header timestamps; aerial calibration provides no time shift.',
-        'intrinsics_source': 'stereo.yaml, matching stereo-imu.yaml, rather than bag CameraInfo',
+        'camera_time_offset_note': 'Use synchronized bag header timestamps; supplied calibration provides no time shift.',
+        'intrinsics_source': 'stereo.yaml; camera-to-IMU transforms from stereo-imu.yaml',
         'stereo_refinement': str(stereo_refinement) if stereo_refinement else None,
         'stereo_rectified': rectify,
     }
@@ -210,10 +231,17 @@ def load_truth(bag, output):
     return truth
 
 
-def viewer_blueprint(camera_mode):
+def viewer_blueprint(camera_mode, online_loop=False, online_depth=False):
     camera_views = [rrb.Spatial2DView(origin='stereo/cam0', name='Left camera + feature tracks')]
     if camera_mode == 'stereo':
         camera_views.append(rrb.Spatial2DView(origin='stereo/cam1', name='Right camera + feature tracks'))
+    loop_views = [rrb.TimeSeriesView(origin='metrics/loop', name='Loop closure')] if online_loop else []
+    depth_views = [rrb.Vertical(
+        rrb.Spatial2DView(origin='da3/depth', name='DA3 depth aligned to VIO (metres)'),
+        rrb.Spatial2DView(origin='da3/input', name='DA3 last keyframe'),
+        rrb.TextDocumentView(origin='da3/status', name='DA3 sequence and alignment'),
+        rrb.TimeSeriesView(origin='metrics/da3', name='DA3 coverage and alignment'),
+        row_shares=[3, 2, 1, 1])] if online_depth else []
     return rrb.Blueprint(
         rrb.Horizontal(
             rrb.Spatial3DView(origin='world', name='VIO, active landmarks, and reference'),
@@ -221,8 +249,10 @@ def viewer_blueprint(camera_mode):
                 *camera_views,
                 rrb.TimeSeriesView(origin='metrics/tracks', name='Visual observations'),
                 rrb.TimeSeriesView(origin='metrics/timing', name='VIO processing (ms)'),
-                row_shares=[3] * len(camera_views) + [1, 1]),
-            column_shares=[1, 1] if camera_mode == 'mono' else [2, 1]),
+                *loop_views,
+                row_shares=[3] * len(camera_views) + [1, 1] + [1] * len(loop_views)),
+            *depth_views,
+            column_shares=([2, 1, 1] if online_depth else [1, 1]) if camera_mode == 'mono' else ([2, 1, 1] if online_depth else [2, 1])),
         rrb.TimePanel(state='expanded', timeline='elapsed', play_state='Following'))
 
 
@@ -232,13 +262,18 @@ def init_rerun(args, calibration):
     if args.rerun_connect:
         sinks.append(rr.GrpcSink(args.rerun_connect))
     rr.set_sinks(*sinks)
-    rr.send_blueprint(viewer_blueprint(args.camera_mode))
+    rr.send_blueprint(viewer_blueprint(args.camera_mode, bool(args.online_loop_config), bool(args.da3_config)))
     rr.log('world', rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
     rr.log('notes', rr.TextDocument(
         f'Blue: sensor-only visloc/Basalt {args.camera_mode} VIO. Orange: active landmarks. '
+        + ('Green: loop-corrected trajectory. Magenta: verified loop edges. '
+           if args.online_loop_config else '') +
+        ('Gray-textured dense points: five-keyframe DA3, conditioned on VIO camera poses/intrinsics '
+         'and scaled against VIO landmarks. Depth uses raw VIO coordinates. '
+         if args.da3_config else '') +
         'Gray: GRACO ground truth transformed to match the first VIO body pose, '
         'for display only. Final evaluation uses full-run rigid SE(3) alignment. '
-        'Images are resized and undistorted using the aerial calibration. '
+        'Images are resized and undistorted using the selected rig calibration. '
         'GNSS position and IMU orientation are never sent to the estimator. '
         + ('Mono mode uses and displays only the left camera and IMU.'
            if args.camera_mode == 'mono' else 'Stereo mode uses both cameras and IMU.')), static=True)
@@ -307,10 +342,13 @@ class FeatureTrackOverlay:
 def replay(args):
     args.output.mkdir(parents=True, exist_ok=False)
     cv2.setNumThreads(2)
-    calibration, maps, raw_sizes = prepare_calibration(args.calibration_dir, args.output, args.width, args.stereo_refinement, args.rectify)
+    calibration, maps, raw_sizes = prepare_calibration(
+        args.calibration_dir, args.output, args.width, args.stereo_refinement, args.rectify,
+        args.imu_noise_scale, args.imu_bias_scale)
     config = json.loads(args.config.read_text())
     (args.output / 'basalt_config.json').write_text(json.dumps(config, indent=2) + '\n')
     bag = Bag(args.bag)
+    depth_worker = None
     try:
         frames = bag.stereo_index()
         imu, imu_stamps = load_imu(bag)
@@ -322,6 +360,9 @@ def replay(args):
         if imu_stamps[0] > frames[0][0] or imu_stamps[-1] < frames[-1][0]:
             raise ValueError('IMU does not cover the requested camera interval')
         init_rerun(args, calibration)
+        if args.da3_config:
+            depth_worker = OnlineDepth(DepthConfig.from_path(args.da3_config), args.output / 'da3')
+        depth_keyframe_index = 0
         width, height = calibration['resolution'][0]
         print(f'Replaying {len(frames)}/{requested} camera frames, {len(imu)} IMU samples, {width}x{height}; estimator={args.camera_mode}', flush=True)
         # The stream wire format has two fixed-size image buffers. In mono
@@ -330,14 +371,18 @@ def replay(args):
         started = time.monotonic()
         positions, estimates, timings, observations = [], [], [], []
         feature_overlay = FeatureTrackOverlay()
+        loop_status = None
         imu_index = 0
         initial_index = int(np.searchsorted(imu_stamps, frames[0][0], side='left'))
         gt_rotation, gt_translation = np.eye(3), np.zeros(3)
         with (args.output / 'vio_stderr.log').open('w') as error_log:
-            process = subprocess.Popen([
+            command = [
                 str(args.binary), str(args.output / 'basalt_calibration.json'),
                 str(args.output / 'basalt_config.json'), str(args.output),
-                '--scalar-mode', args.scalar_mode, '--camera-mode', args.camera_mode],
+                '--scalar-mode', args.scalar_mode, '--camera-mode', args.camera_mode]
+            if args.online_loop_config:
+                command.extend(['--online-loop-config', str(args.online_loop_config.resolve())])
+            process = subprocess.Popen(command,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=error_log)
             try:
                 for index, (stamp, left_id, right_id) in enumerate(frames):
@@ -364,6 +409,13 @@ def replay(args):
                         raise RuntimeError('VIO acknowledgement does not match the sensor frame')
                     if 'feature_tracks' not in result:
                         raise RuntimeError('Rebuild basalt_stream_vio to enable feature-track overlays')
+                    if depth_worker:
+                        if 'is_keyframe' not in result:
+                            raise RuntimeError('Rebuild basalt_stream_vio to expose actual VIO keyframes')
+                        if result['is_keyframe']:
+                            depth_worker.submit(keyframe_from_vio(
+                                result, images[0], calibration, depth_keyframe_index, depth_worker.config))
+                            depth_keyframe_index += 1
                     feature_overlay.update(result['feature_tracks'])
                     imu_index = end
                     p = np.array(result['position'])
@@ -389,6 +441,15 @@ def replay(args):
                         rr.log('world/vio_trajectory', rr.LineStrips3D([positions], colors=[40, 160, 255]))
                     points = np.array([x[1:4] for x in result['map_points']]).reshape(-1, 3)
                     rr.log('world/active_landmarks', rr.Points3D(points, colors=[255, 180, 60], radii=.045))
+                    if result.get('loop_closure') is not None:
+                        loop_status = result['loop_closure']
+                        log_loop_status(loop_status)
+                    if loop_status is not None:
+                        correction = loop_status['map_from_odom']
+                        loop_rotation = Rotation.from_quat(correction['quaternion_xyzw']).as_matrix()
+                        loop_position = loop_rotation @ p + np.array(correction['translation'])
+                        rr.log('world/current_loop_corrected', rr.Points3D(
+                            [loop_position], colors=[60, 230, 120], radii=.12))
                     for i, image in enumerate(images):
                         preview = image
                         if args.preview_width and image.shape[1] > args.preview_width:
@@ -397,6 +458,10 @@ def replay(args):
                         feature_overlay.log(i, (width, height), (preview.shape[1], preview.shape[0]))
                         rr.log(f'metrics/tracks/cam{i}', rr.Scalars(result['observations'][i]))
                     rr.log('metrics/timing/process_ms', rr.Scalars(result['process_ms']))
+                    if depth_worker:
+                        for depth_event in depth_worker.poll():
+                            log_depth_result(depth_event, frames[0][0], depth_worker.config.cloud_stride)
+                        rr.set_time('elapsed', duration=elapsed)
                     if truth:
                         j = int(np.searchsorted(truth_stamps, stamp))
                         nearest = min((k for k in (j - 1, j) if 0 <= k < len(truth)),
@@ -412,8 +477,10 @@ def replay(args):
                               f'tracks={result["observations"]} landmarks={len(points)} '
                               f'vio_ms={result["process_ms"]:.1f} position={p.round(2).tolist()}', flush=True)
                 process.stdin.close()
-                if process.wait(timeout=30):
+                if process.wait(timeout=300 if args.online_loop_config else 30):
                     raise RuntimeError(f'VIO exited with {process.returncode}; see vio_stderr.log')
+            except BrokenPipeError as exc:
+                raise RuntimeError(f'VIO stopped while receiving sensor input; see {args.output / "vio_stderr.log"}') from exc
             finally:
                 if process.poll() is None:
                     process.terminate()
@@ -430,6 +497,7 @@ def replay(args):
             'sensor_only': True, 'imu_samples_loaded': len(imu), 'imu_samples_delivered': imu_index,
             'scalar_mode': args.scalar_mode,
             'camera_mode': args.camera_mode,
+            'imu_noise_scale': args.imu_noise_scale, 'imu_bias_scale': args.imu_bias_scale,
             'feature_tracks': 'KLT observations with persistent ID colors and 12-frame trails',
             'sensor_duration_s': (frames[-1][0] - frames[0][0]) / 1e9,
             'wall_seconds': time.monotonic() - started,
@@ -438,27 +506,70 @@ def replay(args):
             'recording': str(args.output / 'playback.rrd'),
             'visualization_alignment': 'reference transformed to first estimated body pose, no scale correction',
         }
+        if depth_worker:
+            summary['da3'] = depth_worker.finish()
+            summary['wall_seconds'] = time.monotonic() - started
+            for depth_event in depth_worker.poll():
+                log_depth_result(depth_event, frames[0][0], depth_worker.config.cloud_stride)
+            rr.set_time('elapsed', duration=(frames[-1][0]-frames[0][0])/1e9)
         if truth and len(estimates) >= 3:
             evaluation = evaluate(truth, estimates, 10_000_000)
             (args.output / 'evaluation.json').write_text(json.dumps(evaluation, indent=2) + '\n')
             summary['ate_se3_rmse_m'] = evaluation['ate_translation_se3_m']['rmse']
             summary['diagnostic_scale_to_reference'] = evaluation['sim3_scale']
             summary['diagnostic_excess_scale_percent'] = (1 / evaluation['sim3_scale'] - 1) * 100
+        if args.online_loop_config:
+            loop_status = json.loads((args.output / 'loop_closure.json').read_text())
+            summary['loop_closure'] = {k: v for k, v in loop_status.items() if k != 'keyframe_positions'}
+            log_loop_status(loop_status)
+            with (args.output / 'trajectory_loop.csv').open() as source:
+                corrected = [(int(row['timestamp_ns']),
+                    np.array([float(row[k]) for k in ('tx', 'ty', 'tz')]),
+                    Rotation.from_quat([float(row[k]) for k in ('qx', 'qy', 'qz', 'qw')]).as_matrix())
+                    for row in csv.DictReader(source)]
+            if len(corrected) != len(estimates):
+                raise RuntimeError('Loop-corrected trajectory is incomplete')
+            rr.log('world/loop_corrected_trajectory', rr.LineStrips3D(
+                [[x[1] for x in corrected]], colors=[60, 230, 120]))
+            if truth and len(corrected) >= 3:
+                loop_evaluation = evaluate(truth, corrected, 10_000_000)
+                (args.output / 'evaluation_loop.json').write_text(json.dumps(loop_evaluation, indent=2) + '\n')
+                summary['loop_ate_se3_rmse_m'] = loop_evaluation['ate_translation_se3_m']['rmse']
         (args.output / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
         print(json.dumps(summary, indent=2), flush=True)
     finally:
+        if depth_worker and depth_worker.thread.is_alive():
+            depth_worker.abort()
         bag.connection.close()
         rr.disconnect()
+
+
+def log_loop_status(status):
+    for key in ('keyframes', 'candidates', 'candidate_queries', 'local_sequences_skipped',
+                'redundant_sequences_skipped', 'accepted_loops', 'dropped_keyframes', 'capacity_skips', 'worker_ms'):
+        rr.log(f'metrics/loop/{key}', rr.Scalars(status[key]))
+    positions = dict(status['keyframe_positions'])
+    if positions:
+        rr.log('world/loop_keyframes', rr.LineStrips3D([list(positions.values())], colors=[60, 230, 120]))
+    edges = [[positions[a], positions[b]] for a, b in status['edges'] if a in positions and b in positions]
+    if edges:
+        rr.log('world/loop_edges', rr.LineStrips3D(edges, colors=[235, 60, 220]))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--bag', type=Path, default=Path('/data/graco/aerial-08-25m_ros2'))
-    parser.add_argument('--calibration-dir', type=Path, default=DEFAULT_CALIBRATION)
+    parser.add_argument('--calibration-dir', type=Path, help='Override rig calibration; otherwise inferred from the ground-/aerial- bag name')
     parser.add_argument('--stereo-refinement', type=Path, help='Image-only right-camera rotation refinement from refine_graco_stereo.py')
     parser.add_argument('--rectify', action='store_true', help='Rectify the stereo pair and transform the camera calibration consistently')
     parser.add_argument('--config', type=Path, default=REPO / 'configs/graco/aerial_vio.json')
     parser.add_argument('--binary', type=Path, default=REPO / 'target/release/examples/basalt_stream_vio')
+    parser.add_argument('--online-loop-config', type=Path, help='JIST/XFeat/LighterGlue TensorRT engine bundle config')
+    parser.add_argument('--da3-config', type=Path, help='Pose-conditioned five-keyframe DA3 TensorRT config; gate inference on new FOV coverage and align depth to VIO landmarks')
+    parser.add_argument('--imu-noise-scale', type=float, default=1.0,
+                        help='Multiplier for calibrated accelerometer/gyroscope white-noise standard deviations')
+    parser.add_argument('--imu-bias-scale', type=float, default=1.0,
+                        help='Multiplier for calibrated accelerometer/gyroscope bias random-walk standard deviations')
     parser.add_argument('--output', type=Path, required=True, help='New directory; existing outputs are never overwritten')
     parser.add_argument('--width', type=int, default=800)
     parser.add_argument('--scalar-mode', choices=('f32', 'f64'), default='f32', help='Estimator arithmetic; f64 is experimental')
@@ -467,8 +578,14 @@ def main():
     parser.add_argument('--max-frames', type=int)
     parser.add_argument('--rerun-connect', help='Optional viewer URL, e.g. rerun+http://127.0.0.1:9878/proxy')
     args = parser.parse_args()
+    if any(not np.isfinite(v) or v <= 0 for v in (args.imu_noise_scale, args.imu_bias_scale)):
+        parser.error('IMU noise and bias scales must be finite and positive')
     if args.width < 64 or args.preview_width < 0 or (args.max_frames is not None and args.max_frames < 1):
         parser.error('width must be >=64 and max frames must be positive')
+    try:
+        args.calibration_dir = calibration_for_bag(args.bag, args.calibration_dir)
+    except ValueError as error:
+        parser.error(str(error))
     for name in ('bag', 'calibration_dir', 'config', 'binary', 'output'):
         setattr(args, name, getattr(args, name).resolve())
     replay(args)

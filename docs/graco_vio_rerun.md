@@ -1,8 +1,17 @@
-# GRACO aerial VIO with Rerun
+# GRACO VIO with Rerun
 
-Run `aerial-08-25m_ros2` directly from its SQLite bag through visloc's Rust
-`basalt_stream_vio`. No ROS installation or image extraction is required.
+Run GRACO aerial and ground sequences directly from their SQLite bags through
+visloc's Rust `basalt_stream_vio`. No ROS installation or image extraction is required.
 The source bag and calibration YAMLs are opened read-only.
+
+For online JIST keyframe-sequence retrieval, XFeat/LighterGlue matching and
+TensorRT inference, see [online loop closure](online_vio_loop_tensorrt.md).
+Add `--online-loop-config target/loop_models/loop_config.json` after building
+the model bundle. The default global similarity threshold is 0.8.
+
+For pose-conditioned five-keyframe DA3 TensorRT depth, VIO-landmark scale
+alignment and FOV novelty scheduling, see [online DA3 depth](online_da3_depth.md).
+Enable it with `--da3-config configs/graco/da3_five_view.json`.
 
 From the repository root, install/build and run:
 
@@ -55,7 +64,19 @@ to skip setup/build. A recording is saved even when a viewer is connected.
 Use `--max-frames 1000` for a takeoff check; the first 100 frames are stationary
 and do **not** validate metric scale during flight.
 
-The default replay processes every stereo pair at 800 × 550 pixels. `--width`
+For controlled IMU uncertainty experiments, `--imu-noise-scale` multiplies
+both calibrated accelerometer and gyroscope white-noise standard deviations;
+`--imu-bias-scale` multiplies both bias random-walk standard deviations.
+Both default to `1.0`. Values below one tighten the corresponding constraints;
+values above one loosen them. Covariance changes by the **square** of the
+multiplier. The source YAMLs, sensor rate, camera geometry and timestamp
+handling are unchanged. Each run records the multipliers and effective values
+in `calibration_report.json`, `basalt_calibration.json`, and `summary.json`.
+Evaluate the entire sequence before selecting settings: the aerial-05 tests
+show strong takeoff sensitivity to changing these weights. See the
+[aerial IMU tuning results and reproduction command](graco_imu_tuning.md).
+
+The default replay processes every camera timestamp at 800 × 550 pixels. `--width`
 changes image size with matching intrinsics. The display contains undistorted
 images from the selected cameras, blue VIO poses, orange active landmarks, a gray reference
 trajectory, observation counts, and estimator processing time. The timeline
@@ -70,24 +91,69 @@ the left camera only, with no right-camera pane or frustum; stereo mode displays
 both cameras. Rebuild the stream example
 and replay to add overlays to a recording made before this feature was added.
 
+## Ground sequences
+
+The ground preset selects `/data/graco/ground-01`, the supplied
+`/data/graco/ground-calibration`, and **left-camera + IMU** mode:
+
+```bash
+bash scripts/run_local_graco_ground_vio.sh \
+  --output target/graco_vio/ground-01_run
+
+target/graco-venv/bin/rerun target/graco_vio/ground-01_run/playback.rrd
+```
+
+After setup, skip rebuilding and stream into an already running viewer:
+
+```bash
+target/graco-venv/bin/python scripts/run_graco_vio.py \
+  --bag /data/graco/ground-01 --camera-mode mono \
+  --output target/graco_vio/ground-01_live \
+  --rerun-connect rerun+http://127.0.0.1:9878/proxy
+```
+
+Bag names beginning with `ground-` select the ground calibration automatically;
+`aerial-` selects the aerial calibration. Use `--calibration-dir` for a renamed
+bag or a custom calibration location. Unknown names require that explicit
+selection. Both the ground preset and the generic replay accept other ground
+bags through `--bag`, for example `/data/graco/ground-03_ros2`.
+
+Ground intrinsics, camera-to-IMU transforms, and IMU noise are loaded from the
+ground YAMLs. The existing GRACO tracking/backend settings are shared; the
+aerial stereo refinement is not selected. Ground-01 contains 6,676 camera
+timestamps over 333.75 seconds, with 1600 × 1100 raw images and a 125 Hz IMU.
+The viewer displays the left image with feature tracks, VIO, and reference
+trajectory. No right image or right-camera frustum is logged in mono mode.
+
+The completed run in `target/graco_vio/ground-01_mono_20260920` processed all
+6,676 frames, with every estimated pose associated to ground truth within 1 ns.
+Full-run **SE(3) ATE RMSE is 2.837 m**, median 2.557 m, and maximum 4.536 m.
+An independent rigid alignment of the saved trajectory/reference CSVs confirms
+the RMSE. Diagnostic Sim(3) scale is 0.953253 (the estimate is approximately
+4.90% too large), with scale-aligned ATE RMSE 0.714 m. No scale correction is
+applied to VIO or Rerun. The first 1,000 frames gave 0.250 m SE(3) ATE and 0.55%
+excess scale, so that short check substantially understates the full-run error.
+
 ## Sensor and coordinate conventions
 
-- `/camera_left/image_raw` and `/camera_right/image_raw`: paired at exact bag
-  timestamps; both header timestamps are checked before delivery.
+- `/camera_left/image_raw` and `/camera_right/image_raw`: indexed at matching bag
+  timestamps; each selected image's header timestamp is checked before delivery.
 - `/gnss/imu`: gyro in rad/s and acceleration in m/s², delivered once per sample
   in `(previous_camera_time, camera_time]`. The first sample at or after the
   first image provides the estimator's gravity initialization.
 - The published aerial calibration is expected at
   `/data/graco/aerial-calibration-20251121T084428Z-1-001/aerial-calibration`;
-  override with `--calibration-dir`.
+  ground calibration is expected at `/data/graco/ground-calibration`.
+  Override either with `--calibration-dir`.
 - `T_Imu_cam*` maps camera coordinates into IMU coordinates and is already in
-  Basalt's `T_imu_cam` direction. The baseline is 0.43395255 m.
+  Basalt's `T_imu_cam` direction. The aerial baseline is 0.43395255 m;
+  the ground baseline is approximately 0.232249 m. Neither is used in mono mode.
 - Area downsampling includes the pixel-center correction in the intrinsics;
   radial-tangential distortion is removed. Camera axes are retained. The
   undistorted pinhole camera is represented exactly by Double Sphere
   `xi=alpha=0`.
-- IMU rate/noise come from the aerial `imu.yaml`. No camera time shift is given
-  by this calibration, so the replay uses synchronized header timestamps with
+- IMU rate/noise come from the selected rig's `imu.yaml`. No camera time shift is given
+  by these calibrations, so the replay uses synchronized header timestamps with
   zero additional shift.
 - `/gnss/ground_truth` and the IMU orientation field never enter VIO. For live
   display the reference is transformed to the initial estimated body pose.
@@ -195,4 +261,5 @@ target/graco-venv/bin/rerun rrd verify target/graco_vio/aerial-08-25m_run/playba
 
 The calibration tests check resized pixel coordinates against independent
 camera projection, transform direction/optical-center preservation, source
-hash rejection, and recovery of a known synthetic stereo rotation.
+hash rejection, recovery of a known synthetic stereo rotation, and correct
+ground/aerial calibration selection.

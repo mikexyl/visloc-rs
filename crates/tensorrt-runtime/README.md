@@ -87,8 +87,11 @@ only tensor metadata/conversion/validation types are available, not `Session`.
 - Static and dynamic execution dimensions, multiple inputs/outputs, scalar and
   empty tensor storage, and profile selection are supported. Size calculations
   check negative/unresolved dimensions, rank, dtype, and overflow.
+- Data-dependent outputs (such as NonZero match indices) use a reusable,
+  aligned `IOutputAllocator`; actual dimensions are captured via `notifyShape`.
+  Empty outputs are supported. `Output::to_i64()` reads INT64 match indices.
 - Only contiguous LINEAR **device** I/O is supported. Host/shape-inference I/O,
-  data-dependent output sizes (such as NonZero), vectorized formats, packed
+  vectorized formats, packed
   INT4/FP4 I/O, and unknown future dtypes are rejected explicitly.
 - NVIDIA's standard plugins are registered. Loading custom plugin shared
   libraries is not exposed. Engine deserialization reports missing plugins.
