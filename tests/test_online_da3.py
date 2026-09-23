@@ -12,7 +12,8 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from da3_geometry import Keyframe, CoveredView, align_depth, coverage, resize_intrinsics
+from da3_geometry import (Keyframe, CoveredView, align_depth, coverage, resize_intrinsics,
+                          pose_depth_scale, filter_depth_confidence, filter_depth_reprojection)
 from online_da3 import Config, OnlineDepth, Pipeline, keyframe_from_vio, model_inputs
 
 
@@ -36,10 +37,202 @@ class FakeModel:
         self.calls += 1
         inputs, gray = model_inputs(window, (80, 60))
         return (np.full((5, 60, 80), 5., np.float32),
-                np.full((5, 60, 80), 0. if self.reject else 2., np.float32), inputs, gray, 1.)
+                np.full((5, 60, 80), 0. if self.reject else 2., np.float32), inputs, gray, 1.,
+                inputs['input_extrinsics'][0].copy())
 
 
 class DepthGeometryTests(unittest.TestCase):
+    def test_confidence_percentile_and_floor_filter_without_changing_depth(self):
+        depth = np.full((5,4,5),10.,np.float32)
+        scores = np.linspace(1,11,100,dtype=np.float32).reshape(depth.shape)
+        filtered,report = filter_depth_confidence(depth,scores,min_confidence=3.,percentile=70.)
+        self.assertEqual(np.isfinite(filtered).sum(),30)
+        self.assertAlmostEqual(report['threshold'],8.,places=5)
+        np.testing.assert_array_equal(filtered[np.isfinite(filtered)],10.)
+        filtered,report = filter_depth_confidence(depth,scores,min_confidence=9.5,percentile=70.)
+        self.assertEqual(np.isfinite(filtered).sum(),15)
+        self.assertEqual(report['threshold'],9.5)
+        np.testing.assert_array_equal(depth,10.)
+
+    def test_confidence_percentile_excludes_invalid_pixels_and_never_rescues_a_weak_window(self):
+        depth = np.full((5,4,5),10.,np.float32)
+        scores = np.full_like(depth,2.)
+        depth[0] = np.nan
+        scores[0] = 10000.
+        filtered,report = filter_depth_confidence(depth,scores,min_confidence=3.,percentile=70.)
+        self.assertEqual(report['percentile_threshold'],2.)
+        self.assertFalse(np.isfinite(filtered).any())
+        depth[:] = np.nan
+        filtered,report = filter_depth_confidence(depth,scores,min_confidence=3.,percentile=70.)
+        self.assertIsNone(report['percentile_threshold'])
+        self.assertEqual(report['retained_fraction'],0.)
+        json.dumps(report,allow_nan=False)
+
+    def test_low_confidence_views_cannot_support_reprojection(self):
+        class WeakSupportModel(FakeModel):
+            def infer(self,window):
+                depth,conf,inputs,gray,elapsed,poses = super().infer(window)
+                conf[0] = 4.  # Only the reference view passes the absolute floor.
+                return depth,conf,inputs,gray,elapsed,poses
+        with tempfile.TemporaryDirectory() as output:
+            accepted = []
+            config = Config(landmark_alignment=False,reprojection_filter=True,min_confidence=3.,confidence_percentile=70.)
+            pipeline = Pipeline(config,WeakSupportModel(),output,accepted.append)
+            try:
+                for i in range(5):
+                    pipeline.accept(frame(i))
+                self.assertFalse(accepted)
+                self.assertEqual(pipeline.stats['confidence_rejections'],0)
+                self.assertEqual(pipeline.stats['consistency_rejections'],1)
+                self.assertFalse(pipeline.history)
+            finally:
+                pipeline.close()
+
+    def test_reprojection_keeps_a_plane_with_rotated_cameras_and_different_intrinsics(self):
+        y,x = np.mgrid[:60,:80]
+        pixels = np.stack((x,y,np.ones_like(x)),axis=-1)
+        poses = np.array([frame(i).camera_to_world for i in range(5)])
+        k = np.array([frame(i).intrinsics for i in range(5)])
+        depth = []
+        for i in range(5):
+            poses[i,:3,:3] = Rotation.from_euler('y', i-2, degrees=True).as_matrix()
+            k[i,0,0] += i
+            ray = pixels @ np.linalg.inv(k[i]).T @ poses[i,:3,:3].T
+            depth.append((10-poses[i,2,3])/ray[:,:,2])
+        depth = np.array(depth,dtype=np.float32)
+        original = depth.copy()
+        filtered,support,_ = filter_depth_reprojection(depth,k,poses,max_error_px=.05,max_relative_depth=.005)
+        self.assertTrue(np.isfinite(filtered[:,10:-10,10:-10]).all())
+        self.assertTrue((support[:,15:-15,15:-15]==4).all())
+        np.testing.assert_array_equal(filtered[np.isfinite(filtered)],depth[np.isfinite(filtered)])
+        np.testing.assert_array_equal(depth,original)
+        change = np.eye(4)
+        change[:3,:3] = Rotation.from_euler('xyz',[25,-40,80],degrees=True).as_matrix()
+        change[:3,3] = [500,-200,80]
+        transformed,_,_ = filter_depth_reprojection(depth,k,change@poses,max_error_px=.05,max_relative_depth=.005)
+        np.testing.assert_array_equal(transformed,filtered)
+
+    def test_reprojection_rejects_outliers_but_keeps_other_visible_views(self):
+        poses = np.array([frame(i).camera_to_world for i in range(5)])
+        k = np.array([frame(i).intrinsics for i in range(5)])
+        depth = np.full((5,60,80),10.,np.float32)
+        depth[0,20:40,30:50] = 3.
+        filtered,support,report = filter_depth_reprojection(depth,k,poses)
+        self.assertTrue(np.isnan(filtered[0,22:38,32:48]).all())
+        self.assertTrue((support[0,22:38,32:48]==0).all())
+        self.assertTrue(np.isfinite(filtered[1:,22:38,32:48]).all())
+        self.assertGreater(report['rejected_pixels'],300)
+
+    def test_reprojection_depth_check_is_needed_even_when_pixel_roundtrip_is_zero(self):
+        poses = np.repeat(np.eye(4)[None],5,axis=0)
+        k = np.array([frame(i).intrinsics for i in range(5)])
+        depth = np.full((5,60,80),10.,np.float32)
+        depth[0] = 20.
+        filtered,_,_ = filter_depth_reprojection(depth,k,poses)
+        self.assertTrue(np.isnan(filtered[0]).all())
+        self.assertTrue(np.isfinite(filtered[1:,1:-1,1:-1]).all())
+        depth[2:] = np.nan
+        filtered,_,_ = filter_depth_reprojection(depth,k,poses)
+        self.assertTrue(np.isnan(filtered).all())
+
+    def test_reprojection_pixel_limit_rejects_depth_that_passes_relative_limit(self):
+        poses = np.array([frame(i,x=i).camera_to_world for i in range(5)])
+        k = np.array([frame(i).intrinsics for i in range(5)])
+        depth = np.full((5,60,80),10.,np.float32)
+        depth[0] = 10.4
+        loose,_,_ = filter_depth_reprojection(depth,k,poses,max_error_px=2.,max_relative_depth=.1)
+        strict,_,_ = filter_depth_reprojection(depth,k,poses,max_error_px=.05,max_relative_depth=.1)
+        self.assertTrue(np.isfinite(loose[0,10:-10,40:60]).all())
+        self.assertTrue(np.isnan(strict[0]).all())
+
+    def test_reprojection_does_not_count_out_of_view_or_behind_camera_samples(self):
+        poses = np.array([frame(i,x=i*100).camera_to_world for i in range(5)])
+        k = np.array([frame(i).intrinsics for i in range(5)])
+        depth = np.full((5,60,80),10.,np.float32)
+        filtered,support,_ = filter_depth_reprojection(depth,k,poses)
+        self.assertTrue(np.isnan(filtered).all())
+        self.assertFalse(support.any())
+        poses[:] = np.eye(4)
+        poses[2:,:3,:3] = Rotation.from_euler('y',180,degrees=True).as_matrix()
+        filtered,support,_ = filter_depth_reprojection(depth,k,poses)
+        self.assertTrue(np.isnan(filtered[:2]).all())
+        self.assertTrue((support[:2,10:-10,10:-10]==1).all())
+
+    def test_pipeline_saves_filter_mask_and_only_filtered_depth_enters_history(self):
+        class OutlierModel(FakeModel):
+            def infer(self,window):
+                depth,conf,inputs,gray,elapsed,poses = super().infer(window)
+                depth[0,20:40,30:50] = 2.
+                return depth,conf,inputs,gray,elapsed,poses
+        with tempfile.TemporaryDirectory() as output:
+            accepted = []
+            pipeline = Pipeline(Config(landmark_alignment=False,reprojection_filter=True),OutlierModel(),output,accepted.append)
+            try:
+                for i in range(5):
+                    pipeline.accept(frame(i))
+                self.assertEqual(len(accepted),1)
+                self.assertLess(accepted[0]['consistency']['retained_fraction'],1.)
+                with np.load(accepted[0]['archive']) as data:
+                    self.assertTrue(np.isnan(data['depth_m'][0,22:38,32:48]).all())
+                    np.testing.assert_array_equal(data['consistency_mask'],np.isfinite(data['depth_m']))
+                self.assertTrue(np.isnan(pipeline.history[0].depth[5:7,7:9]).all())
+            finally:
+                pipeline.close()
+
+    def test_rejected_consistency_does_not_add_coverage_history(self):
+        class InconsistentModel(FakeModel):
+            def infer(self,window):
+                depth,conf,inputs,gray,elapsed,poses = super().infer(window)
+                depth[:] = np.arange(1,6,dtype=np.float32)[:,None,None]
+                return depth,conf,inputs,gray,elapsed,poses
+        with tempfile.TemporaryDirectory() as output:
+            accepted = []
+            pipeline = Pipeline(Config(landmark_alignment=False,reprojection_filter=True),InconsistentModel(),output,accepted.append)
+            try:
+                for i in range(5):
+                    pipeline.accept(frame(i))
+                self.assertFalse(accepted)
+                self.assertEqual(pipeline.stats['consistency_rejections'],1)
+                self.assertFalse(pipeline.history)
+                self.assertFalse(list(Path(output).glob('window_*.npz')))
+            finally:
+                pipeline.close()
+
+    def test_pose_scale_uses_camera_centers_and_keeps_metric_camera_poses_fixed(self):
+        poses = np.repeat(np.eye(4)[None], 5, axis=0)
+        poses[:, :3, 3] = [[0,0,0], [1,.2,0], [2,0,.1], [3,.4,0], [4,.5,.2]]
+        poses[:, :3, :3] = Rotation.from_euler('xyz', [20,40,30], degrees=True).as_matrix()
+        predicted = poses.copy()
+        rotation = Rotation.from_euler('xyz', [-10,35,70], degrees=True).as_matrix()
+        predicted[:, :3, :3] = rotation @ poses[:, :3, :3]
+        predicted[:, :3, 3] = .25 * poses[:, :3, 3] @ rotation.T + [7,-3,2]
+        supplied = np.linalg.inv(poses)
+        original = supplied.copy()
+        scale, report = pose_depth_scale(supplied, np.linalg.inv(predicted)[:, :3])
+        self.assertAlmostEqual(scale, 4.)
+        self.assertLess(report['pose_fit_rmse_m'], 1e-10)
+        np.testing.assert_array_equal(supplied, original)
+        self.assertIsNone(pose_depth_scale(np.repeat(np.eye(4)[None], 5, axis=0), supplied)[0])
+
+    def test_pose_only_mode_bypasses_landmark_fit_and_held_out_rejection(self):
+        with tempfile.TemporaryDirectory() as output, patch('online_da3.align_depth', side_effect=AssertionError('Landmark fit called')):
+            accepted = []
+            pipeline = Pipeline(Config(landmark_alignment=False), FakeModel(), output, accepted.append)
+            try:
+                for i in range(5):
+                    f = frame(i)
+                    f.track_ids[:] = 1  # Cannot satisfy independent fit/held-out landmark requirements.
+                    pipeline.accept(f)
+                self.assertEqual(len(accepted), 1)
+                self.assertEqual(pipeline.stats['alignment_rejections'], 0)
+                self.assertEqual(accepted[0]['alignment']['method'], 'input_poses')
+                with np.load(accepted[0]['archive']) as data:
+                    np.testing.assert_allclose(data['depth_m'], 5.)
+                    self.assertAlmostEqual(float(data['scale']), 1.)
+                    np.testing.assert_array_equal(data['camera_to_world'], [frame(i).camera_to_world for i in range(5)])
+            finally:
+                pipeline.close()
+
     def test_intrinsics_follow_resize_pixel_centers_and_poses_include_lever_arm(self):
         k = frame(0).intrinsics
         scaled = resize_intrinsics(k, (80, 60), (113, 91))
@@ -173,7 +366,12 @@ class DepthGeometryTests(unittest.TestCase):
 
     def test_configuration_rejects_unsafe_silent_values(self):
         for kwargs in (dict(new_area_threshold=0),dict(new_area_threshold=float('nan')),
-                       dict(queue_capacity=0),dict(min_fit_landmarks=2.5),dict(max_depth_m=-1)):
+                       dict(queue_capacity=0),dict(min_fit_landmarks=2.5),dict(max_depth_m=-1),
+                       dict(landmark_alignment='false'),dict(reprojection_filter='false'),
+                       dict(max_reprojection_error_px=0),dict(max_reprojection_depth_error=float('nan')),
+                       dict(min_consistent_views=0),dict(min_consistent_views=5),
+                       dict(confidence_percentile=-1),dict(confidence_percentile=100),
+                       dict(confidence_percentile=float('nan'))):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 Config(**kwargs).validate()
 

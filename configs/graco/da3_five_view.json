@@ -1,12 +1,18 @@
 {
   "engine": "../../.runtime/da3/da3-small-pose-5view-350x504-typed.engine",
   "library": "../../.runtime/libvisloc_tensorrt.so",
+  "landmark_alignment": false,
+  "reprojection_filter": true,
+  "max_reprojection_error_px": 1.5,
+  "max_reprojection_depth_error": 0.05,
+  "min_consistent_views": 2,
   "new_area_threshold": 0.3,
   "history_depth_tolerance": 0.2,
   "min_coverage_cells": 80,
   "min_baseline_depth_ratio": 0.005,
   "min_interval_keyframes": 5,
   "queue_capacity": 4,
-  "min_confidence": 1.0,
+  "min_confidence": 3.0,
+  "confidence_percentile": 70.0,
   "max_windows": 256
 }

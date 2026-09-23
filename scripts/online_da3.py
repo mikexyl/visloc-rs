@@ -1,4 +1,4 @@
-"""Pose-conditioned, five-keyframe TensorRT depth beside the GRACO VIO replay.
+"""WIP: pose-conditioned, five-keyframe TensorRT depth beside the GRACO VIO replay.
 
 The bounded worker owns the native GPU session. It never changes VIO state.
 Only successful depth windows establish coverage; all scheduling happens before
@@ -18,7 +18,8 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from da3_geometry import Keyframe, CoveredView, align_depth, coverage, resize_intrinsics
+from da3_geometry import (Keyframe, CoveredView, align_depth, coverage, resize_intrinsics,
+                          pose_depth_scale, filter_depth_confidence, filter_depth_reprojection)
 from tensorrt_session import Session, DTYPES
 
 
@@ -27,6 +28,11 @@ class Config:
     engine: str = ''
     library: str = ''
     device: int = 0
+    landmark_alignment: bool = True
+    reprojection_filter: bool = False
+    max_reprojection_error_px: float = 1.5
+    max_reprojection_depth_error: float = .05
+    min_consistent_views: int = 2
     queue_capacity: int = 4
     new_area_threshold: float = .30
     history_depth_tolerance: float = .20
@@ -37,6 +43,7 @@ class Config:
     max_source_reprojection_px: float = 2.
     max_depth_m: float = 200.
     min_confidence: float = 1.
+    confidence_percentile: float = 0.
     min_fit_landmarks: int = 20
     min_holdout_landmarks: int = 5
     min_fit_samples: int = 30
@@ -63,6 +70,13 @@ class Config:
         return result
 
     def validate(self):
+        for name in ('landmark_alignment', 'reprojection_filter'):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f'{name} must be a boolean')
+        if type(self.min_consistent_views) is not int or not 1 <= self.min_consistent_views <= 4:
+            raise ValueError('min_consistent_views must be an integer in [1,4]')
+        if not np.isfinite(self.confidence_percentile) or not 0 <= self.confidence_percentile < 100:
+            raise ValueError('confidence_percentile must be finite and in [0,100)')
         for name in ('queue_capacity', 'min_coverage_cells', 'min_interval_keyframes', 'max_windows',
                      'min_fit_landmarks', 'min_holdout_landmarks', 'min_fit_samples', 'cloud_stride'):
             value = getattr(self, name)
@@ -73,11 +87,13 @@ class Config:
         if type(self.device) is not int or self.device < 0 or self.max_windows > 1000:
             raise ValueError('Invalid device or window capacity')
         for name in ('new_area_threshold', 'history_depth_tolerance', 'min_fit_inlier_ratio',
-                     'max_fit_relative_error', 'max_holdout_median', 'max_holdout_p90'):
+                     'max_fit_relative_error', 'max_holdout_median', 'max_holdout_p90',
+                     'max_reprojection_depth_error'):
             value = getattr(self, name)
             if not np.isfinite(value) or not 0 < value <= 1:
                 raise ValueError(f'{name} must be finite and in (0,1]')
-        for name in ('min_baseline_depth_ratio', 'max_source_reprojection_px', 'max_depth_m', 'min_confidence'):
+        for name in ('min_baseline_depth_ratio', 'max_source_reprojection_px', 'max_depth_m', 'min_confidence',
+                     'max_reprojection_error_px'):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f'{name} must be positive and finite')
 
@@ -162,7 +178,10 @@ class Model:
             if array.shape != (1, 5, self.size[1], self.size[0]):
                 raise ValueError(f'Unexpected DA3 {name} shape: {array.shape}')
             return array[0]
-        return planes('depth'), planes('depth_conf'), inputs, gray, elapsed
+        predicted_extrinsics = np.asarray(outputs['extrinsics'], dtype=np.float32)
+        if predicted_extrinsics.shape not in ((1, 5, 3, 4), (1, 5, 4, 4)):
+            raise ValueError(f'Unexpected DA3 extrinsics shape: {predicted_extrinsics.shape}')
+        return planes('depth'), planes('depth_conf'), inputs, gray, elapsed, predicted_extrinsics[0]
 
     def close(self):
         self.session.close()
@@ -175,7 +194,7 @@ class Pipeline:
         self.last_attempt = -10**12
         self.stats = dict(keyframes=0, candidate_windows=0, inferences=0, accepted_windows=0,
                           novelty_skips=0, geometry_skips=0, interval_skips=0, capacity_skips=0,
-                          alignment_rejections=0, sequence_resets=0)
+                          alignment_rejections=0, confidence_rejections=0, consistency_rejections=0, sequence_resets=0)
         self.output.mkdir(parents=True, exist_ok=True)
         self.events = (self.output/'events.jsonl').open('w')
 
@@ -219,36 +238,57 @@ class Pipeline:
             return
         self.last_attempt = frame.ordinal
         self.stats['inferences'] += 1
-        depth, confidence, inputs, gray, inference_ms = self.model.infer(window)
+        depth, confidence, inputs, gray, inference_ms, predicted_extrinsics = self.model.infer(window)
         if self.stats['inferences'] == 1:
             np.savez_compressed(self.output/'first_inference.npz', **inputs,
-                                depth=depth, depth_conf=confidence,
+                                depth=depth, depth_conf=confidence, predicted_world_to_camera=predicted_extrinsics,
                                 frame_ids=np.array([f.frame_id for f in window]))
-        scale, alignment = align_depth(window, depth, confidence, self.config)
+        if self.config.landmark_alignment:
+            scale, alignment = align_depth(window, depth, confidence, self.config)
+            alignment.update(method='landmarks', landmark_alignment=True)
+        else:
+            scale, alignment = pose_depth_scale(inputs['input_extrinsics'][0], predicted_extrinsics)
         event.update(inference_ms=inference_ms, alignment=alignment)
         if scale is None:
             self.stats['alignment_rejections'] += 1
             self.event(dict(event, decision='alignment_rejected'))
             return
-        aligned = depth * scale
-        valid = (np.isfinite(aligned) & (aligned > .1) & (aligned < self.config.max_depth_m)
-                 & np.isfinite(confidence) & (confidence >= self.config.min_confidence))
-        aligned = np.where(valid, aligned, np.nan).astype(np.float32)
-        if np.mean(valid) < .10:
-            self.stats['alignment_rejections'] += 1
-            self.event(dict(event, decision='too_little_valid_depth'))
+        aligned, confidence_report = filter_depth_confidence(
+            depth * scale, confidence, min_confidence=self.config.min_confidence,
+            percentile=self.config.confidence_percentile, max_depth_m=self.config.max_depth_m)
+        event['confidence_filter'] = confidence_report
+        confidence_mask = np.isfinite(aligned)
+        if np.mean(confidence_mask) < .10:
+            self.stats['confidence_rejections'] += 1
+            self.event(dict(event, decision='too_little_confident_depth'))
             return
+        consistency_data = {}
+        if self.config.reprojection_filter:
+            started = time.monotonic()
+            aligned, support, report = filter_depth_reprojection(
+                aligned, inputs['input_intrinsics'][0], np.array([f.camera_to_world for f in window]),
+                max_error_px=self.config.max_reprojection_error_px,
+                max_relative_depth=self.config.max_reprojection_depth_error,
+                min_consistent_views=self.config.min_consistent_views)
+            event['consistency'] = dict(report, filter_ms=(time.monotonic()-started)*1000)
+            if np.isfinite(aligned).mean() < .10:
+                self.stats['consistency_rejections'] += 1
+                self.event(dict(event, decision='too_little_consistent_depth'))
+                return
+            consistency_data = dict(depth_support=support, consistency_mask=np.isfinite(aligned))
         number = self.stats['accepted_windows']
         archive = self.output/f'window_{number:04d}.npz'
         np.savez_compressed(archive, raw_depth=depth, depth_m=aligned, confidence=confidence,
+                            confidence_mask=confidence_mask,
                             gray=gray, intrinsics=inputs['input_intrinsics'][0],
                             input_world_to_camera=inputs['input_extrinsics'][0],
+                            predicted_world_to_camera=predicted_extrinsics,
                             camera_to_world=np.array([f.camera_to_world for f in window]),
                             frame_ids=np.array([f.frame_id for f in window]),
                             timestamps_ns=np.array([f.timestamp_ns for f in window]),
                             keyframe_ordinals=np.array([f.ordinal for f in window]),
                             scale=np.array(scale),
-                            metadata=np.array(json.dumps(event, allow_nan=False)))
+                            metadata=np.array(json.dumps(event, allow_nan=False)), **consistency_data)
         for i, f in enumerate(window):
             h, w = aligned[i].shape
             small_size = (max(2, w//5), max(2, h//5))
@@ -285,12 +325,14 @@ class OnlineDepth:
         try:
             model = Model(self.config)
             (self.output/'config.json').write_text(json.dumps(asdict(self.config), indent=2)+'\n')
-            manifest = dict(engine_sha256=hashlib.sha256(Path(self.config.engine).read_bytes()).hexdigest(),
+            manifest = dict(status='WIP', engine_sha256=hashlib.sha256(Path(self.config.engine).read_bytes()).hexdigest(),
                             engine=self.config.engine, tensors=model.session.tensors,
                             intrinsics='calibrated, scaled with resize pixel centers',
                             poses='VIO world-to-camera; T_world_body @ T_body_camera inverted',
                             extrinsic_normalization='official DA3 normalization inside exported graph',
-                            scale_source='robust fit to VIO landmark camera-z; held-out track IDs',
+                            scale_source=('robust fit to VIO landmark camera-z; held-out track IDs'
+                                          if self.config.landmark_alignment else
+                                          'input camera poses only; upstream DA3 inverse Umeyama scale'),
                             inference='native TensorRT bridge, no PyTorch or CPU fallback')
             (self.output/'model.json').write_text(json.dumps(manifest, indent=2)+'\n')
             pipeline = Pipeline(self.config, model, self.output, self.results.put)
@@ -363,11 +405,23 @@ def log_result(event, start_ns, cloud_stride):
         rr.set_time('elapsed', duration=(event['timestamp_ns']-start_ns)/1e9)
         rr.log('da3/depth', rr.DepthImage(depth[-1], meter=1.))
         rr.log('da3/input', rr.Image(gray[-1]))
+        alignment = event['alignment']
+        method = alignment.get('method', 'landmarks')
+        validation = (f"Held-out median relative error: {alignment['holdout_relative_median']:.1%}"
+                      if method == 'landmarks' else
+                      f"Landmark alignment disabled. Pose fit RMSE: {alignment['pose_fit_rmse_m']:.3f} m")
+        consistency = event.get('consistency')
+        confidence_report = event.get('confidence_filter')
+        if confidence_report:
+            validation += (f"\nConfidence >= {confidence_report['threshold']:.3f}: "
+                           f"retained {confidence_report['retained_fraction']:.1%} before reprojection")
+        if consistency:
+            validation += (f"\nReprojection filter retained {consistency['retained_fraction']:.1%} "
+                           f"(at least {consistency['min_consistent_views']} other views)")
         rr.log('da3/status', rr.TextDocument(
-            f"Five VIO keyframes: {event['frame_ids']}\n"
+            f"DA3 depth — WIP\nFive VIO keyframes: {event['frame_ids']}\n"
             f"New sampled area: {event['coverage']['new_fraction']:.1%}\n"
-            f"Landmark depth scale: {event['alignment']['scale']:.4f}\n"
-            f"Held-out median relative error: {event['alignment']['holdout_relative_median']:.1%}"))
+            f"Depth scale ({method}): {alignment['scale']:.4f}\n" + validation))
         cloud, colors = [], []
         h, w = depth.shape[1:]
         y, x = np.mgrid[0:h:cloud_stride, 0:w:cloud_stride]
@@ -381,8 +435,18 @@ def log_result(event, start_ns, cloud_stride):
             colors.append(np.repeat(gray[i, y, x][good, None], 3, axis=1))
         rr.log(f"world/da3/window_{event['window_index']:04d}",
                rr.Points3D(np.concatenate(cloud), colors=np.concatenate(colors), radii=.025))
-        for name, value in [('new_area_fraction', event['coverage']['new_fraction']),
+        metrics = [('new_area_fraction', event['coverage']['new_fraction']),
                             ('depth_scale', event['alignment']['scale']),
-                            ('held_out_relative_error', event['alignment']['holdout_relative_median']),
-                            ('inference_ms', event['inference_ms'])]:
+                            ('inference_ms', event['inference_ms'])]
+        if method == 'landmarks':
+            metrics.append(('held_out_relative_error', alignment['holdout_relative_median']))
+        else:
+            metrics.append(('pose_fit_rmse_m', alignment['pose_fit_rmse_m']))
+        if consistency:
+            metrics.extend([('consistent_fraction', consistency['retained_fraction']),
+                            ('consistency_filter_ms', consistency['filter_ms'])])
+        if confidence_report:
+            metrics.extend([('confidence_threshold', confidence_report['threshold']),
+                            ('confident_fraction', confidence_report['retained_fraction'])])
+        for name, value in metrics:
             rr.log('metrics/da3/'+name, rr.Scalars(value))

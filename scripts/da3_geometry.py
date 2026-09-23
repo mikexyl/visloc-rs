@@ -79,7 +79,7 @@ class CoveredView:
 
 def coverage(window, history, depth_tolerance=.15):
     """Estimate sequence FOV novelty by projecting VIO surface samples into
-    the union of all successfully aligned DA3 views, with depth agreement.
+    the union of all accepted metric DA3 views, with depth agreement.
 
     Image cells with no reliable VIO geometry remain unknown; callers enforce
     a minimum spatial support before interpreting this sparse area estimate.
@@ -169,3 +169,151 @@ def align_depth(window, depths, confidence, config):
     if sum(n >= 4 for n in result['fit_samples_by_view']) < 3:
         return None, dict(result, reason='insufficient_inlier_views')
     return scale, dict(result, accepted=True, reason='aligned')
+
+
+def pose_depth_scale(input_world_to_camera, predicted_world_to_camera):
+    """Restore metric depth using DA3's input-pose scale convention.
+
+    Upstream aligns the supplied camera centers to the predicted centers with
+    Umeyama, then divides depth by that scale. Only the scalar is applied:
+    reconstruction keeps the supplied camera poses and calibrated intrinsics.
+    This is necessary because the exported graph normalizes input translations.
+    """
+    def centers(extrinsics):
+        value = np.asarray(extrinsics, dtype=np.float64)
+        if value.shape not in ((5, 3, 4), (5, 4, 4)) or not np.isfinite(value).all():
+            raise ValueError('Expected five finite world-to-camera matrices')
+        return -np.einsum('nji,nj->ni', value[:, :3, :3], value[:, :3, 3])
+
+    measured, predicted = centers(input_world_to_camera), centers(predicted_world_to_camera)
+    a, b = measured-measured.mean(0), predicted-predicted.mean(0)
+    variance = float(np.square(a).sum())
+    report = dict(method='input_poses', accepted=False, landmark_alignment=False)
+    if variance <= 1e-12:
+        return None, dict(report, reason='degenerate_input_baseline')
+    u, singular, vt = np.linalg.svd(b.T @ a)
+    signs = np.ones(3)
+    signs[-1] = 1. if np.linalg.det(u @ vt) >= 0 else -1.
+    input_to_prediction = float(singular @ signs / variance)
+    if not np.isfinite(input_to_prediction) or input_to_prediction <= 1e-12:
+        return None, dict(report, reason='degenerate_predicted_baseline')
+    scale = 1. / input_to_prediction
+    rotation = (u * signs) @ vt
+    residual = (b-input_to_prediction*(a @ rotation.T))*scale
+    return scale, dict(report, accepted=True, reason='input_pose_scale', scale=scale,
+                       pose_fit_rmse_m=float(np.sqrt(np.square(residual).sum(1).mean())))
+
+
+def filter_depth_confidence(depths, confidence, *, min_confidence=1., percentile=0., max_depth_m=200.):
+    """Apply one confidence threshold across the entire five-keyframe window.
+
+    The percentile is computed over finite, in-range depths BEFORE applying
+    the absolute floor or reprojection mask. The floor prevents a uniformly
+    low-confidence window from passing merely through relative ranking.
+    """
+    depth = np.asarray(depths, dtype=np.float32)
+    scores = np.asarray(confidence)
+    if depth.ndim != 3 or depth.shape[0] != 5 or scores.shape != depth.shape:
+        raise ValueError('Expected matching five-view depth and confidence maps')
+    if (not np.isfinite(min_confidence) or min_confidence <= 0
+            or not np.isfinite(percentile) or not 0 <= percentile < 100
+            or not np.isfinite(max_depth_m) or max_depth_m <= .1):
+        raise ValueError('Invalid depth confidence thresholds')
+    valid = (np.isfinite(depth) & (depth > .1) & (depth < max_depth_m)
+             & np.isfinite(scores))
+    before = int(valid.sum())
+    quantile = float(np.percentile(scores[valid], percentile)) if before and percentile > 0 else None
+    threshold = max(min_confidence, quantile) if quantile is not None else min_confidence
+    keep = valid & (scores >= threshold)
+    after = int(keep.sum())
+    report = dict(min_confidence=min_confidence, percentile=percentile, threshold=float(threshold),
+                  percentile_threshold=quantile, input_pixels=before, retained_pixels=after,
+                  rejected_pixels=before-after, retained_fraction=after/before if before else 0.)
+    return np.where(keep, depth, np.nan).astype(np.float32), report
+
+
+def filter_depth_reprojection(depths, intrinsics, camera_to_world, *, max_error_px=1.5,
+                              max_relative_depth=.05, min_consistent_views=2):
+    """Mask depth without modifying surviving values, camera poses or scale.
+
+    For every ordered pair of views, project reference depth into the other
+    camera, sample that camera's depth, and project it back. Both the round-trip
+    pixel error and relative camera-z error must pass. At least two OTHER views
+    support a pixel by default. All votes use the original maps, so filtering
+    order cannot change the result. Missing, occluded and out-of-view samples
+    provide no support; a pixel can still pass using other visible views.
+    """
+    depth = np.asarray(depths, dtype=np.float32)
+    k = np.asarray(intrinsics, dtype=np.float64)
+    poses = np.asarray(camera_to_world, dtype=np.float64)
+    if depth.ndim != 3 or depth.shape[0] != 5 or min(depth.shape[1:]) < 2:
+        raise ValueError('Expected five nonempty depth maps')
+    if k.shape != (5, 3, 3) or poses.shape != (5, 4, 4):
+        raise ValueError('Expected five calibrated intrinsics and camera poses')
+    if not np.isfinite(k).all() or not np.isfinite(poses).all():
+        raise ValueError('Camera geometry must be finite')
+    if (not np.isfinite(max_error_px) or max_error_px <= 0
+            or not np.isfinite(max_relative_depth) or not 0 < max_relative_depth <= 1
+            or type(min_consistent_views) is not int or not 1 <= min_consistent_views <= 4):
+        raise ValueError('Invalid depth reprojection thresholds')
+    inverse_k = np.linalg.inv(k).astype(np.float32)
+    w2c = np.linalg.inv(poses)
+    k = k.astype(np.float32)
+    _, h, w = depth.shape
+    y, x = np.mgrid[:h, :w].astype(np.float32)
+    valid = np.isfinite(depth) & (depth > 0)
+    support = np.zeros(depth.shape, dtype=np.uint8)
+
+    def apply(matrix, xyz):
+        # Elementwise arithmetic avoids starting a BLAS thread pool per image.
+        return tuple(sum(matrix[i, j]*xyz[j] for j in range(3)) for i in range(3))
+
+    def transform(matrix, xyz):
+        return tuple(value + matrix[i, 3] for i, value in enumerate(apply(matrix, xyz)))
+
+    def project(matrix, xyz):
+        u, v, z = apply(matrix, xyz)
+        return u/np.maximum(z, 1e-8), v/np.maximum(z, 1e-8)
+
+    def sample(image, u, v):
+        inside = np.isfinite(u) & np.isfinite(v) & (u >= 0) & (u <= w-1) & (v >= 0) & (v <= h-1)
+        u = np.clip(np.nan_to_num(u, nan=0., posinf=0., neginf=0.), 0, w-1)
+        v = np.clip(np.nan_to_num(v, nan=0., posinf=0., neginf=0.), 0, h-1)
+        x0, y0 = np.floor(u).astype(np.int32), np.floor(v).astype(np.int32)
+        x1, y1 = np.minimum(x0+1, w-1), np.minimum(y0+1, h-1)
+        a, b, c, d = image[y0,x0], image[y0,x1], image[y1,x0], image[y1,x1]
+        low, high = np.minimum(np.minimum(a,b),np.minimum(c,d)), np.maximum(np.maximum(a,b),np.maximum(c,d))
+        # Do not interpolate a fictitious surface across holes or depth edges.
+        usable = inside & (low > 0) & np.isfinite(high) & (high-low <= max_relative_depth*low)
+        dx, dy = u-x0, v-y0
+        sampled = (1-dy)*((1-dx)*a+dx*b) + dy*((1-dx)*c+dx*d)
+        return np.where(usable, sampled, np.nan).astype(np.float32)
+
+    for ref in range(5):
+        z = np.where(valid[ref], depth[ref], 0.)
+        rays = apply(inverse_k[ref], (x,y,np.ones_like(x)))
+        points = tuple(value*z/rays[2] for value in rays)
+        for other in range(5):
+            if other == ref:
+                continue
+            relative = (w2c[other] @ poses[ref]).astype(np.float32)
+            target = transform(relative, points)
+            u, v = project(k[other], target)
+            measured = sample(depth[other], u, v)
+            target_ray = apply(inverse_k[other], (u,v,np.ones_like(u)))
+            target_points = tuple(value*measured/target_ray[2] for value in target_ray)
+            back = transform((w2c[ref] @ poses[other]).astype(np.float32), target_points)
+            back_u, back_v = project(k[ref], back)
+            consistent = (valid[ref] & (target[2] > 0) & (back[2] > 0)
+                          & np.isfinite(measured)
+                          & ((back_u-x)**2 + (back_v-y)**2 <= max_error_px**2)
+                          & (np.abs(back[2]-z) <= max_relative_depth*z))
+            support[ref] += consistent.astype(np.uint8)
+    keep = valid & (support >= min_consistent_views)
+    before, after = int(valid.sum()), int(keep.sum())
+    report = dict(enabled=True, max_error_px=max_error_px, max_relative_depth=max_relative_depth,
+                  min_consistent_views=min_consistent_views, input_pixels=before, retained_pixels=after,
+                  rejected_pixels=before-after, retained_fraction=after/before if before else 0.,
+                  by_view=[dict(input_pixels=int(a.sum()), retained_pixels=int(b.sum()))
+                           for a,b in zip(valid,keep)])
+    return np.where(keep, depth, np.nan).astype(np.float32), support, report

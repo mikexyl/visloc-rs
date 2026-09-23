@@ -237,7 +237,7 @@ def viewer_blueprint(camera_mode, online_loop=False, online_depth=False):
         camera_views.append(rrb.Spatial2DView(origin='stereo/cam1', name='Right camera + feature tracks'))
     loop_views = [rrb.TimeSeriesView(origin='metrics/loop', name='Loop closure')] if online_loop else []
     depth_views = [rrb.Vertical(
-        rrb.Spatial2DView(origin='da3/depth', name='DA3 depth aligned to VIO (metres)'),
+        rrb.Spatial2DView(origin='da3/depth', name='DA3 depth (WIP, metres)'),
         rrb.Spatial2DView(origin='da3/input', name='DA3 last keyframe'),
         rrb.TextDocumentView(origin='da3/status', name='DA3 sequence and alignment'),
         rrb.TimeSeriesView(origin='metrics/da3', name='DA3 coverage and alignment'),
@@ -268,8 +268,8 @@ def init_rerun(args, calibration):
         f'Blue: sensor-only visloc/Basalt {args.camera_mode} VIO. Orange: active landmarks. '
         + ('Green: loop-corrected trajectory. Magenta: verified loop edges. '
            if args.online_loop_config else '') +
-        ('Gray-textured dense points: five-keyframe DA3, conditioned on VIO camera poses/intrinsics '
-         'and scaled against VIO landmarks. Depth uses raw VIO coordinates. '
+        ('Gray-textured dense points: WIP five-keyframe DA3, conditioned on VIO camera poses/intrinsics '
+         'and converted to metres using the configured scale source (see DA3 status). Depth uses raw VIO coordinates. '
          if args.da3_config else '') +
         'Gray: GRACO ground truth transformed to match the first VIO body pose, '
         'for display only. Final evaluation uses full-run rigid SE(3) alignment. '
@@ -565,7 +565,7 @@ def main():
     parser.add_argument('--config', type=Path, default=REPO / 'configs/graco/aerial_vio.json')
     parser.add_argument('--binary', type=Path, default=REPO / 'target/release/examples/basalt_stream_vio')
     parser.add_argument('--online-loop-config', type=Path, help='JIST/XFeat/LighterGlue TensorRT engine bundle config')
-    parser.add_argument('--da3-config', type=Path, help='Pose-conditioned five-keyframe DA3 TensorRT config; gate inference on new FOV coverage and align depth to VIO landmarks')
+    parser.add_argument('--da3-config', type=Path, help='WIP pose-conditioned five-keyframe DA3 TensorRT depth; gate inference on new FOV coverage; select pose-only or landmark depth scale in the config')
     parser.add_argument('--imu-noise-scale', type=float, default=1.0,
                         help='Multiplier for calibrated accelerometer/gyroscope white-noise standard deviations')
     parser.add_argument('--imu-bias-scale', type=float, default=1.0,
