@@ -9,7 +9,6 @@ use std::{
     time::Instant,
 };
 use visloc_basalt::config::BasaltConfig;
-use visloc_basalt::vio::scalar::ScalarMode;
 use visloc_basalt::{
     BasaltCalibration, BasaltVioEstimatorAdapter, EurocSensorFrame, ImuSample, RawU16Image,
 };
@@ -43,18 +42,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 || (args.len() - 4) % 2 != 0 {
         return Err(
-            "usage: basalt_stream_vio CALIBRATION CONFIG OUTPUT_DIR [--scalar-mode f32|f64] [--camera-mode stereo|mono]".into(),
+            "usage: basalt_stream_vio CALIBRATION CONFIG OUTPUT_DIR [--camera-mode stereo|mono] [--imu-startup stationary|legacy|stationary-gravity|stationary-motion] (f64; stationary gyro-only startup by default)".into(),
         );
     }
-    let mut scalar_mode = ScalarMode::UpstreamF32;
     let mut monocular = false;
     let mut loop_config = None;
+    let mut imu_startup = Some(visloc_basalt::startup::StationaryStartupConfig::default());
     for option in args[4..].chunks_exact(2) {
         match (option[0].as_str(), option[1].as_str()) {
-            ("--scalar-mode", "f32") => scalar_mode = ScalarMode::UpstreamF32,
-            ("--scalar-mode", "f64") => scalar_mode = ScalarMode::ExtendedF64,
             ("--camera-mode", "stereo") => monocular = false,
             ("--camera-mode", "mono") => monocular = true,
+            ("--imu-startup", "legacy") => imu_startup = None,
+            (
+                "--imu-startup",
+                mode @ ("stationary" | "stationary-gravity" | "stationary-motion"),
+            ) => {
+                imu_startup = Some(visloc_basalt::startup::StationaryStartupConfig {
+                    average_gravity: mode != "stationary",
+                    wait_for_motion: mode == "stationary-motion",
+                    ..Default::default()
+                });
+            }
             ("--online-loop-config", path) => loop_config = Some(PathBuf::from(path)),
             _ => return Err(format!("invalid option: {} {}", option[0], option[1]).into()),
         }
@@ -65,7 +73,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let config = BasaltConfig::from_json(&fs::read_to_string(&args[2])?)?;
     let mut adapter = BasaltVioEstimatorAdapter::from_config(&calibration, &config)?;
-    adapter.estimator.config.scalar_mode = scalar_mode;
+    let mut startup = imu_startup
+        .map(|c| visloc_basalt::startup::StationaryStartup::new(&calibration, &config, c))
+        .transpose()?;
+    let mut startup_seeded = false;
+    let mut startup_report_saved = false;
     let out = PathBuf::from(&args[3]);
     fs::create_dir_all(&out)?;
     #[cfg(not(feature = "tensorrt-loop"))]
@@ -155,7 +167,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .map(sample)
             .collect::<Result<_, _>>()?;
-        if imu.is_empty() {
+        // The first image may precede the first IMU packet. Initialization
+        // uses the separately supplied sample at/after that image, just as
+        // the ROS adapter does; there is no preceding interval to integrate.
+        if imu.is_empty() && frame_id != 0 {
             return Err("empty IMU interval".into());
         }
         for s in &imu {
@@ -194,119 +209,156 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             imu,
             initialization_imu,
         };
-        let started = Instant::now();
-        let result = adapter.process_without_marg_data_no_trace(frame)?;
-        let pose = &result.estimator.state.imu_to_world;
-        let q = pose.rotation.quaternion();
-        let p = pose.translation;
-        let process_ms = started.elapsed().as_secs_f64() * 1000.0;
-        if p.iter().chain(q.coords.iter()).any(|x| !x.is_finite()) {
-            return Err("nonfinite VIO pose".into());
-        }
-        let c0 = result
-            .tracks
-            .observations
-            .iter()
-            .filter(|o| o.camera_id == 0)
-            .count();
-        let c1 = result
-            .tracks
-            .observations
-            .iter()
-            .filter(|o| o.camera_id == 1)
-            .count();
-        writeln!(
-            tum,
-            "{:.9} {:.9} {:.9} {:.9} {:.12} {:.12} {:.12} {:.12}",
-            t as f64 * 1e-9,
-            p.x,
-            p.y,
-            p.z,
-            q.i,
-            q.j,
-            q.k,
-            q.w
-        )?;
-        writeln!(
-            csv,
-            "{frame_id},{t},{},{},{},{},{},{},{},{c0},{c1},{}",
-            p.x, p.y, p.z, q.w, q.i, q.j, q.k, result.imu_count
-        )?;
-        tum.flush()?;
-        csv.flush()?;
-        let state = &result.estimator.state;
-        let v = state.velocity_world_m_s;
-        let bg = state.gyro_bias_rad_s;
-        let ba = state.accel_bias_m_s2;
-        writeln!(
-            states,
-            "{t},{},{},{},{},{},{},{},{},{}",
-            v.x, v.y, v.z, bg.x, bg.y, bg.z, ba.x, ba.y, ba.z
-        )?;
-        states.flush()?;
-        let current_map = adapter.estimator.map_points();
-        #[allow(unused_mut)]
-        let mut loop_update = Value::Null;
-        #[cfg(feature = "tensorrt-loop")]
-        if let Some(worker) = &mut loop_worker {
-            dense_poses.push((t, pose.clone()));
-            // JIST sequences contain actual Basalt keyframes, never raw-frame
-            // intervals. Increment the ordinal even if the bounded queue drops.
-            if result.estimator.is_keyframe {
-                worker.submit(visloc_online_loop::Frame {
-                    id: frame_id,
-                    keyframe_index,
-                    timestamp_ns: t,
-                    width,
-                    height,
-                    gray: left,
-                    body_to_world: pose.clone(),
-                    observations: result
-                        .tracks
-                        .observations
-                        .iter()
-                        .filter(|o| o.camera_id == 0)
-                        .take(1024)
-                        .map(|o| visloc_online_loop::Observation {
-                            track_id: o.track_id,
-                            pixel: o.pixel,
-                            point_world: current_map.get(&o.track_id).copied(),
-                        })
-                        .collect(),
-                })?;
-                keyframe_index += 1;
-            }
-            let status = worker.snapshot()?;
-            if status.keyframes != published_keyframes {
-                loop_update = status.json();
-                published_keyframes = status.keyframes;
-            }
-        }
-        let map_points: Vec<_> = current_map
-            .iter()
-            // Sample the whole active ID range if the visualization budget is
-            // exceeded; taking only the first IDs biases output to old tracks.
-            .step_by(current_map.len().div_ceil(3000).max(1))
-            .filter(|(_, point)| point.coords.iter().all(|v| v.is_finite()))
-            .take(3000)
-            .map(|(id, point)| json!([id, point.x, point.y, point.z]))
-            .collect();
-        // Export the frontend's measured pixels and persistent IDs for
-        // visualization in the same undistorted image used by tracking.
-        let feature_tracks: Vec<_> = result
-            .tracks
-            .observations
-            .iter()
-            .map(|o| json!([o.camera_id, o.track_id, o.pixel.x, o.pixel.y]))
-            .collect();
-        writeln!(
-            output,
-            "{}",
-            json!({"frame_id":frame_id,"timestamp_ns":t,"position":[p.x,p.y,p.z],"quaternion_xyzw":[q.i,q.j,q.k,q.w],"observations":[c0,c1],"imu_samples":result.imu_count,"process_ms":process_ms,"map_points":map_points,"feature_tracks":feature_tracks,"is_keyframe":result.estimator.is_keyframe,"loop_closure":loop_update})
-        )?;
-        output.flush()?;
         previous = Some(t);
         frame_id += 1;
+        let ready = if let Some(gate) = &mut startup {
+            gate.push(frame)?
+        } else {
+            vec![frame]
+        };
+        if !startup_seeded {
+            if let Some(report) = startup.as_ref().and_then(|s| s.report.as_ref()) {
+                adapter.estimator.apply_stationary_startup(report)?;
+                startup_seeded = true;
+            }
+        }
+        if !startup_report_saved && !ready.is_empty() {
+            if let Some(report) = startup.as_ref().and_then(|s| s.report.as_ref()) {
+                fs::write(
+                    out.join("imu_startup.json"),
+                    serde_json::to_vec_pretty(report)?,
+                )?;
+                startup_report_saved = true;
+            }
+        }
+        for frame in ready {
+            let frame_id = frame.frame_id;
+            let t = frame.timestamp_ns;
+            #[cfg(feature = "tensorrt-loop")]
+            let left: Vec<u8> = frame.cam0.pixels().iter().map(|v| (v >> 8) as u8).collect();
+            let started = Instant::now();
+            let result = adapter.process_without_marg_data_no_trace(frame)?;
+            let pose = &result.estimator.state.imu_to_world;
+            let q = pose.rotation.quaternion();
+            let p = pose.translation;
+            let process_ms = started.elapsed().as_secs_f64() * 1000.0;
+            if p.iter().chain(q.coords.iter()).any(|x| !x.is_finite()) {
+                return Err("nonfinite VIO pose".into());
+            }
+            let c0 = result
+                .tracks
+                .observations
+                .iter()
+                .filter(|o| o.camera_id == 0)
+                .count();
+            let c1 = result
+                .tracks
+                .observations
+                .iter()
+                .filter(|o| o.camera_id == 1)
+                .count();
+            writeln!(
+                tum,
+                "{:.9} {:.9} {:.9} {:.9} {:.12} {:.12} {:.12} {:.12}",
+                t as f64 * 1e-9,
+                p.x,
+                p.y,
+                p.z,
+                q.i,
+                q.j,
+                q.k,
+                q.w
+            )?;
+            writeln!(
+                csv,
+                "{frame_id},{t},{},{},{},{},{},{},{},{c0},{c1},{}",
+                p.x, p.y, p.z, q.w, q.i, q.j, q.k, result.imu_count
+            )?;
+            tum.flush()?;
+            csv.flush()?;
+            let state = &result.estimator.state;
+            let v = state.velocity_world_m_s;
+            let bg = state.gyro_bias_rad_s;
+            let ba = state.accel_bias_m_s2;
+            writeln!(
+                states,
+                "{t},{},{},{},{},{},{},{},{},{}",
+                v.x, v.y, v.z, bg.x, bg.y, bg.z, ba.x, ba.y, ba.z
+            )?;
+            states.flush()?;
+            let current_map = adapter.estimator.map_points();
+            #[allow(unused_mut)]
+            let mut loop_update = Value::Null;
+            #[cfg(feature = "tensorrt-loop")]
+            if let Some(worker) = &mut loop_worker {
+                dense_poses.push((t, pose.clone()));
+                // JIST sequences contain actual Basalt keyframes, never raw-frame
+                // intervals. Increment the ordinal even if the bounded queue drops.
+                if result.estimator.is_keyframe {
+                    worker.submit(visloc_online_loop::Frame {
+                        id: frame_id,
+                        keyframe_index,
+                        timestamp_ns: t,
+                        width,
+                        height,
+                        gray: left,
+                        body_to_world: pose.clone(),
+                        observations: result
+                            .tracks
+                            .observations
+                            .iter()
+                            .filter(|o| o.camera_id == 0)
+                            .take(1024)
+                            .map(|o| visloc_online_loop::Observation {
+                                track_id: o.track_id,
+                                pixel: o.pixel,
+                                point_world: current_map.get(&o.track_id).copied(),
+                            })
+                            .collect(),
+                    })?;
+                    keyframe_index += 1;
+                }
+                let status = worker.snapshot()?;
+                if status.keyframes != published_keyframes {
+                    loop_update = status.json();
+                    published_keyframes = status.keyframes;
+                }
+            }
+            let map_points: Vec<_> = current_map
+                .iter()
+                // Sample the whole active ID range if the visualization budget is
+                // exceeded; taking only the first IDs biases output to old tracks.
+                .step_by(current_map.len().div_ceil(3000).max(1))
+                .filter(|(_, point)| point.coords.iter().all(|v| v.is_finite()))
+                .take(3000)
+                .map(|(id, point)| json!([id, point.x, point.y, point.z]))
+                .collect();
+            // Export the frontend's measured pixels and persistent IDs for
+            // visualization in the same undistorted image used by tracking.
+            let feature_tracks: Vec<_> = result
+                .tracks
+                .observations
+                .iter()
+                .map(|o| json!([o.camera_id, o.track_id, o.pixel.x, o.pixel.y]))
+                .collect();
+            writeln!(
+                output,
+                "{}",
+                json!({"frame_id":frame_id,"timestamp_ns":t,"position":[p.x,p.y,p.z],"quaternion_xyzw":[q.i,q.j,q.k,q.w],"observations":[c0,c1],"imu_samples":result.imu_count,"process_ms":process_ms,"map_points":map_points,"feature_tracks":feature_tracks,"is_keyframe":result.estimator.is_keyframe,"loop_closure":loop_update})
+            )?;
+            output.flush()?;
+        }
+        if startup.is_some() {
+            writeln!(
+                output,
+                "{}",
+                json!({"batch_complete": true, "received_frames": frame_id, "initialized": startup.as_ref().is_some_and(|s| s.is_initialized()), "oldest_buffered_frame_id": startup.as_ref().and_then(|s| s.oldest_buffered_frame_id())})
+            )?;
+            output.flush()?;
+        }
+    }
+    if let Some(gate) = &startup {
+        gate.finish()?;
     }
     if frame_id == 0 {
         return Err("sensor stream ended without frames".into());
@@ -360,7 +412,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         out.join("summary.json"),
         json!({"frames_processed":frame_id,"sensor_only":true,
             "camera_mode": if monocular { "mono" } else { "stereo" },
-            "scalar_mode": if scalar_mode == ScalarMode::UpstreamF32 { "f32" } else { "f64" }
+            "scalar_mode": "f64"
         })
         .to_string(),
     )?;

@@ -2,7 +2,6 @@ use crate::mapper::{GlobalBaConfig, MapperConfig, OfflineMapperConfig};
 use crate::vio::aom::LmConfig;
 use crate::vio::estimator::EstimatorConfig;
 use crate::vio::margdata::WindowPolicy;
-use crate::vio::scalar::ScalarMode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -116,7 +115,6 @@ impl BasaltConfig {
     }
     pub fn estimator_config(&self) -> Result<EstimatorConfig, ConfigError> {
         Ok(EstimatorConfig {
-            scalar_mode: ScalarMode::UpstreamF32,
             window: WindowPolicy {
                 max_states: self.value("config.vio_max_states")?,
                 max_kfs: self.value("config.vio_max_kfs")?,

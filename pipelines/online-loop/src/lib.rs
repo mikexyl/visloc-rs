@@ -16,6 +16,8 @@ pub mod models;
 mod worker;
 #[cfg(feature = "native")]
 pub use worker::OnlineLoop;
+#[cfg(feature = "native")]
+pub use worker::select_observations;
 
 #[derive(Debug, Clone)]
 pub struct Error(pub String);

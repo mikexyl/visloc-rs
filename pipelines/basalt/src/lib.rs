@@ -29,6 +29,7 @@ pub mod euroc;
 pub mod fast;
 pub mod imu;
 pub mod initialization;
+pub mod startup;
 pub mod mapper;
 pub mod patch;
 pub mod pattern;

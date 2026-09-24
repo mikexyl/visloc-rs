@@ -1,0 +1,14 @@
+uint64 keyframe_cursor
+uint64 sequence_cursor
+uint64 loop_cursor
+bool include_keyframes
+bool include_loops
+---
+string session
+Keyframe[] keyframes
+SequenceAnnouncement[] sequences
+LoopConstraint[] loops
+uint64 keyframe_cursor
+uint64 sequence_cursor
+uint64 loop_cursor
+bool more

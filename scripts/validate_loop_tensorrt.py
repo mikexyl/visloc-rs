@@ -78,7 +78,15 @@ def main():
                 score_error = max((abs(expected[k]-actual[k]) for k in common), default=0.0)
                 comparison.update(matches_onnx=len(expected), matches_trt=len(actual),
                                   pair_agreement=agreement, max_score_error=score_error)
-                assert agreement == 1.0 and score_error < .001, comparison
+                # A discrete >0.1 filter can change membership when an FP32
+                # score differs by a few ulps. Permit only cutoff-adjacent
+                # membership changes; stable matches must agree exactly.
+                boundary = {p for p in set(expected) ^ set(actual)
+                            if abs(expected.get(p, actual.get(p)) - .1) < 1e-5}
+                stable_union = (set(expected) | set(actual)) - boundary
+                stable_agreement = len(common) / max(1, len(stable_union)) if stable_union else 1.0
+                comparison.update(threshold_boundary_pairs=len(boundary), stable_pair_agreement=stable_agreement)
+                assert stable_agreement == 1.0 and score_error < .001, comparison
             else:
                 for key, expected in reference.items():
                     actual = measured[key]

@@ -1,11 +1,10 @@
 use super::aom::{
-    q2_f32_normal_system, set_active_diagnostic_projection_event, sophus_rotate_step_packet_f32,
-    DiagnosticProjectionEvent, LmConfig, WhitenedFactorRowStack,
+    set_active_diagnostic_projection_event, DiagnosticProjectionEvent, LmConfig,
+    WhitenedFactorRowStack,
 };
 use super::landmarks::{
-    triangulate_dlt, triangulate_dlt_rig_f32, triangulate_dlt_rig_f32_traced, BearingObservation,
-    InverseDistanceLandmark, LandmarkStatus, NativeHostOrder, ObservationDb,
-    StereographicDirection, TriangulationDltTraceF32,
+    triangulate_dlt, BearingObservation, InverseDistanceLandmark, LandmarkStatus, NativeHostOrder,
+    ObservationDb, StereographicDirection, TriangulationDltTraceF32,
 };
 use super::margdata::{
     AomBlockData, FramePoseData, FrameStateData, MargData, MargDataDiagnosticSidecar,
@@ -49,10 +48,8 @@ type F32Matrix9x3 = SMatrix<f32, 9, 3>;
 static M7HD_ASSIGN_DUMP_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+/// Configuration of the f64-only VIO estimator. Precision is not configurable.
 pub struct EstimatorConfig {
-    /// Numeric ownership of the compatibility core.  Public sensor and
-    /// trajectory values remain f64 in either mode.
-    pub scalar_mode: ScalarMode,
     pub window: WindowPolicy,
     /// Upstream `vio_min_frames_after_kf`.  The pinned implementation uses a
     /// strict `frames_after_kf > value` comparison, so the EuRoC default of 5
@@ -74,7 +71,6 @@ pub struct EstimatorConfig {
 impl Default for EstimatorConfig {
     fn default() -> Self {
         Self {
-            scalar_mode: ScalarMode::default(),
             window: WindowPolicy::default(),
             min_frames_after_kf: 5,
             new_kf_keypoints_threshold: 0.7,
@@ -436,6 +432,8 @@ pub struct BasaltVioEstimator {
     prior: Option<WindowPrior>,
     anchor_point: Option<DVector<f64>>,
     gravity_world: Option<Vector3<f64>>,
+    startup_gravity_sample: Option<Vector3<f64>>,
+    startup_seed_applied: bool,
     /// Mirrors upstream `SqrtKeypointVioEstimator::opt_started`: the first
     /// four inserted states are prediction/observation accumulation only;
     /// optimization starts once the fifth state makes `frame_states.size() >
@@ -556,6 +554,8 @@ impl BasaltVioEstimator {
             // option preserves the existing test/configuration seam, while
             // the production default is the upstream constant.
             gravity_world: Some(Vector3::new(0.0, 0.0, -9.81)),
+            startup_gravity_sample: None,
+            startup_seed_applied: false,
             opt_started: false,
             take_kf: true,
             frames_after_kf: 0,
@@ -647,6 +647,41 @@ impl BasaltVioEstimator {
         Ok(self)
     }
 
+    /// Apply a validated session gyro offset before any preintegration or prior.
+    /// Accelerometer bias remains unobservable from one stationary orientation.
+    pub fn apply_stationary_startup(
+        &mut self,
+        report: &crate::startup::StationaryStartupReport,
+    ) -> Result<(), String> {
+        if self.startup_seed_applied
+            || self.last_timestamp_ns.is_some()
+            || self.calib_gyro_bias.len() != 12
+            || report
+                .gyro_offset_rad_s
+                .iter()
+                .chain(report.mean_accel_m_s2.iter())
+                .any(|x| !x.is_finite())
+        {
+            return Err(
+                "stationary IMU seed must be finite and applied before the first VIO frame".into(),
+            );
+        }
+        // The offset is expressed after the existing affine sensor calibration.
+        // Rebasing the static gyro polynomial preserves its scale/misalignment
+        // coefficients and lets dynamic bias estimate the residual about zero.
+        for (coefficient, offset) in self.calib_gyro_bias[..3]
+            .iter_mut()
+            .zip(report.gyro_offset_rad_s)
+        {
+            *coefficient += offset;
+        }
+        self.startup_seed_applied = true;
+        if report.config.average_gravity {
+            self.startup_gravity_sample = Some(Vector3::from(report.mean_accel_m_s2));
+        }
+        Ok(())
+    }
+
     /// Opt-in read-only snapshots; does not enable image or MargData retention.
     pub fn enable_keyframe_pose_output(&mut self, enabled: bool) {
         self.keyframe_pose_output_enabled = enabled;
@@ -720,23 +755,11 @@ impl BasaltVioEstimator {
 
     fn bearing_from_pixel(&self, camera_id: u16, pixel: &Point2<f64>) -> Option<Vector3<f64>> {
         let camera = self.camera_model(camera_id)?;
-        if self.config.scalar_mode == ScalarMode::UpstreamF32 {
-            let pixel_f32 = Point2::new(pixel.x as f32, pixel.y as f32);
-            return camera
-                .unproject_f32(&pixel_f32)
-                .map(|bearing| bearing.map(|value| value as f64));
-        }
         camera.unproject(pixel)
     }
 
     fn raw_bearing_from_pixel(&self, camera_id: u16, pixel: &Point2<f64>) -> Option<Vector3<f64>> {
         let camera = self.camera_model(camera_id)?;
-        if self.config.scalar_mode == ScalarMode::UpstreamF32 {
-            let pixel_f32 = Point2::new(pixel.x as f32, pixel.y as f32);
-            return camera
-                .unproject_raw_f32(&pixel_f32)
-                .map(|bearing| bearing.map(|value| value as f64));
-        }
         camera.unproject_raw(pixel)
     }
 
@@ -930,15 +953,15 @@ impl BasaltVioEstimator {
             .map(|state| state.nav.clone())
             .unwrap_or_else(|| self.nav.clone());
         if previous_timestamp.is_none() {
-            let initialization_samples = calibrated_initialization_imu
+            let gravity_sample = self
+                .startup_gravity_sample
+                .map(|a| ImuSample::new(timestamp_ns, Vector3::zeros(), a));
+            let initialization_samples = gravity_sample
                 .as_ref()
+                .or(calibrated_initialization_imu.as_ref())
                 .map(std::slice::from_ref)
                 .unwrap_or(&calibrated_imu);
-            previous_nav = initial_nav_from_imu(
-                timestamp_ns,
-                initialization_samples,
-                self.config.scalar_mode,
-            );
+            previous_nav = initial_nav_from_imu(timestamp_ns, initialization_samples);
         }
         let initialization_output =
             (retain_trace_payload && previous_timestamp.is_none()).then(|| previous_nav.clone());
@@ -955,7 +978,6 @@ impl BasaltVioEstimator {
                     previous_nav.gyro_bias_rad_s,
                     previous_nav.accel_bias_m_s2,
                     self.imu_noise,
-                    self.config.scalar_mode,
                 )
             })
             .unwrap_or((None, false));
@@ -964,7 +986,6 @@ impl BasaltVioEstimator {
             imu_delta.as_ref(),
             self.gravity_world
                 .unwrap_or_else(|| Vector3::new(0.0, 0.0, -9.81)),
-            self.config.scalar_mode,
         );
         let imu_propagation = retain_trace_payload
             .then(|| {
@@ -992,7 +1013,7 @@ impl BasaltVioEstimator {
         if self.window_states.is_empty() {
             self.anchor_point = Some(flatten_nav_with_mode(
                 &predicted_nav,
-                self.config.scalar_mode,
+                ScalarMode::ExtendedF64,
             ));
         }
         // Upstream computes connectivity before triangulating the unconnected
@@ -1143,7 +1164,7 @@ impl BasaltVioEstimator {
                 &mut problem.poses,
                 &mut problem.states,
                 &solution_state,
-                self.config.scalar_mode,
+                ScalarMode::ExtendedF64,
             );
             // The selection policy uses the solved pose/state values, so give
             // the estimator those snapshots before asking for a plan.  The
@@ -1223,7 +1244,7 @@ impl BasaltVioEstimator {
                     &plan.drop_poses,
                     &plan.drop_states,
                     &plan.convert_states,
-                    self.config.scalar_mode,
+                    ScalarMode::ExtendedF64,
                     &marg_state,
                 )
                 .or_else(|| self.anchor_prior_for_kept(&fallback_dropped));
@@ -1672,11 +1693,7 @@ impl BasaltVioEstimator {
                     // Basalt applies T_0_1.translation().squaredNorm() to
                     // temporal and same-timestamp stereo candidates alike.
                     let baseline = target_history.pose.translation - candidate.pose.translation;
-                    let baseline_norm = if self.config.scalar_mode == ScalarMode::UpstreamF32 {
-                        baseline.map(|value| value as f32).norm() as f64
-                    } else {
-                        baseline.norm()
-                    };
+                    let baseline_norm = { baseline.norm() };
                     if baseline_norm < 0.05 {
                         if capture_triangulation {
                             triangulation_attempts.push(json!({
@@ -1690,141 +1707,7 @@ impl BasaltVioEstimator {
                         }
                         continue;
                     }
-                    let triangulated_candidate = if self.config.scalar_mode
-                        == ScalarMode::UpstreamF32
-                    {
-                        // `PoseVelBiasStateWithLin<float>` already owns the
-                        // upstream Sophus SO3 value.  Widening through the
-                        // f64 history and narrowing back must not normalize
-                        // that stored quaternion a second time.
-                        let target_rotation = UnitQuaternion::new_unchecked(Quaternion::new(
-                            target_history.imu_pose.rotation.w as f32,
-                            target_history.imu_pose.rotation.i as f32,
-                            target_history.imu_pose.rotation.j as f32,
-                            target_history.imu_pose.rotation.k as f32,
-                        ));
-                        let candidate_rotation = UnitQuaternion::new_unchecked(Quaternion::new(
-                            candidate.imu_pose.rotation.w as f32,
-                            candidate.imu_pose.rotation.i as f32,
-                            candidate.imu_pose.rotation.j as f32,
-                            candidate.imu_pose.rotation.k as f32,
-                        ));
-                        let Some(target_extrinsic) = self.camera_to_imu(0) else {
-                            continue;
-                        };
-                        let Some(candidate_extrinsic) = self.camera_to_imu(candidate.camera_id)
-                        else {
-                            continue;
-                        };
-                        let target_extrinsic_rotation =
-                            UnitQuaternion::from_quaternion(Quaternion::new(
-                                target_extrinsic.rotation.w as f32,
-                                target_extrinsic.rotation.i as f32,
-                                target_extrinsic.rotation.j as f32,
-                                target_extrinsic.rotation.k as f32,
-                            ));
-                        let candidate_extrinsic_rotation =
-                            UnitQuaternion::from_quaternion(Quaternion::new(
-                                candidate_extrinsic.rotation.w as f32,
-                                candidate_extrinsic.rotation.i as f32,
-                                candidate_extrinsic.rotation.j as f32,
-                                candidate_extrinsic.rotation.k as f32,
-                            ));
-                        let target_imu_translation = target_history
-                            .imu_pose
-                            .translation
-                            .map(|value| value as f32);
-                        let target_extrinsic_translation =
-                            target_extrinsic.translation.map(|value| value as f32);
-                        let target_bearing_f32 = target_bearing.map(|value| value as f32);
-                        let candidate_imu_translation =
-                            candidate.imu_pose.translation.map(|value| value as f32);
-                        let candidate_extrinsic_translation =
-                            candidate_extrinsic.translation.map(|value| value as f32);
-                        let candidate_bearing_f32 = candidate.raw_bearing.map(|value| value as f32);
-                        let target_bearing_trace = [
-                            target_bearing_f32.x,
-                            target_bearing_f32.y,
-                            target_bearing_f32.z,
-                        ];
-                        let candidate_bearing_normalized =
-                            candidate_bearings[candidate_index].map(|value| value as f32);
-                        let candidate_bearing_normalized_trace = [
-                            candidate_bearing_normalized.x,
-                            candidate_bearing_normalized.y,
-                            candidate_bearing_normalized.z,
-                        ];
-                        let (candidate_result, trace_record) = if capture_triangulation {
-                            let attempt = triangulate_dlt_rig_f32_traced(
-                                &target_rotation,
-                                target_imu_translation,
-                                &target_extrinsic_rotation,
-                                target_extrinsic_translation,
-                                target_bearing_f32,
-                                &candidate_rotation,
-                                candidate_imu_translation,
-                                &candidate_extrinsic_rotation,
-                                candidate_extrinsic_translation,
-                                candidate_bearing_f32,
-                            );
-                            let result = attempt.result;
-                            let status = match result {
-                                Some((_direction, inverse_distance))
-                                    if inverse_distance.is_finite()
-                                        && inverse_distance > 0.0
-                                        && inverse_distance < 3.0 =>
-                                {
-                                    "accepted"
-                                }
-                                Some(_) => "rho_rejected",
-                                None => "dlt_failed",
-                            };
-                            let result_f64 = result.map(|(direction, inverse_distance)| {
-                                (direction.map(|value| value as f64), inverse_distance as f64)
-                            });
-                            let record = json!({
-                                "candidate_index": candidate_index,
-                                "candidate": json_track_history_triangulation_trace(candidate),
-                                "baseline_norm": baseline_norm,
-                                "target_bearing_normalized_f32": json_f32_values(&target_bearing_trace),
-                                "candidate_bearing_normalized_f32": json_f32_values(&candidate_bearing_normalized_trace),
-                                "target_extrinsic": json_se3_triangulation_trace(target_extrinsic),
-                                "candidate_extrinsic": json_se3_triangulation_trace(candidate_extrinsic),
-                                "dlt": json_triangulation_dlt_trace(&attempt.dlt),
-                                "result": json_triangulation_result(result),
-                                "status": status,
-                            });
-                            (result_f64, Some(record))
-                        } else {
-                            (
-                                triangulate_dlt_rig_f32(
-                                    &target_rotation,
-                                    target_imu_translation,
-                                    &target_extrinsic_rotation,
-                                    target_extrinsic_translation,
-                                    target_bearing_f32,
-                                    &candidate_rotation,
-                                    candidate_imu_translation,
-                                    &candidate_extrinsic_rotation,
-                                    candidate_extrinsic_translation,
-                                    candidate_bearing_f32,
-                                )
-                                .map(
-                                    |(direction, inverse_distance)| {
-                                        (
-                                            direction.map(|value| value as f64),
-                                            inverse_distance as f64,
-                                        )
-                                    },
-                                ),
-                                None,
-                            )
-                        };
-                        if let Some(record) = trace_record {
-                            triangulation_attempts.push(record);
-                        }
-                        candidate_result
-                    } else {
+                    let triangulated_candidate = {
                         if capture_triangulation {
                             triangulation_attempts.push(json!({
                                 "candidate_index": candidate_index,
@@ -1867,7 +1750,7 @@ impl BasaltVioEstimator {
                             &complete_history,
                             &triangulation_attempts,
                             selected_attempt,
-                            self.config.scalar_mode,
+                            ScalarMode::ExtendedF64,
                         );
                     }
                 }
@@ -1880,15 +1763,9 @@ impl BasaltVioEstimator {
                 if !anchor_distance.is_finite() || anchor_distance <= 1e-9 {
                     continue;
                 }
-                let Some(stereographic_direction) =
-                    (if self.config.scalar_mode == ScalarMode::UpstreamF32 {
-                        StereographicDirection::from_triangulated_f32(
-                            direction.map(|value| value as f32),
-                        )
-                    } else {
-                        StereographicDirection::from_bearing(point_anchor.coords / anchor_distance)
-                    })
-                else {
+                let Some(stereographic_direction) = ({
+                    StereographicDirection::from_bearing(point_anchor.coords / anchor_distance)
+                }) else {
                     continue;
                 };
 
@@ -2203,7 +2080,7 @@ impl BasaltVioEstimator {
             .chain(self.window_states.iter().map(|state| {
                 (
                     state.frame_id,
-                    visual_state_pose_with_mode(state, self.config.scalar_mode),
+                    visual_state_pose_with_mode(state, ScalarMode::ExtendedF64),
                 )
             }))
             .collect::<BTreeMap<_, _>>();
@@ -2330,7 +2207,7 @@ impl BasaltVioEstimator {
             gravity_world: self
                 .gravity_world
                 .unwrap_or_else(|| Vector3::new(0.0, 0.0, -9.81)),
-            scalar_mode: self.config.scalar_mode,
+            scalar_mode: ScalarMode::ExtendedF64,
         }
     }
 
@@ -2556,7 +2433,7 @@ impl BasaltVioEstimator {
                     .rows_mut(offset, POSE_DOF)
                     .copy_from(&flatten_pose_with_mode(
                         &pose.linearized_pose,
-                        self.config.scalar_mode,
+                        ScalarMode::ExtendedF64,
                     ));
                 offset += POSE_DOF;
             }
@@ -2565,7 +2442,7 @@ impl BasaltVioEstimator {
                     .rows_mut(offset, NAV_STATE_DOF)
                     .copy_from(&flatten_nav_with_mode(
                         &state.linearized_nav,
-                        self.config.scalar_mode,
+                        ScalarMode::ExtendedF64,
                     ));
                 offset += NAV_STATE_DOF;
             }
@@ -2584,29 +2461,6 @@ impl BasaltVioEstimator {
     }
 
     fn calibrate_imu(&self, sample: ImuSample) -> ImuSample {
-        if self.config.scalar_mode == ScalarMode::UpstreamF32 {
-            let gyro = calibrate_gyro_f32(
-                &self.calib_gyro_bias,
-                Vector3::new(
-                    sample.gyro_rad_s.x as f32,
-                    sample.gyro_rad_s.y as f32,
-                    sample.gyro_rad_s.z as f32,
-                ),
-            );
-            let accel = calibrate_accel_f32(
-                &self.calib_accel_bias,
-                Vector3::new(
-                    sample.accel_m_s2.x as f32,
-                    sample.accel_m_s2.y as f32,
-                    sample.accel_m_s2.z as f32,
-                ),
-            );
-            return ImuSample::new(
-                sample.timestamp_ns,
-                gyro.map(|value| value as f64),
-                accel.map(|value| value as f64),
-            );
-        }
         ImuSample::new(
             sample.timestamp_ns,
             calibrate_gyro(&self.calib_gyro_bias, sample.gyro_rad_s),
@@ -3797,14 +3651,7 @@ impl BasaltVioEstimator {
             });
             offset += NAV_STATE_DOF;
         }
-        let (h, b) = if aom_problem.scalar_mode == ScalarMode::UpstreamF32 {
-            // Basalt assigns MargData::abs_H/abs_b from the already reduced
-            // Q2 rows, immediately before MargHelper consumes those rows.
-            // Do not rebuild the packet from the original factor list: that
-            // is an earlier boundary and has a different Eigen reduction
-            // tree.  q2_f32_normal_system widens only after its f32 product.
-            q2_f32_normal_system(&jacobian, &rhs_vector)
-        } else {
+        let (h, b) = {
             (
                 jacobian.transpose() * &jacobian,
                 jacobian.transpose() * &rhs_vector,
@@ -4087,11 +3934,7 @@ fn integrate_interval(
     bias_gyro: Vector3<f64>,
     bias_accel: Vector3<f64>,
     noise: ImuNoiseModel,
-    scalar_mode: ScalarMode,
 ) -> (Option<ImuPreintegratedDelta>, bool) {
-    if scalar_mode == ScalarMode::UpstreamF32 {
-        return integrate_queue_f32(samples, start_ns, end_ns, bias_gyro, bias_accel, noise);
-    }
     match integrate_between(
         samples,
         start_ns,
@@ -4111,7 +3954,7 @@ fn integrate_interval(
 /// Applies Basalt's static gyro calibration.  The parameter layout is the
 /// upstream `[b_x,b_y,b_z,s_1,s_2,s_3,s_4,s_5,s_6,s_7,s_8,s_9]`, with the
 /// scale columns stored contiguously after the three bias entries.
-fn calibrate_gyro(params: &[f64], raw: Vector3<f64>) -> Vector3<f64> {
+pub(crate) fn calibrate_gyro(params: &[f64], raw: Vector3<f64>) -> Vector3<f64> {
     if params.len() != 12 {
         return raw;
     }
@@ -4126,7 +3969,7 @@ fn calibrate_gyro(params: &[f64], raw: Vector3<f64>) -> Vector3<f64> {
 /// Applies Basalt's static accelerometer calibration.  Its six scale terms
 /// form the lower-triangular matrix described by `CalibAccelBias` in the
 /// pinned basalt-headers revision.
-fn calibrate_accel(params: &[f64], raw: Vector3<f64>) -> Vector3<f64> {
+pub(crate) fn calibrate_accel(params: &[f64], raw: Vector3<f64>) -> Vector3<f64> {
     if params.len() != 9 {
         return raw;
     }
@@ -4173,43 +4016,12 @@ fn calibrate_accel_f32(params: &[f64], raw: Vector3<f32>) -> Vector3<f32> {
 /// IMU packet at or after the camera timestamp defines roll/pitch by rotating
 /// its specific-force direction to world +Z; position, velocity, and biases
 /// start at zero.  No IMU interval is integrated before this first state.
-fn initial_nav_from_imu(
-    timestamp_ns: i64,
-    samples: &[ImuSample],
-    scalar_mode: ScalarMode,
-) -> BasaltNavState {
+fn initial_nav_from_imu(timestamp_ns: i64, samples: &[ImuSample]) -> BasaltNavState {
     let sample = samples
         .iter()
         .find(|sample| sample.timestamp_ns >= timestamp_ns)
         .or_else(|| samples.last());
-    let rotation = if scalar_mode == ScalarMode::UpstreamF32 {
-        sample
-            .and_then(|sample| {
-                let accel = sample.accel_m_s2.map(|value| value as f32);
-                if accel.norm_squared() > 1.0e-18_f32 && accel.iter().all(|value| value.is_finite())
-                {
-                    // Eigen's Quaternion::FromTwoVectors (used by the
-                    // pinned initialize() path) constructs the quaternion
-                    // directly from normalized dot/cross terms.  The
-                    // nalgebra rotation_between helper takes an
-                    // axis-angle route, which is mathematically equivalent
-                    // but rounds differently at the f32 boundary.
-                    Some(from_two_vectors_eigen_f32(accel, Vector3::z()))
-                } else {
-                    None
-                }
-            })
-            .map(|q| {
-                // `q` already owns the upstream Eigen/Sophus f32
-                // normalization.  Widen its stored components without a
-                // second f64 normalization: Sophus' cast path preserves the
-                // normalized Scalar quaternion at this boundary.
-                UnitQuaternion::new_unchecked(Quaternion::new(
-                    q.w as f64, q.i as f64, q.j as f64, q.k as f64,
-                ))
-            })
-            .unwrap_or_else(UnitQuaternion::identity)
-    } else {
+    let rotation = {
         sample
             .and_then(|sample| {
                 let accel = sample.accel_m_s2;
@@ -5084,90 +4896,10 @@ fn predict_nav(
     previous: &BasaltNavState,
     delta: Option<&ImuPreintegratedDelta>,
     gravity_world: Vector3<f64>,
-    scalar_mode: ScalarMode,
 ) -> BasaltNavState {
     let Some(delta) = delta else {
         return previous.clone();
     };
-    if scalar_mode == ScalarMode::UpstreamF32 {
-        // The public state widens the upstream f32 quaternion components to
-        // f64.  Narrowing those components for the next prediction must not
-        // normalize a second time; the source state is already a Sophus SO3
-        // unit quaternion at this boundary.
-        let q0 = UnitQuaternion::new_unchecked(Quaternion::new(
-            previous.imu_to_world.rotation.w as f32,
-            previous.imu_to_world.rotation.i as f32,
-            previous.imu_to_world.rotation.j as f32,
-            previous.imu_to_world.rotation.k as f32,
-        ));
-        let t0 = previous.imu_to_world.translation.map(|value| value as f32);
-        let v0 = previous.velocity_world_m_s.map(|value| value as f32);
-        let g = gravity_world.map(|value| value as f32);
-        let dt = delta.delta_time as f32;
-        let dp = delta.delta_position.map(|value| value as f32);
-        let dv = delta.delta_velocity.map(|value| value as f32);
-        let dq = UnitQuaternion::new_unchecked(Quaternion::new(
-            delta.delta_rotation.w as f32,
-            delta.delta_rotation.i as f32,
-            delta.delta_rotation.j as f32,
-            delta.delta_rotation.k as f32,
-        ));
-        // Keep the operation order of basalt's pinned
-        // `IntegratedImuMeasurement::predictState` literal.  In particular,
-        // the gravity terms precede the rotated preintegrated increments;
-        // changing only this association is enough to move the f32 result by
-        // one or more ulps after each camera interval.
-        // The pinned `predictState` instantiation routes both preintegrated
-        // vector actions through the out-of-line Packet4f SO3 operator.  Its
-        // duplicated cross-product lanes are observable beyond frame 38
-        // (frame 39 x differs by one ulp from the scalar-lane helper), so use
-        // the same schedule already required by delta velocity.
-        let rotated_delta_position = sophus_rotate_step_packet_f32(q0, dp);
-        // Eigen's packetized prediction materializes the half-gravity-times-
-        // dt operand, then performs the second position update as an FMA:
-        // `hdt = (0.5 * g) * dt; p_g = fma(hdt, dt, p_v)`.  Materializing
-        // `0.5*g*dt*dt` first changes the final f32 bit on nonzero gravity
-        // lanes, even though the real-valued expression is identical.
-        let gravity_half_dt = Vector3::new(
-            (0.5_f32 * g.x) * dt,
-            (0.5_f32 * g.y) * dt,
-            (0.5_f32 * g.z) * dt,
-        );
-        let position_after_velocity = Vector3::new(
-            v0.x.mul_add(dt, t0.x),
-            v0.y.mul_add(dt, t0.y),
-            v0.z.mul_add(dt, t0.z),
-        );
-        let position_after_gravity = Vector3::new(
-            gravity_half_dt.x.mul_add(dt, position_after_velocity.x),
-            gravity_half_dt.y.mul_add(dt, position_after_velocity.y),
-            gravity_half_dt.z.mul_add(dt, position_after_velocity.z),
-        );
-        let translation = Vector3::new(
-            position_after_gravity.x + rotated_delta_position.x,
-            position_after_gravity.y + rotated_delta_position.y,
-            position_after_gravity.z + rotated_delta_position.z,
-        );
-        let velocity = predict_velocity_f32(v0, g, dt, sophus_rotate_step_packet_f32(q0, dv));
-        let rotation = sophus_quat_product(q0, dq);
-        return BasaltNavState {
-            imu_to_world: SE3::new(
-                // `rotation` is the already-normalized upstream f32 Sophus
-                // product. Widen its components without a second f64
-                // normalization, matching the initial state conversion.
-                UnitQuaternion::new_unchecked(Quaternion::new(
-                    rotation.w as f64,
-                    rotation.i as f64,
-                    rotation.j as f64,
-                    rotation.k as f64,
-                )),
-                translation.map(|value| value as f64),
-            ),
-            velocity_world_m_s: velocity.map(|value| value as f64),
-            gyro_bias_rad_s: previous.gyro_bias_rad_s.map(|value| (value as f32) as f64),
-            accel_bias_m_s2: previous.accel_bias_m_s2.map(|value| (value as f32) as f64),
-        };
-    }
     let mut predicted = previous.clone();
     let dt = delta.delta_time.max(1e-9);
     predicted.imu_to_world.translation += previous
@@ -5635,8 +5367,7 @@ mod tests {
     fn unconnected_tracks_are_created_only_on_keyframes_and_count_successes() {
         let camera = cam();
         let cam1_extrinsic = SE3::new(UnitQuaternion::identity(), Vector3::new(0.2, 0.0, 0.0));
-        let mut config = EstimatorConfig::default();
-        config.scalar_mode = ScalarMode::ExtendedF64;
+        let config = EstimatorConfig::default();
         let mut estimator = BasaltVioEstimator::new(camera, config)
             .with_camera_rig(
                 vec![camera, camera],
@@ -6007,8 +5738,7 @@ mod tests {
     #[test]
     fn invalid_historical_bearing_fails_before_landmark_insertion() {
         let camera = cam();
-        let mut config = EstimatorConfig::default();
-        config.scalar_mode = ScalarMode::ExtendedF64;
+        let config = EstimatorConfig::default();
         let mut estimator = BasaltVioEstimator::new(camera, config);
         // ExtendedF64 triangulation can use the stored pose/raw bearing, but
         // this camera id is deliberately absent from the one-camera rig. The
@@ -6325,7 +6055,7 @@ mod tests {
                 Vector3::new(0.0, 2.0, 0.0),
             ),
         ];
-        let state = initial_nav_from_imu(100, &samples, ScalarMode::ExtendedF64);
+        let state = initial_nav_from_imu(100, &samples);
         let aligned = state
             .imu_to_world
             .rotation
@@ -6386,7 +6116,7 @@ mod tests {
             0.05,
         );
         let delta = preintegrator.delta().clone();
-        let predicted = predict_nav(&previous, Some(&delta), gravity, ScalarMode::ExtendedF64);
+        let predicted = predict_nav(&previous, Some(&delta), gravity);
         let factor =
             crate::imu::whitened_preintegration_factor(&previous, &predicted, &delta, gravity)
                 .expect("synthetic prediction must have a valid covariance");
@@ -7196,5 +6926,59 @@ mod tests {
         }
         assert!(first.states.len() <= 3);
         assert!(last.unwrap().marg_data.aom_sqrt_jacobian.cols >= 15);
+    }
+}
+
+#[cfg(test)]
+mod imu_closed_form_reference_tests {
+    use super::*;
+
+    /// Closed-form constant body-force / angular-rate solution, independent of
+    /// either implementation's update equations. Includes a partial last step.
+    #[test]
+    fn both_precision_paths_match_rotating_force_at_graco_imu_rate() {
+        let t: f64 = 0.05;
+        let w: f64 = 1.0;
+        let a: f64 = 2.0;
+        let expected_v = Vector3::new(a * (w * t).sin() / w, a * (1.0 - (w * t).cos()) / w, 0.0);
+        let expected_p = Vector3::new(
+            a * (1.0 - (w * t).cos()) / (w * w),
+            a * (t / w - (w * t).sin() / (w * w)),
+            0.0,
+        );
+        let bg = Vector3::new(0.002, -0.001, 0.0005);
+        let ba = Vector3::new(0.1, -0.2, 0.05);
+        let samples: Vec<_> = (1..=6)
+            .map(|i| {
+                ImuSample::new(
+                    i * 8_000_000,
+                    Vector3::new(0., 0., w) + bg,
+                    Vector3::new(a, 0., 0.) + ba,
+                )
+            })
+            .collect();
+        let noise = ImuNoiseModel {
+            gyro_density: 0.001,
+            accel_density: 0.01,
+        };
+        for (mode, (d, fallback)) in [
+            (
+                "upstream f32 reference",
+                integrate_queue_f32(&samples, 0, 50_000_000, bg, ba, noise),
+            ),
+            (
+                "f64 VIO",
+                integrate_interval(&samples, 0, 50_000_000, bg, ba, noise),
+            ),
+        ] {
+            let d = d.unwrap();
+            assert!(
+                fallback,
+                "streaming packet interval uses a held partial endpoint"
+            );
+            assert!((d.delta_velocity - expected_v).norm() < 2e-6, "{mode:?}");
+            assert!((d.delta_position - expected_p).norm() < 2e-6, "{mode:?}");
+            assert!((d.delta_rotation.angle() - w * t).abs() < 2e-7, "{mode:?}");
+        }
     }
 }

@@ -45,6 +45,10 @@ control); the native diagnostic completes all 17 stages **20.41×** faster with
 **17.0%** lower peak RSS. Full comparison tables and caveats:
 [SfM benchmark details](docs/sfm_benchmarks.md).
 
+## Multi-robot VIO SLAM (native Rust ROS2)
+
+The [native Rust ROS2 pipeline](ros2/README.md) runs f64 Basalt VIO with stationary gyro-only startup per robot, SB-SLAM-style ten-keyframe sequence construction and 5×5 JIST frame refinement, XFeat/LighterGlue verification, and a centralized sparse SE(3) backend. Robot and backend nodes use `rclrs` directly. ROS dependencies live in a separate workspace. See the [current VIO validation](ros2/F64_DEFAULT_VALIDATION.md) and [initial multi-robot validation](ros2/VALIDATION.md) for measured results and limitations.
+
 ## SfM and SLAM benchmarks
 
 visloc-rs registers **9,996/10,008 cameras (99.88%)** across every ETH3D

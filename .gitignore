@@ -1,6 +1,10 @@
 /target/
 /.runtime/
 /results/graco/
+/ros2/.cargo/
+/ros2/visloc_ros/.cargo/
+/ros2/log/
+/ros2/visloc_ros/target/
 **/*.rs.bk
 # Benchmark datasets fetched by scripts/fetch_pgo_g2o_datasets.sh
 /datasets/

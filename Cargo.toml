@@ -28,6 +28,7 @@ members = [
     "pipelines/mapping",
     "pipelines/slam",
     "pipelines/online-loop",
+    "pipelines/multi-robot",
     "pipelines/fusion",
     "pipelines/basalt",
 ]

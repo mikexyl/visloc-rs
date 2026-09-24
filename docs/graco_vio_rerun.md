@@ -4,6 +4,12 @@ Run GRACO aerial and ground sequences directly from their SQLite bags through
 visloc's Rust `basalt_stream_vio`. No ROS installation or image extraction is required.
 The source bag and calibration YAMLs are opened read-only.
 
+VIO uses **f64 only** and defaults to **stationary gyro-only initialization**.
+The first second must pass visual/IMU stationarity checks; its buffered frames
+are then replayed without omissions. See [startup configuration](imu-startup.md)
+and the [current aerial 5–8 validation](../ros2/UNIFORM_ATE4_VALIDATION.md).
+The precision switch has been removed; omit `--scalar-mode` from old commands.
+
 For online JIST keyframe-sequence retrieval, XFeat/LighterGlue matching and
 TensorRT inference, see [online loop closure](online_vio_loop_tensorrt.md).
 Add `--online-loop-config target/loop_models/loop_config.json` after building
@@ -37,7 +43,7 @@ For stereo comparisons, explicitly select `--camera-mode stereo` and optionally
 add `--stereo-refinement configs/graco/aerial-08-25m_stereo_refinement.json`.
 The generic replay CLI retains stereo as its default when the mode is omitted.
 
-The completed left-camera/IMU run at
+The historical left-camera/IMU run at
 `target/graco_vio/aerial-08-25m_mono_20260920` processed all **5,563 frames**
 (278.10 seconds). Full-run SE(3) ATE RMSE is **1.058 m** and diagnostic excess
 scale is **0.928%**, compared with **4.934 m / 8.995%** for the corrected stereo
@@ -45,7 +51,7 @@ run. No ground-truth alignment or scale correction enters estimation. The
 trajectory still has ordinary odometry drift; this is a working monocular
 alternative, not a repair of the unresolved stereo calibration.
 
-Reproduce this exact estimator mode after setup:
+Run the same monocular input configuration with the current estimator defaults:
 
 ```bash
 target/graco-venv/bin/python scripts/run_graco_vio.py \
@@ -221,8 +227,9 @@ Controlled comparisons over the same first 2,000 frames (99.95 s):
 The stereo alternatives did not fix scale and are not promoted to defaults.
 `--rectify` is available for further diagnosis; `--preview-width` controls
 Rerun image size independently of processing resolution.
-`--scalar-mode f64` enables experimental double-precision arithmetic; the
-default remains the upstream-compatible `f32` path.
+These precision comparisons used the former selectable f32/f64 estimator.
+The current estimator is fixed to f64 with stationary gyro-only startup;
+the historical measurements above are not results for the new defaults.
 
 Starting separately at frame 300 (the first hover), then processing through
 frame 1999, still gives 7.66% excess scale and 2.075 m SE(3) ATE. This uses a

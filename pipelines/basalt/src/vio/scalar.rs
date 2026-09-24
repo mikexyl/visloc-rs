@@ -1,22 +1,20 @@
-//! Numeric ownership for the VIO compatibility core.
+//! Numeric ownership for low-level solver/reference arithmetic.
 //!
 //! Basalt's public feed is double precision (`ImuData<double>`, calibration
-//! and trajectory output), but the default estimator instantiated by
-//! `VioEstimatorFactory` is `SqrtKeypointVioEstimator<float>`.  Keeping the
-//! choice explicit prevents a final `H/b` cast from being mistaken for the
-//! upstream scalar boundary: the selected mode owns state prediction,
-//! landmark/factor arithmetic, QR, solve, and LM cost evaluation.
+//! and trajectory output). The Rust VIO estimator always uses f64 and exposes
+//! no precision selector. The f32 variant remains for upstream numerical
+//! reference fixtures and low-level arithmetic tests, not as a VIO mode.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarMode {
     /// The pinned Basalt default: `SqrtKeypointVioEstimator<float>`.
     UpstreamF32,
-    /// Extended Rust/API mode retained for numerical experiments and tests.
+    /// The fixed precision of the Rust VIO estimator.
     ExtendedF64,
 }
 
 impl Default for ScalarMode {
     fn default() -> Self {
-        Self::UpstreamF32
+        Self::ExtendedF64
     }
 }

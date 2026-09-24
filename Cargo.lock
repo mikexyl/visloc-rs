@@ -921,6 +921,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "visloc-multi-robot"
+version = "0.1.0"
+dependencies = [
+ "nalgebra",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "visloc-core",
+ "visloc-online-loop",
+ "visloc-slam",
+ "visloc-vision",
+]
+
+[[package]]
 name = "visloc-online-loop"
 version = "0.1.0"
 dependencies = [

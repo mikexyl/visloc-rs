@@ -693,7 +693,7 @@ fn information(translation_sigma: f64, rotation_sigma: f64) -> Matrix6<f64> {
     m
 }
 
-fn select_observations(
+pub fn select_observations(
     observations: Vec<Observation>,
     width: usize,
     height: usize,

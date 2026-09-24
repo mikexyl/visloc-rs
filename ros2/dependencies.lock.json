@@ -1,0 +1,13 @@
+{
+  "ros_distro": "humble",
+  "minimum_rust": "1.85",
+  "rclrs": "0.7.0",
+  "rosidl_rust": {"repository":"https://github.com/ros2-rust/rosidl_rust", "revision":"19d57818dab3b51e418c0893b70b3a1a8b64c495", "generator_version":"0.5.0"},
+  "rosidl_runtime_rs": {"repository":"https://github.com/ros2-rust/rosidl_runtime_rs", "revision":"c443e1e8d4e87e22021c4abd99b5e5d088f9165b", "version":"0.6.1"},
+  "colcon_cargo": "0.2.0",
+  "colcon_ros_cargo": "0.2.0",
+  "cargo_ament_build": "0.1.11",
+  "empy": "3.3.4",
+  "test_msgs_humble_deb": "1.2.3-1jammy.20260907.205609",
+  "clang14_jammy_deb": "1:14.0.0-1ubuntu1.1"
+}

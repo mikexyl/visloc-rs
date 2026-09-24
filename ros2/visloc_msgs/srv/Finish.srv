@@ -1,0 +1,4 @@
+# Finish once all images through this timestamp have been processed.
+int64 last_image_timestamp_ns
+---
+bool accepted

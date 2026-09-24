@@ -1,0 +1,37 @@
+[package]
+name = "visloc_ros"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+# ROS must be sourced only for this workspace, never for ordinary visloc builds.
+[workspace]
+
+[dependencies]
+rclrs = "=0.7.0"
+rosidl_runtime_rs = "=0.6.1"
+visloc_msgs = "*"
+sensor_msgs = "*"
+nav_msgs = "*"
+geometry_msgs = "*"
+std_msgs = "*"
+tf2_msgs = "*"
+builtin_interfaces = "*"
+visloc-multi-robot = { path = "../../pipelines/multi-robot", features = ["native"] }
+visloc-online-loop = { path = "../../pipelines/online-loop", features = ["native"] }
+visloc-basalt = { path = "../../pipelines/basalt", features = ["basalt-lm-workspace-reuse"] }
+visloc-core = { path = "../../crates/core" }
+nalgebra = "0.33"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+uuid = { version = "1", features = ["v4"] }
+opencv = { version = "=0.96.0", default-features = false, features = ["imgproc", "calib3d", "clang-runtime"] }
+
+[package.metadata.ros]
+install_to_share = ["launch", "config"]
+
+# rosidl_generator_rs 0.5 emits Sequence<T> -> Vec<T> conversions added after
+# runtime 0.6.0. Pin the compatible Humble ABI, before the 0.7 ABI change.
+[patch.crates-io]
+rosidl_runtime_rs = { git = "https://github.com/ros2-rust/rosidl_runtime_rs", rev = "c443e1e8d4e87e22021c4abd99b5e5d088f9165b" }

@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>visloc_ros</name><version>0.1.0</version>
+  <description>Native rclrs robot and centralized SLAM backend nodes.</description>
+  <maintainer email="mikexyl@users.noreply.github.com">visloc contributors</maintainer>
+  <license>MIT</license>
+  <buildtool_depend>ament_cargo</buildtool_depend>
+  <depend>visloc_msgs</depend><depend>sensor_msgs</depend><depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend><depend>std_msgs</depend><depend>tf2_msgs</depend><depend>builtin_interfaces</depend>
+  <export><build_type>ament_cargo</build_type></export>
+</package>

@@ -339,6 +339,57 @@ class FeatureTrackOverlay:
             rr.log(path + '/trails', rr.Clear(recursive=True))
 
 
+
+def stream_vio_frames(args, process, bag, frames, maps, raw_sizes, imu, imu_stamps,
+                      initial_index, imu_index, width, height):
+    """Bounded startup batches; visualize each released original frame in order."""
+    from collections import deque
+    pending = deque()
+    unused_right = bytes(width * height) if args.camera_mode == 'mono' else None
+    for index, (stamp, left_id, right_id) in enumerate(frames):
+        image_ids = (left_id,) if args.camera_mode == 'mono' else (left_id, right_id)
+        images = [cv2.remap(
+            cv2.resize(bag.image(row, stamp, raw_sizes[i]), (width, height), interpolation=cv2.INTER_AREA),
+            *maps[i], cv2.INTER_LINEAR) for i, row in enumerate(image_ids)]
+        end = int(np.searchsorted(imu_stamps, stamp, side='right'))
+        header = json.dumps({
+            'timestamp_ns': stamp, 'width': width, 'height': height,
+            'imu': imu[imu_index:end], 'initialization_imu': imu[initial_index],
+        }, allow_nan=False).encode()
+        process.stdin.write(struct.pack('<I', len(header)) + header)
+        for image in images:
+            process.stdin.write(image.tobytes())
+        if unused_right is not None:
+            process.stdin.write(unused_right)
+        process.stdin.flush()
+        pending.append((index, stamp, images))
+        if len(pending) > 64:
+            raise RuntimeError('VIO startup buffer exceeded 64 frames')
+        imu_index = end
+        while True:
+            line = process.stdout.readline()
+            if not line:
+                raise RuntimeError(f'VIO stopped at frame {index}; see {args.output / "vio_stderr.log"}')
+            result = json.loads(line)
+            if result.get('batch_complete'):
+                if args.imu_startup == 'legacy' or result['received_frames'] != index + 1:
+                    raise RuntimeError('Invalid VIO startup batch acknowledgement')
+                oldest = result.get('oldest_buffered_frame_id')
+                while pending and oldest is not None and pending[0][0] < oldest:
+                    pending.popleft()
+                break
+            if not pending:
+                raise RuntimeError('Unexpected VIO output without a sensor frame')
+            ready_index, ready_stamp, ready_images = pending.popleft()
+            if result['timestamp_ns'] != ready_stamp or result['frame_id'] != ready_index:
+                raise RuntimeError('VIO acknowledgement does not match the buffered sensor frame')
+            yield ready_index, ready_stamp, ready_images, result
+            if args.imu_startup == 'legacy':
+                break
+    if pending:
+        raise RuntimeError('Stream ended before stationary IMU initialization completed')
+
+
 def replay(args):
     args.output.mkdir(parents=True, exist_ok=False)
     cv2.setNumThreads(2)
@@ -355,9 +406,15 @@ def replay(args):
         truth = load_truth(bag, args.output)
         truth_stamps = np.array([p[0] for p in truth], dtype=np.int64)
         requested = len(frames)
+        if args.start_frame >= requested:
+            raise ValueError('start frame is outside the bag')
+        frames = frames[args.start_frame:]
         if args.max_frames:
             frames = frames[:args.max_frames]
-        if imu_stamps[0] > frames[0][0] or imu_stamps[-1] < frames[-1][0]:
+        # Initialization consumes the first IMU at/after the first image.
+        # Permit an empty first interval, but require IMU before image two.
+        if (imu_stamps[-1] < frames[-1][0]
+                or (len(frames) > 1 and imu_stamps[0] > frames[1][0])):
             raise ValueError('IMU does not cover the requested camera interval')
         init_rerun(args, calibration)
         if args.da3_config:
@@ -367,46 +424,29 @@ def replay(args):
         print(f'Replaying {len(frames)}/{requested} camera frames, {len(imu)} IMU samples, {width}x{height}; estimator={args.camera_mode}', flush=True)
         # The stream wire format has two fixed-size image buffers. In mono
         # mode its second buffer is discarded; do not decode the right camera.
-        unused_right_image = bytes(width * height) if args.camera_mode == 'mono' else None
         started = time.monotonic()
         positions, estimates, timings, observations = [], [], [], []
         feature_overlay = FeatureTrackOverlay()
         loop_status = None
-        imu_index = 0
+        # A cropped replay starts a fresh estimator, not an IMU-only warmup.
+        imu_index = int(np.searchsorted(imu_stamps, frames[0][0], side='left')) if args.start_frame else 0
+        imu_start_index = imu_index
         initial_index = int(np.searchsorted(imu_stamps, frames[0][0], side='left'))
         gt_rotation, gt_translation = np.eye(3), np.zeros(3)
         with (args.output / 'vio_stderr.log').open('w') as error_log:
             command = [
                 str(args.binary), str(args.output / 'basalt_calibration.json'),
                 str(args.output / 'basalt_config.json'), str(args.output),
-                '--scalar-mode', args.scalar_mode, '--camera-mode', args.camera_mode]
+                '--camera-mode', args.camera_mode, '--imu-startup', args.imu_startup]
             if args.online_loop_config:
                 command.extend(['--online-loop-config', str(args.online_loop_config.resolve())])
             process = subprocess.Popen(command,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=error_log)
             try:
-                for index, (stamp, left_id, right_id) in enumerate(frames):
-                    image_ids = (left_id,) if args.camera_mode == 'mono' else (left_id, right_id)
-                    images = [cv2.remap(
-                        cv2.resize(bag.image(row, stamp, raw_sizes[i]), (width, height), interpolation=cv2.INTER_AREA),
-                        *maps[i], cv2.INTER_LINEAR) for i, row in enumerate(image_ids)]
+                for index, stamp, images, result in stream_vio_frames(
+                        args, process, bag, frames, maps, raw_sizes, imu, imu_stamps,
+                        initial_index, imu_index, width, height):
                     end = int(np.searchsorted(imu_stamps, stamp, side='right'))
-                    header = json.dumps({
-                        'timestamp_ns': stamp, 'width': width, 'height': height,
-                        'imu': imu[imu_index:end], 'initialization_imu': imu[initial_index],
-                    }, allow_nan=False).encode()
-                    process.stdin.write(struct.pack('<I', len(header)) + header)
-                    for image in images:
-                        process.stdin.write(image.tobytes())
-                    if unused_right_image is not None:
-                        process.stdin.write(unused_right_image)
-                    process.stdin.flush()
-                    line = process.stdout.readline()
-                    if not line:
-                        raise RuntimeError(f'VIO stopped at frame {index}; see {args.output / "vio_stderr.log"}')
-                    result = json.loads(line)
-                    if result['timestamp_ns'] != stamp or result['frame_id'] != index:
-                        raise RuntimeError('VIO acknowledgement does not match the sensor frame')
                     if 'feature_tracks' not in result:
                         raise RuntimeError('Rebuild basalt_stream_vio to enable feature-track overlays')
                     if depth_worker:
@@ -426,7 +466,7 @@ def replay(args):
                     observations.append(result['observations'])
                     elapsed = (stamp - frames[0][0]) / 1e9
                     rr.set_time('elapsed', duration=elapsed)
-                    if index == 0 and truth:
+                    if len(estimates) == 1 and truth:
                         nearest = int(np.argmin(np.abs(truth_stamps - stamp)))
                         if abs(int(truth_stamps[nearest]) - stamp) > 10_000_000:
                             raise ValueError('Ground truth does not match the initial image timestamp')
@@ -494,9 +534,14 @@ def replay(args):
                     process.stdin.close()
         summary = {
             'bag': str(args.bag), 'frames_available': requested, 'frames_processed': len(estimates),
-            'sensor_only': True, 'imu_samples_loaded': len(imu), 'imu_samples_delivered': imu_index,
-            'scalar_mode': args.scalar_mode,
+            'frames_ingested': len(frames), 'initialization_skipped_frames': len(frames)-len(estimates),
+            'start_frame': args.start_frame,
+            'sensor_only': True, 'imu_samples_loaded': len(imu),
+            'imu_samples_delivered': imu_index - imu_start_index,
+            'imu_samples_skipped_before_start': imu_start_index,
+            'scalar_mode': 'f64',
             'camera_mode': args.camera_mode,
+            'imu_startup': args.imu_startup,
             'imu_noise_scale': args.imu_noise_scale, 'imu_bias_scale': args.imu_bias_scale,
             'feature_tracks': 'KLT observations with persistent ID colors and 12-frame trails',
             'sensor_duration_s': (frames[-1][0] - frames[0][0]) / 1e9,
@@ -566,22 +611,25 @@ def main():
     parser.add_argument('--binary', type=Path, default=REPO / 'target/release/examples/basalt_stream_vio')
     parser.add_argument('--online-loop-config', type=Path, help='JIST/XFeat/LighterGlue TensorRT engine bundle config')
     parser.add_argument('--da3-config', type=Path, help='WIP pose-conditioned five-keyframe DA3 TensorRT depth; gate inference on new FOV coverage; select pose-only or landmark depth scale in the config')
+    parser.add_argument('--imu-startup', choices=['stationary', 'legacy', 'stationary-gravity', 'stationary-motion'], default='stationary',
+                        help='Default: stationary gyro-only initialization; legacy explicitly bypasses the startup gate')
     parser.add_argument('--imu-noise-scale', type=float, default=1.0,
                         help='Multiplier for calibrated accelerometer/gyroscope white-noise standard deviations')
     parser.add_argument('--imu-bias-scale', type=float, default=1.0,
                         help='Multiplier for calibrated accelerometer/gyroscope bias random-walk standard deviations')
     parser.add_argument('--output', type=Path, required=True, help='New directory; existing outputs are never overwritten')
     parser.add_argument('--width', type=int, default=800)
-    parser.add_argument('--scalar-mode', choices=('f32', 'f64'), default='f32', help='Estimator arithmetic; f64 is experimental')
     parser.add_argument('--camera-mode', choices=('stereo', 'mono'), default='stereo', help='Use and display both cameras or only the left camera and IMU')
     parser.add_argument('--preview-width', type=int, default=800, help='Rerun preview width; 0 keeps processing resolution')
     parser.add_argument('--max-frames', type=int)
+    parser.add_argument('--start-frame', type=int, default=0,
+                        help='Start a fresh estimator at this camera index (diagnostic startup ablation)')
     parser.add_argument('--rerun-connect', help='Optional viewer URL, e.g. rerun+http://127.0.0.1:9878/proxy')
     args = parser.parse_args()
     if any(not np.isfinite(v) or v <= 0 for v in (args.imu_noise_scale, args.imu_bias_scale)):
         parser.error('IMU noise and bias scales must be finite and positive')
-    if args.width < 64 or args.preview_width < 0 or (args.max_frames is not None and args.max_frames < 1):
-        parser.error('width must be >=64 and max frames must be positive')
+    if args.width < 64 or args.preview_width < 0 or args.start_frame < 0 or (args.max_frames is not None and args.max_frames < 1):
+        parser.error('width must be >=64, start frame nonnegative, and max frames positive')
     try:
         args.calibration_dir = calibration_for_bag(args.bag, args.calibration_dir)
     except ValueError as error:
