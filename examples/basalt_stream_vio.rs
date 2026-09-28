@@ -42,16 +42,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 4 || (args.len() - 4) % 2 != 0 {
         return Err(
-            "usage: basalt_stream_vio CALIBRATION CONFIG OUTPUT_DIR [--camera-mode stereo|mono] [--imu-startup stationary|legacy|stationary-gravity|stationary-motion] (f64; stationary gyro-only startup by default)".into(),
+            "usage: basalt_stream_vio CALIBRATION CONFIG OUTPUT_DIR [--camera-mode stereo|mono] [--imu-startup stationary|legacy|stationary-gravity|stationary-motion] [--keyframe-poses on|off] (f64; stationary gyro-only startup by default)".into(),
         );
     }
     let mut monocular = false;
+    let mut keyframe_pose_output = false;
     let mut loop_config = None;
     let mut imu_startup = Some(visloc_basalt::startup::StationaryStartupConfig::default());
     for option in args[4..].chunks_exact(2) {
         match (option[0].as_str(), option[1].as_str()) {
             ("--camera-mode", "stereo") => monocular = false,
             ("--camera-mode", "mono") => monocular = true,
+            ("--keyframe-poses", "on") => keyframe_pose_output = true,
+            ("--keyframe-poses", "off") => keyframe_pose_output = false,
             ("--imu-startup", "legacy") => imu_startup = None,
             (
                 "--imu-startup",
@@ -73,6 +76,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let config = BasaltConfig::from_json(&fs::read_to_string(&args[2])?)?;
     let mut adapter = BasaltVioEstimatorAdapter::from_config(&calibration, &config)?;
+    adapter.estimator.enable_keyframe_pose_output(keyframe_pose_output);
     let mut startup = imu_startup
         .map(|c| visloc_basalt::startup::StationaryStartup::new(&calibration, &config, c))
         .transpose()?;
@@ -341,10 +345,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .map(|o| json!([o.camera_id, o.track_id, o.pixel.x, o.pixel.y]))
                 .collect();
+            // Read-only optimized poses include a keyframe's final revision
+            // before it leaves the active window. Downstream maps keep stable IDs.
+            let keyframe_poses: Vec<_> = result.estimator.keyframe_poses.iter().map(|k| {
+                let q = k.pose.rotation.quaternion();
+                let p = k.pose.translation;
+                json!({"frame_id":k.frame_id,"timestamp_ns":k.timestamp_ns,
+                    "version":k.version,"departing":k.departing,
+                    "position":[p.x,p.y,p.z],"quaternion_xyzw":[q.i,q.j,q.k,q.w]})
+            }).collect();
             writeln!(
                 output,
                 "{}",
-                json!({"frame_id":frame_id,"timestamp_ns":t,"position":[p.x,p.y,p.z],"quaternion_xyzw":[q.i,q.j,q.k,q.w],"observations":[c0,c1],"imu_samples":result.imu_count,"process_ms":process_ms,"map_points":map_points,"feature_tracks":feature_tracks,"is_keyframe":result.estimator.is_keyframe,"loop_closure":loop_update})
+                json!({"frame_id":frame_id,"timestamp_ns":t,"position":[p.x,p.y,p.z],"quaternion_xyzw":[q.i,q.j,q.k,q.w],"observations":[c0,c1],"imu_samples":result.imu_count,"process_ms":process_ms,"map_points":map_points,"feature_tracks":feature_tracks,"is_keyframe":result.estimator.is_keyframe,"keyframe_poses":keyframe_poses,"loop_closure":loop_update})
             )?;
             output.flush()?;
         }
