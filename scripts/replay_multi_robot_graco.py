@@ -17,6 +17,7 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from rclpy.serialization import serialize_message
 from sensor_msgs.msg import Image, Imu
+from std_msgs.msg import UInt8MultiArray
 from nav_msgs.msg import Odometry
 from rosgraph_msgs.msg import Clock
 from visloc_msgs.msg import Status, SequenceAnnouncement, LoopConstraint, GraphSnapshot
@@ -53,7 +54,18 @@ class Replay(Node):
             self.subs.append(self.create_subscription(Odometry, f'/{name}/vio/odometry', lambda m, n=name: self.ack.update({n: m.header.stamp.sec * 10**9 + m.header.stamp.nanosec}), reliable))
             source = open_source(robot)
             frames, imu, times = source.frames, source.imu, source.times
-            self.streams.append(dict(robot=robot, source=source, frames=frames, imu=imu, times=times, imu_index=0,
+            gnss=None
+            if (robot_config.get('gnss') or {}).get('enabled', False):
+                if robot_config.get('gnss_typed_input', False):
+                    raise ValueError('Recorded UBX replay requires raw GNSS input')
+                mapping=int(robot['offset_ns'])
+                if robot_config.get('gnss_replay_shift_ns') != mapping:
+                    raise ValueError('GNSS replay timestamp mapping must equal the camera/IMU mapping')
+                path=Path(robot['gnss_raw'])
+                receipts=[json.loads(line) for line in Path(robot['gnss_receipts']).read_text().splitlines()]
+                gnss={'file':path.open('rb'),'receipts':receipts,'index':0,
+                      'pub':self.create_publisher(UInt8MultiArray,f'/{name}/gnss/raw',reliable)}
+            self.streams.append(dict(gnss=gnss,robot=robot, source=source, frames=frames, imu=imu, times=times, imu_index=0,
                 image_pub=self.create_publisher(Image, f'/{name}/camera/image', reliable),
                 right_pub=self.create_publisher(Image, f'/{name}/camera_right/image', reliable) if stereo else None,
                 imu_pub=self.create_publisher(Imu, f'/{name}/imu', QoSProfile(depth=2048, reliability=ReliabilityPolicy.RELIABLE)),
@@ -85,6 +97,7 @@ class Replay(Node):
     def run(self):
         self.spin_until(lambda: len(self.status) == len(self.streams) and all(s.ready for s in self.status.values()), 180, 'robot readiness')
         self.spin_until(lambda: all(s['image_pub'].get_subscription_count() and s['imu_pub'].get_subscription_count()
+                                   and (s['gnss'] is None or s['gnss']['pub'].get_subscription_count())
                                    and (s['right_pub'] is None or s['right_pub'].get_subscription_count())
                                    for s in self.streams), 30, 'sensor discovery')
         queue = [(s['frames'][0][0] + s['robot']['offset_ns'], i, 0) for i, s in enumerate(self.streams)]
@@ -115,6 +128,18 @@ class Replay(Node):
                     m.linear_acceleration.x, m.linear_acceleration.y, m.linear_acceleration.z = sample[4:7]
                     stream['imu_pub'].publish(m)
                 stream['imu_index'] = end
+                gnss=stream['gnss']
+                if gnss is not None:
+                    while gnss['index']<len(gnss['receipts']):
+                        receipt=gnss['receipts'][gnss['index']]
+                        receipt_ns=receipt['sec']*10**9+receipt['nanosec']
+                        if receipt_ns>original_ns: break
+                        gnss['file'].seek(receipt['offset'])
+                        payload=gnss['file'].read(receipt['length'])
+                        if len(payload)!=receipt['length']:raise ValueError('Truncated GNSS raw recording')
+                        message=UInt8MultiArray(data=array.array('B',payload));gnss['pub'].publish(message)
+                        self.count('gnss_raw',message)
+                        gnss['index']+=1
                 raw = stream['source'].image(row)
                 m = Image(); stamp(m.header.stamp, ns); m.header.frame_id = f"{robot['robot']}/camera"
                 m.width, m.height, m.step, m.encoding, m.is_bigendian = raw.width, raw.height, raw.step, raw.encoding, raw.is_bigendian
@@ -191,6 +216,7 @@ class Replay(Node):
         (self.output / 'replay_summary.json').write_text(json.dumps(summary, indent=2) + '\n')
         for stream in self.streams:
             stream['source'].close()
+            if stream['gnss'] is not None: stream['gnss']['file'].close()
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)

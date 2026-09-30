@@ -2179,6 +2179,17 @@ pub trait LmProblem {
     fn linearize(&self, state: &DVector<f64>) -> Result<LmLinearization, LmFailure>;
     fn cost(&self, state: &DVector<f64>) -> Result<f64, LmFailure>;
 
+    /// Expanded problems may reduce only the nonzero state columns of each
+    /// factor. Ordinary VIO retains its historical arithmetic and ordering.
+    fn reduce_f64(
+        &self,
+        factors: &[WhitenedFactorRowStack],
+        state_dof: usize,
+        tolerance: f64,
+    ) -> ReducedNormalSystem {
+        reduce_landmark_factors(factors, state_dof, tolerance)
+    }
+
     /// Optional frame identity for the diagnostic-only IMU reduction audit.
     /// Generic/synthetic problems remain unlabelled and incur no work.
     fn diagnostic_frame_id(&self) -> Option<u64> {
@@ -2741,7 +2752,7 @@ pub(crate) fn solve_lm_with_timing<P: LmProblem>(
         })?;
         let reduced_f64 = if scalar_mode == ScalarMode::ExtendedF64 {
             Some(timing.measure(TimingBucket::LmLandmarkReduction, || {
-                reduce_landmark_factors(&lin.factors, state.len(), 1e-10)
+                problem.reduce_f64(&lin.factors, state.len(), 1e-10)
             }))
         } else {
             None

@@ -396,6 +396,7 @@ fn append_triangulation_trace(
 /// all observations of a track before landmark QR elimination.
 #[derive(Debug)]
 pub struct BasaltVioEstimator {
+    pub gnss: Option<crate::gnss::GnssRuntime>,
     keyframe_pose_output_enabled: bool,
     pub camera: DoubleSphereCamera,
     pub config: EstimatorConfig,
@@ -516,6 +517,7 @@ impl BasaltVioEstimator {
 
     pub fn new(camera: DoubleSphereCamera, config: EstimatorConfig) -> Self {
         Self {
+            gnss: None,
             camera,
             config,
             stream: BasaltStream::new(false),
@@ -572,6 +574,38 @@ impl BasaltVioEstimator {
             lifecycle_trace_previous: None,
             lifecycle_trace_peak: LifecycleTracePeak::default(),
             timing: TimingBreakdown::from_env(),
+        }
+    }
+
+    /// Opt-in raw GNSS; disabled configuration leaves the numeric path unchanged.
+    pub fn configure_gnss(&mut self, config: visloc_gnss::Config) -> Result<(), String> {
+        if self.last_timestamp_ns.is_some() {
+            return Err("configure GNSS before sensor processing".into());
+        }
+        self.gnss = if config.enabled {
+            Some(crate::gnss::GnssRuntime::new(
+                config,
+                &self.t_imu_cam[0].rotation,
+                self.t_imu_cam[0].translation,
+            )?)
+        } else {
+            None
+        };
+        Ok(())
+    }
+    pub fn push_gnss_raw(&mut self, bytes: &[u8], receipt_ns: i64) {
+        if let Some(g) = &mut self.gnss {
+            g.push_raw(bytes, receipt_ns);
+        }
+    }
+    pub fn push_gnss_epoch(&mut self, epoch: visloc_gnss::Epoch) {
+        if let Some(g) = &mut self.gnss {
+            g.push_epoch(epoch);
+        }
+    }
+    pub fn push_gnss_ephemeris(&mut self, ephemeris: visloc_gnss::navigation::Ephemeris) {
+        if let Some(g) = &mut self.gnss {
+            g.push_ephemeris(ephemeris);
         }
     }
 
@@ -929,6 +963,9 @@ impl BasaltVioEstimator {
             .copied()
             .map(|sample| self.calibrate_imu(sample))
             .collect::<Vec<_>>();
+        if let Some(g) = &mut self.gnss {
+            g.record_imu(&calibrated_imu);
+        }
         let calibrated_initialization_imu =
             initialization_imu.map(|sample| self.calibrate_imu(sample));
         for sample in &calibrated_imu {
@@ -1134,7 +1171,13 @@ impl BasaltVioEstimator {
                 .finish(TimingBucket::EstimatorBuildProblem, build_started);
             let initial_state = problem.initial_state();
             let lm_started = self.timing.start();
-            let solution_result = if retain_marg_data {
+            let solution_result = if self.gnss.as_ref().is_some_and(|g| g.active()) {
+                self.gnss.as_mut().unwrap().solve(
+                    &mut problem,
+                    self.config.solver,
+                    &mut self.timing,
+                )
+            } else if retain_marg_data {
                 problem.solve_with_timing(initial_state, self.config.solver, &mut self.timing)
             } else if retain_trace_payload {
                 problem.solve_without_factors_with_timing(
@@ -1237,17 +1280,27 @@ impl BasaltVioEstimator {
                     plan.boundary_state,
                     &marg_factors,
                 );
-                self.prior = marginalize_mixed_prior_with_mode(
-                    &marg_factors,
-                    &marg_problem.poses,
-                    &marg_problem.states,
-                    &plan.drop_poses,
-                    &plan.drop_states,
-                    &plan.convert_states,
-                    ScalarMode::ExtendedF64,
-                    &marg_state,
-                )
-                .or_else(|| self.anchor_prior_for_kept(&fallback_dropped));
+                if self.gnss.as_ref().is_some_and(|g| g.active()) {
+                    self.gnss.as_mut().unwrap().marginalize(
+                        &marg_problem,
+                        &plan.drop_poses,
+                        &plan.drop_states,
+                        &plan.convert_states,
+                    )?;
+                    self.prior = None;
+                } else {
+                    self.prior = marginalize_mixed_prior_with_mode(
+                        &marg_factors,
+                        &marg_problem.poses,
+                        &marg_problem.states,
+                        &plan.drop_poses,
+                        &plan.drop_states,
+                        &plan.convert_states,
+                        ScalarMode::ExtendedF64,
+                        &marg_state,
+                    )
+                    .or_else(|| self.anchor_prior_for_kept(&fallback_dropped));
+                }
                 let prior_pre_transition = if retain_marg_sidecar {
                     take_diagnostic_prior_pre().and_then(|prior| Self::prior_data(&prior))
                 } else {
@@ -1402,6 +1455,9 @@ impl BasaltVioEstimator {
             .last()
             .map(|state| state.nav.clone())
             .unwrap_or_else(|| predicted_nav.clone());
+        if let Some(g) = &mut self.gnss {
+            g.sensor_frame(timestamp_ns, &post_opt_state, &calibrated_imu);
+        }
         self.last_timestamp_ns = Some(timestamp_ns);
         let marg = if retain_marg_data {
             self.pending_marg_data
@@ -2515,13 +2571,13 @@ impl BasaltVioEstimator {
     }
 
     fn marginalization_plan(&self, current_frame_id: u64) -> MarginalizationPlan {
-        let trigger_states = self.window_states.len() >= self.config.window.max_states;
+        let mut trigger_states = self.window_states.len() >= self.config.window.max_states;
         let trigger_poses = self.window_poses.len() > self.config.window.max_kfs;
         if !trigger_states && !trigger_poses {
             return MarginalizationPlan::default();
         }
 
-        let states_to_remove = if trigger_states {
+        let mut states_to_remove = if trigger_states {
             self.window_states
                 .len()
                 .saturating_sub(self.config.window.max_states)
@@ -2529,6 +2585,23 @@ impl BasaltVioEstimator {
         } else {
             0
         };
+        if let Some(g) = self.gnss.as_ref().filter(|g| g.active()) {
+            let latest = self.window_states.last().map_or(0, |s| s.timestamp_ns);
+            let cutoff = latest - (g.config.min_active_window_s * 1e9).round() as i64;
+            let by_time = self
+                .window_states
+                .partition_point(|s| s.timestamp_ns < cutoff)
+                .saturating_sub(1);
+            let by_capacity = self
+                .window_states
+                .len()
+                .saturating_sub(g.config.max_navigation_states);
+            states_to_remove = states_to_remove.min(by_time).max(by_capacity);
+            trigger_states = states_to_remove > 0;
+        }
+        if !trigger_states && !trigger_poses {
+            return MarginalizationPlan::default();
+        }
         let mut plan = MarginalizationPlan::default();
         // `states_to_remove` is the number erased before the retained FEJ
         // boundary, not the boundary's own index.  This is the subtle
@@ -6892,6 +6965,33 @@ mod tests {
         assert!(outputs[4].window.lm.iter().any(|run| run.pass == "first"));
     }
 
+    #[test]
+    fn disabled_gnss_preserves_every_raw_vio_bit() {
+        let mut first = BasaltVioEstimator::new(cam(), EstimatorConfig::default());
+        let mut second = BasaltVioEstimator::new(cam(), EstimatorConfig::default());
+        second
+            .configure_gnss(visloc_gnss::Config::default())
+            .unwrap();
+        second.push_gnss_raw(&[0xb5, 0x62, 0xff, 0xff], 0);
+        assert!(second.gnss.is_none());
+        for frame in 0..12 {
+            let point = Point3::new(0.1, 0., 2.);
+            let observation = obs(&first.camera, 1, frame, point);
+            let imu = [ImuSample::new(
+                frame as i64 * 10,
+                Vector3::zeros(),
+                Vector3::new(0., 0., 9.81),
+            )];
+            let a = first
+                .process(frame, frame as i64 + 1, &[observation.clone()], &imu)
+                .unwrap();
+            let b = second
+                .process(frame, frame as i64 + 1, &[observation], &imu)
+                .unwrap();
+            assert_eq!(a.state, b.state);
+            assert_eq!(a.marg_data.stable_hash(), b.marg_data.stable_hash());
+        }
+    }
     #[test]
     fn synthetic_stereo_inertial_replay_is_finite_bounded_and_deterministic() {
         let mut first = BasaltVioEstimator::new(cam(), EstimatorConfig::default());

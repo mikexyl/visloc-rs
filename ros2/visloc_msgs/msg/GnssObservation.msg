@@ -1,0 +1,9 @@
+uint8 gnss_id
+uint8 sv_id
+uint8 signal_id
+float64 pseudorange_m
+float64 doppler_hz
+float64 pseudorange_std_m
+float64 doppler_std_hz
+uint8 cn0_dbhz
+uint16 lock_ms

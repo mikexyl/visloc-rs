@@ -1,0 +1,17 @@
+int64 timestamp_ns
+string status
+bool initialized
+float64 time_offset_s
+float64 timing_std_s
+float64 yaw_rad
+float64[3] origin_ecef_m
+float64[3] translation_enu_m
+float64[3] lever_arm_imu_m
+uint64 epochs
+uint64 dropped_epochs
+uint64 stale_epochs
+uint64 missing_ephemeris
+uint64 accepted_pseudoranges
+uint64 accepted_dopplers
+uint64 rejected_pseudoranges
+uint64 rejected_dopplers

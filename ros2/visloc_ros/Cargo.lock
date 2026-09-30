@@ -749,6 +749,7 @@ dependencies = [
  "num-complex",
  "num-rational",
  "num-traits",
+ "serde",
  "simba",
  "typenum",
 ]
@@ -801,6 +802,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "73f88a1307638156682bada9d7604135552957b7818057dcef22705b4d509495"
 dependencies = [
  "num-traits",
+ "serde",
 ]
 
 [[package]]
@@ -1382,6 +1384,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "visloc-core",
+ "visloc-gnss",
 ]
 
 [[package]]
@@ -1389,6 +1392,17 @@ name = "visloc-core"
 version = "0.2.0"
 dependencies = [
  "nalgebra",
+]
+
+[[package]]
+name = "visloc-gnss"
+version = "0.2.0"
+dependencies = [
+ "nalgebra",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]
@@ -1508,6 +1522,7 @@ dependencies = [
  "uuid",
  "visloc-basalt",
  "visloc-core",
+ "visloc-gnss",
  "visloc-multi-robot",
  "visloc-online-loop",
  "visloc_msgs",

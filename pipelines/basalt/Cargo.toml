@@ -78,3 +78,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 thiserror = { workspace = true }
 visloc-core = { path = "../../crates/core", version = "0.2.0" }
+visloc-gnss = { path = "../../crates/gnss", version = "0.2.0" }

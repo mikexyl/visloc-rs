@@ -28,6 +28,9 @@ use visloc_multi_robot::{Key, KeyframeRecord, Transform};
 use visloc_online_loop::{Frame, Observation};
 
 pub enum Input {
+    GnssRaw { data: Vec<u8>, receipt_ns: i64 },
+    GnssEpoch(visloc_gnss::Epoch),
+    GnssEphemeris(visloc_gnss::navigation::Ephemeris),
     Image(Image),
     RightImage(Image),
     Imu(Imu),
@@ -309,6 +312,20 @@ pub fn run(
     }
     let vio_config = BasaltConfig::from_json(&std::fs::read_to_string(&config.vio_config)?)?;
     let mut adapter = BasaltVioEstimatorAdapter::from_config(&calibration, &vio_config)?;
+    if let Some(g) = &config.gnss {
+        let mut effective = g.clone();
+        effective.nominal_imu_period_s = 1. / calibration.imu_update_rate_hz;
+        adapter.estimator.configure_gnss(effective)?;
+        if let Some(runtime) = &mut adapter.estimator.gnss {
+            runtime.replay_shift_ns = config.gnss_replay_shift_ns;
+            crate::archive::store_json(
+                &config.output.join("gnss_effective.json"),
+                &serde_json::json!({"config":runtime.config,"lever_arm":runtime.lever_arm,"mounting_geometry":visloc_gnss::calibration::mechanical_datums(runtime.config.gasket_gap_mm),"replay_shift_ns":runtime.replay_shift_ns}),
+            )?;
+        }
+    }
+    let mut gnss_records = BufWriter::new(File::create(config.output.join("gnss_records.jsonl"))?);
+    let mut gnss_log = BufWriter::new(File::create(config.output.join("gnss_diagnostics.jsonl"))?);
     let mut startup = config
         .imu_startup
         .clone()
@@ -346,6 +363,33 @@ pub fn run(
     loop {
         let event = rx.recv()?;
         match event {
+            Input::GnssRaw { data, receipt_ns } => {
+                adapter.estimator.push_gnss_raw(&data, receipt_ns);
+                if let Some(g) = &mut adapter.estimator.gnss {
+                    for record in g.records.drain(..) {
+                        let value = match &record {
+                            visloc_basalt::gnss::Record::Epoch(e) => serde_json::json!({"epoch":e}),
+                            visloc_basalt::gnss::Record::Ephemeris(e) => {
+                                serde_json::json!({"ephemeris":e})
+                            }
+                            visloc_basalt::gnss::Record::Decision(d) => d.clone(),
+                        };
+                        writeln!(gnss_records, "{value}")?;
+                        gnss_records.flush()?;
+                        events.send(Event::GnssRecord(record))?;
+                    }
+                }
+            }
+            Input::GnssEpoch(e) => {
+                writeln!(gnss_records, "{}", serde_json::json!({"epoch":&e}))?;
+                gnss_records.flush()?;
+                adapter.estimator.push_gnss_epoch(e);
+            }
+            Input::GnssEphemeris(e) => {
+                writeln!(gnss_records, "{}", serde_json::json!({"ephemeris":&e}))?;
+                gnss_records.flush()?;
+                adapter.estimator.push_gnss_ephemeris(e);
+            }
             Input::Imu(m) => {
                 let t = timestamp(&m.header.stamp);
                 if last_imu.is_some_and(|v| t <= v) {
@@ -480,6 +524,52 @@ pub fn run(
                     "{:.9} {x:.9} {y:.9} {z:.9} {qx:.12} {qy:.12} {qz:.12} {qw:.12}",
                     t as f64 * 1e-9
                 )?;
+                if let Some(g) = &mut adapter.estimator.gnss {
+                    for record in g.records.drain(..) {
+                        let value = match &record {
+                            visloc_basalt::gnss::Record::Epoch(e) => serde_json::json!({"epoch":e}),
+                            visloc_basalt::gnss::Record::Ephemeris(e) => {
+                                serde_json::json!({"ephemeris":e})
+                            }
+                            visloc_basalt::gnss::Record::Decision(d) => d.clone(),
+                        };
+                        writeln!(gnss_records, "{value}")?;
+                        events.send(Event::GnssRecord(record))?;
+                    }
+                    gnss_records.flush()?;
+                    writeln!(
+                        gnss_log,
+                        "{}",
+                        serde_json::json!({"timestamp_ns":t,"diagnostics":g.diagnostics,"initialization":g.initialization,"alignment":g.bootstrap.as_ref().map(|b|&b.alignment)})
+                    )?;
+                    let mut message = visloc_msgs::msg::GnssStatus::default();
+                    message.timestamp_ns = t;
+                    message.status = g.diagnostics.status.clone();
+                    message.initialized = g.active();
+                    message.lever_arm_imu_m = g.lever_arm.imu_to_antenna_m.into();
+                    message.epochs = g.diagnostics.epochs;
+                    message.dropped_epochs = g.diagnostics.dropped_epochs;
+                    message.stale_epochs = g.diagnostics.stale_epochs;
+                    message.missing_ephemeris = g.diagnostics.missing_ephemeris;
+                    message.accepted_pseudoranges = g.diagnostics.accepted_pseudoranges;
+                    message.accepted_dopplers = g.diagnostics.accepted_dopplers;
+                    message.rejected_pseudoranges = g.diagnostics.rejected_pseudoranges;
+                    message.rejected_dopplers = g.diagnostics.rejected_dopplers;
+                    if let Some(b) = &g.bootstrap {
+                        message.time_offset_s = b.time_offset_s;
+                        message.timing_std_s = b.timing_std_s;
+                        message.yaw_rad = b.alignment.yaw_rad;
+                        message.origin_ecef_m = b.alignment.origin_ecef_m.into();
+                        message.translation_enu_m = b.alignment.translation_enu_m.into();
+                    }
+                    events.send(Event::GnssStatus(message))?;
+                    if frame_id % 30 == 0 {
+                        crate::archive::store_json(
+                            &config.output.join("gnss_status.json"),
+                            &serde_json::json!({"diagnostics":g.diagnostics,"initialization":g.initialization,"alignment":g.bootstrap.as_ref().map(|b|&b.alignment)}),
+                        )?;
+                    }
+                }
                 events.send(Event::Odometry {
                     timestamp_ns: t,
                     pose: transform.clone(),
@@ -530,6 +620,11 @@ pub fn run(
                     }
                 }
                 processed_frames += 1;
+                if frame_id % 30 == 0 && adapter.timing_breakdown().enabled() {
+                    adapter.timing_breakdown_with_estimator().write_json(
+                        config.output.join("timing_breakdown.json"),
+                    )?;
+                }
                 let mut s = status.lock().unwrap();
                 s.frames = processed_frames;
                 s.keyframes = kf_id;
@@ -548,6 +643,19 @@ pub fn run(
             csv.flush()?;
             tum.flush()?;
             tracking.flush()?;
+            if adapter.timing_breakdown().enabled() {
+                adapter.timing_breakdown_with_estimator().write_json(
+                    config.output.join("timing_breakdown.json"),
+                )?;
+            }
+            gnss_log.flush()?;
+            gnss_records.flush()?;
+            if let Some(g) = &adapter.estimator.gnss {
+                crate::archive::store_json(
+                    &config.output.join("gnss_status.json"),
+                    &serde_json::json!({"diagnostics":g.diagnostics,"initialization":g.initialization,"alignment":g.bootstrap.as_ref().map(|b|&b.alignment)}),
+                )?;
+            }
             loop_tx.send(LoopCommand::Finish)?;
             events.send(Event::VioFinished)?;
             return Ok(());

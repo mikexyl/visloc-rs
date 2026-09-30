@@ -10861,6 +10861,15 @@ mod tests {
 
     #[test]
     fn clean_trial_token_matches_recomputed_landmark_recovery_exactly() {
+        check_trial_token_recovery(ScalarMode::UpstreamF32);
+    }
+
+    #[test]
+    fn f64_trial_token_matches_recomputed_landmark_recovery_exactly() {
+        check_trial_token_recovery(ScalarMode::ExtendedF64);
+    }
+
+    fn check_trial_token_recovery(mode: ScalarMode) {
         let direction = StereographicDirection::from_bearing(Vector3::new(0.1, -0.2, 1.0)).unwrap();
         let landmark = WindowLandmark {
             track_id: 17,
@@ -10881,7 +10890,8 @@ mod tests {
                 },
             ],
         };
-        let problem = test_window(vec![nav(0, 0.0), nav(1, 0.25), nav(2, 0.5)], vec![landmark]);
+        let mut problem = test_window(vec![nav(0, 0.0), nav(1, 0.25), nav(2, 0.5)], vec![landmark]);
+        problem.scalar_mode = mode;
         let state = problem.initial_state();
         let mut step = DVector::zeros(problem.state_dof());
         step[15] = 0.015625;

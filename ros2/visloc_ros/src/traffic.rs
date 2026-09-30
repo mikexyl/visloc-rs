@@ -65,10 +65,21 @@ payload!(
     v,
     1 + v.frame.key.bytes() + 8 + 96 + v.frame.features.len() * (8 + 8 + 256 + 1 + 24)
 );
+payload!(m::GnssEpoch, v, 21 + v.observations.len() * 38);
+payload!(m::GnssEphemeris, v, {
+    let _ = v;
+    175
+});
 static CALLS: AtomicU64 = AtomicU64::new(0);
 static SENT: AtomicU64 = AtomicU64::new(0);
 static RECEIVED: AtomicU64 = AtomicU64::new(0);
 static RESPONSES: AtomicU64 = AtomicU64::new(0);
+static GNSS_RECORDS: AtomicU64 = AtomicU64::new(0);
+static GNSS_SENT: AtomicU64 = AtomicU64::new(0);
+pub fn gnss_published(v: &impl Payload) {
+    GNSS_RECORDS.fetch_add(1, Ordering::Relaxed);
+    GNSS_SENT.fetch_add(v.bytes() as u64, Ordering::Relaxed);
+}
 pub enum Queue {
     Sensor,
     Communication,
@@ -87,5 +98,5 @@ pub fn received(v: &impl Payload) {
     RECEIVED.fetch_add(v.bytes() as u64, Ordering::Relaxed);
 }
 pub fn snapshot() -> serde_json::Value {
-    serde_json::json!({"service_attempts":CALLS.load(Ordering::Relaxed),"service_responses":RESPONSES.load(Ordering::Relaxed),"service_request_field_bytes":SENT.load(Ordering::Relaxed),"service_response_field_bytes":RECEIVED.load(Ordering::Relaxed),"sensor_ingress_drops":QUEUE_DROPS[0].load(Ordering::Relaxed),"communication_queue_drops":QUEUE_DROPS[1].load(Ordering::Relaxed),"graph_queue_drops":QUEUE_DROPS[2].load(Ordering::Relaxed),"note":"Typed field payload bytes; excludes CDR lengths, padding, encapsulation, DDS headers and retransmission. Counted at requesting node."})
+    serde_json::json!({"service_attempts":CALLS.load(Ordering::Relaxed),"service_responses":RESPONSES.load(Ordering::Relaxed),"service_request_field_bytes":SENT.load(Ordering::Relaxed),"service_response_field_bytes":RECEIVED.load(Ordering::Relaxed),"gnss_records_published":GNSS_RECORDS.load(Ordering::Relaxed),"gnss_record_field_bytes":GNSS_SENT.load(Ordering::Relaxed),"sensor_ingress_drops":QUEUE_DROPS[0].load(Ordering::Relaxed),"communication_queue_drops":QUEUE_DROPS[1].load(Ordering::Relaxed),"graph_queue_drops":QUEUE_DROPS[2].load(Ordering::Relaxed),"note":"Typed field payload bytes; excludes CDR lengths, padding, encapsulation, DDS headers and retransmission. Counted at requesting node."})
 }

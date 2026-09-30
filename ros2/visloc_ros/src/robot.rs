@@ -26,6 +26,13 @@ use visloc_multi_robot::{
 #[serde(deny_unknown_fields)]
 pub struct RobotConfig {
     pub robot: String,
+    #[serde(default)]
+    pub gnss: Option<visloc_gnss::Config>,
+    #[serde(default)]
+    pub gnss_typed_input: bool,
+    #[serde(default)]
+    pub gnss_replay_shift_ns: i64,
+
     pub peers: Vec<String>,
     pub calibration: PathBuf,
     pub vio_config: PathBuf,
@@ -110,6 +117,8 @@ pub enum Event {
         frame_id: u64,
         process_ms: f64,
     },
+    GnssRecord(visloc_basalt::gnss::Record),
+    GnssStatus(m::GnssStatus),
     Keyframe(c::KeyframeRecord),
     Sequence(c::Sequence, f64),
     Loop(c::LoopConstraint),
@@ -680,6 +689,78 @@ pub fn run(mut config: RobotConfig) -> AnyResult<()> {
             let _ = errors.try_send(Event::Error(format!("IMU queue overflow: {e}")));
         }
     })?;
+    let gnss_enabled = config.gnss.as_ref().is_some_and(|g| g.enabled);
+    let raw_gnss_sub = if gnss_enabled && !config.gnss_typed_input {
+        let topic = format!("/{}/gnss/raw", config.robot);
+        let tx = input_tx.clone();
+        let reliable = config.reliable_sensors;
+        Some(node.create_subscription(
+            topic.as_str().reliable().keep_last(128),
+            move |m: std_msgs::msg::UInt8MultiArray| {
+                let receipt_ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |t| t.as_nanos() as i64);
+                let input = Input::GnssRaw {
+                    data: m.data,
+                    receipt_ns,
+                };
+                let failure = if reliable {
+                    tx.send(input).err().map(|e| e.to_string())
+                } else {
+                    tx.try_send(input).err().map(|e| e.to_string())
+                };
+                if let Some(e) = failure {
+                    crate::traffic::dropped(crate::traffic::Queue::Sensor);
+                    eprintln!("GNSS queue drop: {e}");
+                }
+            },
+        )?)
+    } else {
+        None
+    };
+    let epoch_gnss_sub = if gnss_enabled && config.gnss_typed_input {
+        let topic = format!("/{}/gnss/epochs", config.robot);
+        let tx = input_tx.clone();
+        let reliable = config.reliable_sensors;
+        Some(node.create_subscription(
+            topic.as_str().reliable().keep_last(128),
+            move |m: m::GnssEpoch| {
+                let result = crate::gnss_wire::epoch_from(m)
+                    .and_then(|e| {
+                        let input = Input::GnssEpoch(e);
+                        if reliable { tx.send(input).map_err(|e| e.to_string()) }
+                        else { tx.try_send(input).map_err(|e| e.to_string()) }
+                    });
+                if let Err(e) = result {
+                    crate::traffic::dropped(crate::traffic::Queue::Sensor);
+                    eprintln!("GNSS typed epoch rejected: {e}");
+                }
+            },
+        )?)
+    } else {
+        None
+    };
+    let ephemeris_gnss_sub = if gnss_enabled && config.gnss_typed_input {
+        let topic = format!("/{}/gnss/ephemerides", config.robot);
+        let tx = input_tx.clone();
+        let reliable = config.reliable_sensors;
+        Some(node.create_subscription(
+            topic.as_str().reliable().transient_local().keep_last(128),
+            move |m: m::GnssEphemeris| {
+                let result = crate::gnss_wire::ephemeris_from(m).and_then(|e| {
+                    let input = Input::GnssEphemeris(e);
+                    if reliable { tx.send(input).map_err(|e| e.to_string()) }
+                    else { tx.try_send(input).map_err(|e| e.to_string()) }
+                });
+                if let Err(e) = result {
+                    crate::traffic::dropped(crate::traffic::Queue::Sensor);
+                    eprintln!("GNSS typed ephemeris rejected: {e}");
+                }
+            },
+        )?)
+    } else {
+        None
+    };
     let h = history.clone();
     let history_service = node.create_service::<s::GetHistory, _>(
         format!("/{}/slam/history", config.robot).as_str(),
@@ -803,6 +884,33 @@ pub fn run(mut config: RobotConfig) -> AnyResult<()> {
             .transient_local()
             .keep_last(1),
     )?;
+    let gnss_epochs = node.create_publisher::<m::GnssEpoch>(
+        format!("/{}/gnss/epochs", config.robot)
+            .as_str()
+            .reliable()
+            .keep_last(128),
+    )?;
+    let gnss_ephemerides = node.create_publisher::<m::GnssEphemeris>(
+        format!("/{}/gnss/ephemerides", config.robot)
+            .as_str()
+            .reliable()
+            .transient_local()
+            .keep_last(128),
+    )?;
+    let gnss_statuses = node.create_publisher::<m::GnssStatus>(
+        format!("/{}/gnss/status", config.robot)
+            .as_str()
+            .reliable()
+            .transient_local()
+            .keep_last(1),
+    )?;
+    let geographic_odom = node.create_publisher::<nav_msgs::msg::Odometry>(
+        format!("/{}/gnss/geographic_odometry", config.robot)
+            .as_str()
+            .reliable()
+            .keep_last(64),
+    )?;
+    let mut geographic: Option<m::GnssStatus> = None;
     let mut log = std::fs::File::create(config.output.join("events.jsonl"))?;
     let mut keyframe_log = std::fs::File::create(config.output.join("keyframes.jsonl"))?;
     let mut loop_log = std::fs::File::create(config.output.join("loops.jsonl"))?;
@@ -815,8 +923,30 @@ pub fn run(mut config: RobotConfig) -> AnyResult<()> {
                     Event::Odometry {timestamp_ns,pose,frame_id,process_ms}=> {
                         let parent=format!("{robot}/odom");let child=format!("{robot}/base_link");
                         let mut msg=nav_msgs::msg::Odometry::default();msg.header.frame_id=parent.clone();msg.header.stamp=wire::stamp(timestamp_ns);msg.child_frame_id=child.clone();msg.pose.pose=wire::pose(&pose);
+                        if let Some(g)=&geographic {
+                            if g.initialized {let yaw=nalgebra::UnitQuaternion::from_axis_angle(&nalgebra::Vector3::z_axis(),g.yaw_rad);let raw=pose.se3()?;
+                                let corrected=visloc_multi_robot::Transform{translation:(yaw*raw.translation+nalgebra::Vector3::from(g.translation_enu_m)).into(),rotation_xyzw:{let q=yaw*raw.rotation;[q.i,q.j,q.k,q.w]}};
+                                let mut geo=msg.clone();geo.header.frame_id=format!("{robot}/gnss_enu");geo.pose.pose=wire::pose(&corrected);geographic_odom.publish(geo)?;
+                            }
+                        }
                         odom.publish(msg)?;tf.publish(tf2_msgs::msg::TFMessage {transforms:vec![wire::tf(&pose,&parent,&child,timestamp_ns)]})?;
                         writeln!(log,"{}",serde_json::json!({"event":"vio","frame_id":frame_id,"timestamp_ns":timestamp_ns,"process_ms":process_ms}))?;
+                    },
+                    Event::GnssRecord(record)=> {match record {
+                        visloc_basalt::gnss::Record::Epoch(e)=>{let m=crate::gnss_wire::epoch_wire(&e);crate::traffic::gnss_published(&m);gnss_epochs.publish(m)?;},
+                        visloc_basalt::gnss::Record::Ephemeris(e)=>{let m=crate::gnss_wire::ephemeris_wire(&e);crate::traffic::gnss_published(&m);gnss_ephemerides.publish(m)?;},
+                        visloc_basalt::gnss::Record::Decision(_)=>{},
+                    }},
+                    Event::GnssStatus(s)=> {
+                        if s.initialized {
+                            let yaw=nalgebra::UnitQuaternion::from_axis_angle(&nalgebra::Vector3::z_axis(),s.yaw_rad);
+                            let local=visloc_multi_robot::Transform{translation:s.translation_enu_m,rotation_xyzw:[yaw.i,yaw.j,yaw.k,yaw.w]};
+                            let enu=visloc_gnss::navigation::enu_to_ecef(s.origin_ecef_m.into());let q=nalgebra::UnitQuaternion::from_matrix(&enu);
+                            let earth=visloc_multi_robot::Transform{translation:s.origin_ecef_m,rotation_xyzw:[q.i,q.j,q.k,q.w]};
+                            let frame=format!("{robot}/gnss_enu");
+                            tf.publish(tf2_msgs::msg::TFMessage{transforms:vec![wire::tf(&earth,"earth",&frame,s.timestamp_ns),wire::tf(&local,&frame,&format!("{robot}/gnss_local"),s.timestamp_ns)]})?;
+                        }
+                        geographic=Some(s.clone());gnss_statuses.publish(s)?;
                     },
                     Event::Keyframe(record)=> {writeln!(keyframe_log,"{}",serde_json::to_string(&record)?)?;history.lock().unwrap().keyframes.push(record.clone());keyframes.publish(record.wire())?;},
                     Event::Sequence(sequence,encoding_ms)=> {status.lock().unwrap().sequences+=1;sequences.publish(sequence.wire())?;writeln!(log,"{}",serde_json::json!({"event":"sequence_encoding","sequence":sequence.key,"encoding_ms":encoding_ms}))?;if comm_tx.try_send(Comm::Sequence(sequence)).is_err() {crate::traffic::dropped(crate::traffic::Queue::Communication);}},
@@ -837,6 +967,9 @@ pub fn run(mut config: RobotConfig) -> AnyResult<()> {
         image_sub,
         right_sub,
         imu_sub,
+        raw_gnss_sub,
+        epoch_gnss_sub,
+        ephemeris_gnss_sub,
         history_service,
         sequence_service,
         feature_service,
