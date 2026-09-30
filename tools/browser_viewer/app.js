@@ -124,19 +124,14 @@ function startControls(){
    const response=await fetch('/api/control');const state=await response.json();
    if(!response.ok)throw Error(state.error||'Unable to read VIO status');
    const busy=pending||!!state.operation;
-   $('start-vio').disabled=busy||state.vio||state.gaussian;$('stop-vio').disabled=busy||!state.vio;
-   $('vio-state').textContent=state.vio?'VIO running':state.gaussian?'VIO in Gaussian pipeline':'VIO stopped';
-   $('gaussian-controls').hidden=!state.gaussian_available;
-   $('start-gaussian').disabled=busy||state.vio||state.gaussian;
-   $('stop-gaussian').disabled=busy||!state.gaussian;
-   $('gaussian-state').textContent=state.operation?.includes('gaussian')?(state.operation==='start-gaussian'?'Starting…':'Saving map and stopping…'):state.gaussian?'Running':'Stopped';
-   const trackingWarning=state.gaussian&&!state.operation?(state.mapping_tracking_lost?'Mapping paused: VIO tracking was lost. Stop and restart in a textured scene.':state.mapping_tracking_ok===false?'Mapping paused: waiting for reliable stereo tracking.':''):'';
-   $('control-status').textContent=state.error||trackingWarning||state.message||'';
-   $('control-status').className=(state.error||trackingWarning)?'control-error':'';
-  }catch(e){$('control-status').textContent=e.message;['start-vio','stop-vio','start-gaussian','stop-gaussian'].forEach(k=>$(k).disabled=true);}
+   $('start-vio').disabled=busy||state.vio;$('stop-vio').disabled=busy||!state.vio;
+   $('vio-state').textContent=state.vio?'VIO running':'VIO stopped';
+   $('control-status').textContent=state.error||state.message||'';
+   $('control-status').className=state.error?'control-error':'';
+  }catch(e){$('control-status').textContent=e.message;['start-vio','stop-vio'].forEach(k=>$(k).disabled=true);}
  }
  async function action(name){
-  pending=true;['start-vio','stop-vio','start-gaussian','stop-gaussian'].forEach(k=>$(k).disabled=true);
+  pending=true;['start-vio','stop-vio'].forEach(k=>$(k).disabled=true);
   try{
    const response=await fetch('/api/'+name,{method:'POST',headers:{'X-Control-Token':token}});
    const result=await response.json();if(!response.ok)throw Error(result.error);
@@ -144,7 +139,5 @@ function startControls(){
   }catch(e){pending=false;$('control-status').textContent=e.message;}
  }
  $('start-vio').onclick=()=>action('start');$('stop-vio').onclick=()=>action('stop');
- $('start-gaussian').onclick=()=>action('start-gaussian');$('stop-gaussian').onclick=()=>action('stop-gaussian');
- $('open-gaussian').onclick=()=>{const url=new URL(location.href);url.port='8092';url.pathname='/splats';url.search='';url.hash='live';window.open(url.href,'_blank','noopener');};
  refresh();setInterval(refresh,2000);
 }

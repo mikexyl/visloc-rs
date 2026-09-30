@@ -90,7 +90,7 @@ def main():
                 self.reply(b'{}', status=404)
 
         def do_POST(self):
-            if self.path in ('/api/start', '/api/stop', '/api/start-gaussian', '/api/stop-gaussian') and controller:
+            if self.path in ('/api/start', '/api/stop') and controller:
                 origin = self.headers.get('Origin')
                 if (self.headers.get('X-Control-Token') != token or
                         (origin and urlsplit(origin).netloc != self.headers.get('Host'))):
