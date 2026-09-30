@@ -10,6 +10,7 @@ use visloc_slam::{LinearSolver, PoseGraph, PoseGraphEdgeKind, PoseGraphSe3Config
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BackendConfig {
+    pub min_loop_similarity: f32,
     pub odometry_translation_sigma: f64,
     pub odometry_rotation_sigma: f64,
     pub loop_translation_sigma: f64,
@@ -18,11 +19,30 @@ pub struct BackendConfig {
 impl Default for BackendConfig {
     fn default() -> Self {
         Self {
+            min_loop_similarity: 0.8,
             odometry_translation_sigma: 0.15,
             odometry_rotation_sigma: 0.03,
             loop_translation_sigma: 0.2,
             loop_rotation_sigma: 0.04,
         }
+    }
+}
+
+impl BackendConfig {
+    pub fn validate(&self) -> Result<()> {
+        if !(0.0..=1.0).contains(&self.min_loop_similarity) {
+            return Err(Error("invalid loop similarity threshold".into()));
+        }
+        let sigmas = [
+            self.odometry_translation_sigma,
+            self.odometry_rotation_sigma,
+            self.loop_translation_sigma,
+            self.loop_rotation_sigma,
+        ];
+        if sigmas.iter().any(|x| !x.is_finite() || *x <= 0.) {
+            return Err(Error("invalid graph noise configuration".into()));
+        }
+        Ok(())
     }
 }
 
@@ -55,6 +75,7 @@ impl Backend {
         Ok(true)
     }
     pub fn insert_loop(&mut self, edge: LoopConstraint) -> Result<bool> {
+        self.config.validate()?;
         edge.from.validate()?;
         edge.to.validate()?;
         edge.to_from.se3()?;
@@ -64,7 +85,7 @@ impl Backend {
             || !edge.from.same_session(&edge.pair.0)
             || !edge.to.same_session(&edge.pair.1)
             || !edge.similarity.is_finite()
-            || edge.similarity < 0.8
+            || edge.similarity < self.config.min_loop_similarity
             || edge.verification.pnp_inliers < 15
         {
             return Err(Error("invalid verified loop constraint".into()));
@@ -83,15 +104,7 @@ impl Backend {
     }
     pub fn solve(&self, previous: &GraphSnapshot) -> Result<GraphSnapshot> {
         let start = Instant::now();
-        let sigmas = [
-            self.config.odometry_translation_sigma,
-            self.config.odometry_rotation_sigma,
-            self.config.loop_translation_sigma,
-            self.config.loop_rotation_sigma,
-        ];
-        if sigmas.iter().any(|x| !x.is_finite() || *x <= 0.) {
-            return Err(Error("invalid graph noise configuration".into()));
-        }
+        self.config.validate()?;
         let mut edges: Vec<(Key, Key, SE3, PoseGraphEdgeKind, Matrix6<f64>)> = Vec::new();
         for r in self.records.values() {
             if let Some(p) = r.previous.as_ref().and_then(|p| self.records.get(p)) {

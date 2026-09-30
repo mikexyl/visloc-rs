@@ -144,6 +144,56 @@ fn remote_queries_do_not_spend_slots_on_unowned_pairs() {
     assert_eq!(c[0].0.robot, "a");
 }
 #[test]
+fn configurable_similarity_retrieves_and_accepts_new_candidates() {
+    let query = sequence("a", 0, 0);
+    let mut candidate = sequence("b", 0, 0);
+    candidate.descriptor[0] = 0.75;
+    candidate.descriptor[1] = (1.0_f32 - 0.75_f32.powi(2)).sqrt();
+    let mut retrieval = Retrieval::default();
+    retrieval.insert(candidate).unwrap();
+    assert!(retrieval.candidates(&query, 0.8).0.is_empty());
+    let candidates = retrieval.candidates(&query, 0.7).0;
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].1, 0.75);
+
+    let mut constraint = edge(key("a", 0), key("b", 0), t(-3., 0., 0.));
+    constraint.similarity = 0.7;
+    assert!(Backend::default().insert_loop(constraint.clone()).is_err());
+    let config: BackendConfig =
+        serde_json::from_value(serde_json::json!({"min_loop_similarity":0.7})).unwrap();
+    let mut backend = Backend::default();
+    backend.config = config;
+    let mut below = constraint.clone();
+    below.similarity = 0.699;
+    assert!(backend.insert_loop(below).is_err());
+    let mut unsupported = constraint.clone();
+    unsupported.verification.pnp_inliers = 14;
+    assert!(backend.insert_loop(unsupported).is_err());
+    assert!(backend.insert_loop(constraint).unwrap());
+    let saved = serde_json::to_vec(&backend.config).unwrap();
+    let restored: BackendConfig = serde_json::from_slice(&saved).unwrap();
+    assert_eq!(restored.min_loop_similarity, 0.7);
+    assert_eq!(restored.odometry_translation_sigma, 0.15);
+}
+
+#[test]
+fn invalid_similarity_configuration_is_rejected() {
+    assert_eq!(
+        serde_json::from_str::<BackendConfig>("{}")
+            .unwrap()
+            .min_loop_similarity,
+        0.8
+    );
+    for threshold in [f32::NAN, f32::INFINITY, -0.1, 1.1] {
+        let config = BackendConfig {
+            min_loop_similarity: threshold,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+}
+
+#[test]
 fn identity_dedup_and_conflicting_retransmissions() {
     let mut b = Backend::default();
     assert!(b.insert_keyframe(record("a", 0, 0.)).unwrap());
@@ -292,6 +342,7 @@ fn different_rigs_and_reverse_pnp_preserve_body_constraint_direction() {
     let error = result.to_from.se3().unwrap().compose(&expected.inverse());
     assert!(error.translation.norm() < 1e-4 && error.rotation.angle() < 1e-4);
 }
+
 #[test]
 fn two_d_and_pnp_reject_scrambled_matches() {
     let (a, b, _, _) = geometry_fixture();

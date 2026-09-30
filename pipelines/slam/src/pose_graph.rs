@@ -3,6 +3,10 @@
 
 use super::*;
 
+#[cfg(test)]
+#[path = "pose_graph_relative_tests.rs"]
+mod relative_factor_tests;
+
 /// Kind of an edge inside a [`PoseGraph`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoseGraphEdgeKind {
@@ -809,19 +813,20 @@ impl PoseGraph {
             let t_to = &self.poses[&edge.to].world_to_camera;
             let predicted = t_to.compose(&t_from.inverse());
             let r = edge.measurement.inverse().compose(&predicted).log();
-            let ad_from = t_from.adjoint();
+            // Exact log derivative for right pose updates, including nonzero error.
+            let jacobian = crate::se3_jacobian::right_log_jacobian(&r) * t_from.adjoint();
             let (weight, ata, atr) = match &edge.information {
                 Some(omega) => {
                     let robust_weight = kernel.weight((r.transpose() * omega * r)[(0, 0)]);
-                    let oa = ad_from.transpose() * omega;
-                    (robust_weight, oa * ad_from, oa * r)
+                    let oa = jacobian.transpose() * omega;
+                    (robust_weight, oa * jacobian, oa * r)
                 }
                 None => {
                     let robust_weight = kernel.weight(r.norm_squared());
                     (
                         edge.weight * robust_weight,
-                        ad_from.transpose() * ad_from,
-                        ad_from.transpose() * r,
+                        jacobian.transpose() * jacobian,
+                        jacobian.transpose() * r,
                     )
                 }
             };
@@ -1089,11 +1094,12 @@ impl PoseGraph {
     }
 
     /// Run a full SE(3) Gauss-Newton optimization with right-perturbation
-    /// updates `T_i ← T_i · Exp(δ_i)`. Uses the first-order BCH approximation
-    /// `J_r⁻¹(r) ≈ I`, so each edge contributes:
+    /// updates `T_i ← T_i · Exp(δ_i)`. Uses the exact derivative of the SE3 log
+    /// at the current residual, so each edge contributes:
     ///
     /// - residual: `r_e = log(meas_e⁻¹ · T_to · T_from⁻¹)` (6-vector),
-    /// - Jacobians: `∂r/∂δ_to = Ad(T_from)`, `∂r/∂δ_from = -Ad(T_from)`.
+    /// - Jacobians: `∂r/∂δ_to = J_r(r)^-1 Ad(T_from)`, with the negative for
+    ///   `∂r/∂δ_from`; `J_r^-1` is the inverse right Jacobian of SE3.
     ///
     /// The anchor pose is held fixed; all other poses are updated. Returns the
     /// per-iteration cost trace plus a `converged` flag derived from the

@@ -340,3 +340,5 @@ pub use sparse_factor_graph::{
 
 pub mod report;
 pub use report::*;
+
+mod se3_jacobian;

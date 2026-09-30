@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- Local multi-robot replay: raw camera images exceed Fast DDS's default
+     512 KiB shared-memory segment. Keep room for simultaneous image streams.
+     Opt in with FASTRTPS_DEFAULT_PROFILES_FILE; live deployments are unchanged. -->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>visloc_replay_shm</transport_id>
+      <type>SHM</type>
+      <segment_size>67108864</segment_size>
+      <maxMessageSize>4194304</maxMessageSize>
+      <port_queue_capacity>4096</port_queue_capacity>
+    </transport_descriptor>
+    <transport_descriptor>
+      <transport_id>visloc_replay_udp</transport_id>
+      <type>UDPv4</type>
+    </transport_descriptor>
+  </transport_descriptors>
+  <participant profile_name="visloc_local_replay" is_default_profile="true">
+    <rtps>
+      <userTransports>
+        <transport_id>visloc_replay_shm</transport_id>
+        <transport_id>visloc_replay_udp</transport_id>
+      </userTransports>
+      <useBuiltinTransports>false</useBuiltinTransports>
+    </rtps>
+  </participant>
+</profiles>

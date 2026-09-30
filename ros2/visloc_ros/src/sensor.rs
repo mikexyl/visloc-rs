@@ -11,7 +11,7 @@ use opencv::{
 };
 use sensor_msgs::msg::{Image, Imu};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fs::File,
     io::{BufWriter, Write},
     sync::{
@@ -29,8 +29,144 @@ use visloc_online_loop::{Frame, Observation};
 
 pub enum Input {
     Image(Image),
+    RightImage(Image),
     Imu(Imu),
     Finish(i64),
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CameraMode {
+    #[default]
+    Mono,
+    Stereo,
+}
+
+/// Exact-stamp pairing, independent of callback order between camera topics.
+/// Each topic must be ordered; a later stamp proves a missing counterpart.
+struct CameraQueue {
+    stereo: bool,
+    pending: BTreeMap<i64, [Option<Image>; 2]>,
+    latest: [Option<i64>; 2],
+    retired: Option<i64>,
+    dropped: u64,
+}
+impl CameraQueue {
+    fn new(stereo: bool) -> Self {
+        Self {
+            stereo,
+            pending: BTreeMap::new(),
+            latest: [None, None],
+            retired: None,
+            dropped: 0,
+        }
+    }
+    fn push(&mut self, camera: usize, image: Image) -> AnyResult<()> {
+        if camera > 1 || (!self.stereo && camera != 0) {
+            return Err("unexpected right camera in monocular mode".into());
+        }
+        let t = timestamp(&image.header.stamp);
+        if self.latest[camera].is_some_and(|previous| t <= previous) {
+            return Err("non-monotonic camera timestamps".into());
+        }
+        self.latest[camera] = Some(t);
+        // Count a discarded exposure once; its delayed second image must not
+        // resurrect a pair already consumed or evicted for capacity.
+        if self.retired.is_some_and(|retired| t <= retired) {
+            return Ok(());
+        }
+        self.pending.entry(t).or_default()[camera] = Some(image);
+        if self.pending.len() > 32 {
+            self.retired = Some(self.pending.pop_first().unwrap().0);
+            self.dropped += 1;
+        }
+        Ok(())
+    }
+    fn pop_ready(&mut self, imu_watermark: Option<i64>) -> Option<(Image, Option<Image>)> {
+        loop {
+            let (&t, pair) = self.pending.first_key_value()?;
+            let required = if self.stereo { 2 } else { 1 };
+            if (0..required)
+                .any(|i| pair[i].is_none() && self.latest[i].is_some_and(|latest| latest > t))
+            {
+                self.retired = Some(self.pending.pop_first().unwrap().0);
+                self.dropped += 1;
+                continue;
+            }
+            if pair[0].is_none()
+                || (self.stereo && pair[1].is_none())
+                || !imu_watermark.is_some_and(|imu| imu >= t)
+            {
+                return None;
+            }
+            let (_, [left, right]) = self.pending.pop_first().unwrap();
+            self.retired = Some(t);
+            return Some((left.unwrap(), right));
+        }
+    }
+}
+
+#[cfg(test)]
+mod camera_queue_tests {
+    use super::*;
+    fn image(t: i64) -> Image {
+        let mut image = Image::default();
+        image.header.stamp.sec = (t / 1_000_000_000) as i32;
+        image.header.stamp.nanosec = (t % 1_000_000_000) as u32;
+        image
+    }
+    #[test]
+    fn stereo_waits_for_both_cameras_and_imu_in_either_callback_order() {
+        for first in [0, 1] {
+            let mut q = CameraQueue::new(true);
+            q.push(first, image(100)).unwrap();
+            assert!(q.pop_ready(Some(100)).is_none());
+            q.push(1 - first, image(100)).unwrap();
+            assert!(q.pop_ready(Some(99)).is_none());
+            let (left, right) = q.pop_ready(Some(100)).unwrap();
+            assert_eq!(timestamp(&left.header.stamp), 100);
+            assert_eq!(timestamp(&right.unwrap().header.stamp), 100);
+            assert_eq!(q.dropped, 0);
+        }
+    }
+    #[test]
+    fn missing_counterpart_is_counted_and_never_paired_with_next_exposure() {
+        let mut q = CameraQueue::new(true);
+        q.push(0, image(100)).unwrap();
+        q.push(1, image(101)).unwrap();
+        assert!(q.pop_ready(Some(200)).is_none());
+        q.push(0, image(101)).unwrap();
+        assert_eq!(
+            timestamp(&q.pop_ready(Some(200)).unwrap().0.header.stamp),
+            101
+        );
+        assert_eq!(q.dropped, 1);
+    }
+    #[test]
+    fn capacity_eviction_does_not_resurrect_delayed_half_pairs() {
+        let mut q = CameraQueue::new(true);
+        for t in 0..48 {
+            q.push(0, image(t)).unwrap();
+        }
+        for t in 0..48 {
+            q.push(1, image(t)).unwrap();
+        }
+        assert_eq!(q.pending.len(), 32);
+        assert_eq!(q.dropped, 16);
+        for t in 16..48 {
+            let (left, right) = q.pop_ready(Some(100)).unwrap();
+            assert_eq!(timestamp(&left.header.stamp), t);
+            assert_eq!(timestamp(&right.unwrap().header.stamp), t);
+        }
+        assert!(q.pop_ready(Some(100)).is_none());
+    }
+    #[test]
+    fn mono_still_needs_no_right_camera_and_rejects_duplicate_stamps() {
+        let mut q = CameraQueue::new(false);
+        q.push(0, image(100)).unwrap();
+        assert!(q.push(0, image(100)).is_err());
+        assert!(q.push(1, image(100)).is_err());
+        assert!(q.pop_ready(Some(100)).unwrap().1.is_none());
+    }
 }
 pub fn timestamp(t: &builtin_interfaces::msg::Time) -> i64 {
     t.sec as i64 * 1_000_000_000 + t.nanosec as i64
@@ -161,6 +297,16 @@ pub fn run(
     status: Arc<Mutex<Status>>,
 ) -> AnyResult<()> {
     let calibration = BasaltCalibration::from_path(&config.calibration)?;
+    let stereo = config.camera_mode == CameraMode::Stereo;
+    if stereo && calibration.cameras.len() < 2 {
+        return Err("stereo mode requires two calibrated cameras".into());
+    }
+    if !stereo && config.preprocess_right.is_some() {
+        return Err("right preprocessing requires stereo mode".into());
+    }
+    if stereo && config.preprocess.is_some() != config.preprocess_right.is_some() {
+        return Err("stereo raw images require preprocessing for both cameras".into());
+    }
     let vio_config = BasaltConfig::from_json(&std::fs::read_to_string(&config.vio_config)?)?;
     let mut adapter = BasaltVioEstimatorAdapter::from_config(&calibration, &vio_config)?;
     let mut startup = config
@@ -175,10 +321,19 @@ pub fn run(
     let (width, height) = calibration.resolutions[0];
     let preprocessor =
         Preprocessor::new(width as usize, height as usize, config.preprocess.as_ref())?;
+    let right_preprocessor = if stereo {
+        let (w, h) = calibration.resolutions[1];
+        Some(Preprocessor::new(
+            w as usize,
+            h as usize,
+            config.preprocess_right.as_ref(),
+        )?)
+    } else {
+        None
+    };
     let mut imu = VecDeque::new();
-    let mut images = VecDeque::new();
+    let mut images = CameraQueue::new(stereo);
     let mut last_imu = None;
-    let mut last_image = None;
     let mut first = true;
     let mut frame_id = 0;
     let mut kf_id = 0;
@@ -186,6 +341,7 @@ pub fn run(
     let mut finish = None;
     let mut csv = BufWriter::new(File::create(config.output.join("trajectory.csv"))?);
     let mut tum = BufWriter::new(File::create(config.output.join("trajectory.tum"))?);
+    let mut tracking = BufWriter::new(File::create(config.output.join("tracking.jsonl"))?);
     writeln!(csv, "frame_id,timestamp_ns,tx,ty,tz,qw,qx,qy,qz")?;
     loop {
         let event = rx.recv()?;
@@ -211,24 +367,12 @@ pub fn run(
                 }
             }
             Input::Image(m) => {
-                let t = timestamp(&m.header.stamp);
-                if last_image.is_some_and(|v| t <= v) {
-                    return Err("non-monotonic camera timestamps".into());
-                }
-                last_image = Some(t);
-                if images.len() >= 32 {
-                    images.pop_front();
-                    status.lock().unwrap().dropped_images += 1;
-                }
-                images.push_back(m);
+                images.push(0, m)?;
             }
+            Input::RightImage(m) => images.push(1, m)?,
             Input::Finish(t) => finish = Some(t),
         }
-        while images
-            .front()
-            .is_some_and(|m| last_imu.is_some_and(|t| t >= timestamp(&m.header.stamp)))
-        {
-            let message = images.pop_front().unwrap();
+        while let Some((message, right_message)) = images.pop_ready(last_imu) {
             let t = timestamp(&message.header.stamp);
             let initialization_imu = if first {
                 imu.iter().find(|s| s.timestamp_ns >= t).cloned()
@@ -252,7 +396,18 @@ pub fn run(
                     height as usize,
                     gray.iter().map(|&v| (v as u16) << 8).collect(),
                 )?,
-                cam1: None,
+                cam1: match (right_message, &right_preprocessor) {
+                    (Some(message), Some(p)) => Some(RawU16Image::new(
+                        p.width,
+                        p.height,
+                        p.image(&message)?
+                            .iter()
+                            .map(|&v| (v as u16) << 8)
+                            .collect(),
+                    )?),
+                    (None, None) => None,
+                    _ => return Err("incomplete stereo frame".into()),
+                },
                 cam0_path: Default::default(),
                 cam1_path: None,
                 imu: samples,
@@ -296,6 +451,24 @@ pub fn run(
                 let gray: Vec<u8> = frame.cam0.pixels().iter().map(|v| (v >> 8) as u8).collect();
                 let start = std::time::Instant::now();
                 let result = adapter.process_without_marg_data_no_trace(frame)?;
+                let left_tracks = result
+                    .tracks
+                    .observations
+                    .iter()
+                    .filter(|o| o.camera_id == 0)
+                    .count();
+                let right_tracks = result
+                    .tracks
+                    .observations
+                    .iter()
+                    .filter(|o| o.camera_id == 1)
+                    .count();
+                writeln!(
+                    tracking,
+                    "{}",
+                    serde_json::json!({"frame_id":frame_id,"timestamp_ns":t,
+                    "stereo_input":stereo,"left_tracks":left_tracks,"right_tracks":right_tracks})
+                )?;
                 let pose = result.estimator.state.imu_to_world.clone();
                 let transform = Transform::from(&pose);
                 transform.se3()?;
@@ -363,7 +536,10 @@ pub fn run(
                 s.timestamp_ns = t;
             }
         }
-        if finish.is_some_and(|t| last_image.is_some_and(|i| i >= t)) && images.is_empty() {
+        status.lock().unwrap().dropped_images = images.dropped;
+        if finish.is_some_and(|t| images.latest[0].is_some_and(|i| i >= t))
+            && images.pending.is_empty()
+        {
             if let Some(gate) = &startup {
                 gate.finish()?;
             }
@@ -371,6 +547,7 @@ pub fn run(
         if finish.is_some_and(|t| status.lock().unwrap().timestamp_ns >= t) {
             csv.flush()?;
             tum.flush()?;
+            tracking.flush()?;
             loop_tx.send(LoopCommand::Finish)?;
             events.send(Event::VioFinished)?;
             return Ok(());

@@ -9,7 +9,7 @@ import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 from scipy.spatial.transform import Rotation
-from run_graco_vio import Bag
+from replay_sensor_source import open_source
 
 def identity(key):
     return key['robot'], key['session'], key['id']
@@ -75,7 +75,7 @@ def main():
             e = json.loads(line)
             if e.get('event') == 'verification':
                 diagnostics[tuple(identity(k) for k in e['pair'])] = e['diagnostic']
-        bags[name] = (Bag(Path(robot['bag'])), robot)
+        bags[name] = (open_source(robot), robot)
     edges={}
     for edge in graph['loops']:
         a,b=pose_by_key.get(identity(edge['from'])),pose_by_key.get(identity(edge['to']))
@@ -90,11 +90,10 @@ def main():
             if not feature:
                 continue
             bag,robot=bags[k[0]]; original=feature['timestamp_ns']-robot['offset_ns']
-            tid,_=bag.topics['/camera_left/image_raw']
-            row=bag.connection.execute('SELECT data FROM messages WHERE topic_id=? AND timestamp=?',(tid,original)).fetchone()
-            if row is None:
+            try:
+                raw=bag.image_at(original)
+            except KeyError:
                 continue
-            raw=bag.types.deserialize_cdr(row[0],'sensor_msgs/msg/Image')
             image=np.asarray(raw.data).reshape(raw.height,raw.step)[:,:raw.width]
             config=json.loads(Path(robot['config']).read_text()); prep=config['preprocess'];cam=feature['camera']
             fx,fy,cx,cy=prep['intrinsics']; K=np.array([[fx,0,cx],[0,fy,cy],[0,0,1.]])
@@ -110,7 +109,7 @@ def main():
     if not records:
         rr.log('status',rr.TextDocument(f"Components: {graph['components']}\nVerified constraints: {len(graph['loops'])}\nNo frame pairs reached refinement.{accuracy}"),static=True)
     for bag,_ in bags.values():
-        bag.connection.close()
+        bag.close()
     print(root / 'playback.rrd')
 
 if __name__ == '__main__':

@@ -30,6 +30,7 @@ enum Update {
     Finish,
 }
 pub fn run(config: Config) -> AnyResult<()> {
+    config.pgo.validate()?;
     std::fs::create_dir_all(&config.output)?;
     std::fs::write(
         config.output.join("config.json"),

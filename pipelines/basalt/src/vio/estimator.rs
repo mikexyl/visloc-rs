@@ -4921,6 +4921,7 @@ fn predict_nav(
 mod tests {
     use super::super::landmarks::triangulate_two_rays;
     use super::*;
+    use crate::vio::sophus_rotate_step_packet_f32;
     use nalgebra::UnitQuaternion;
 
     #[test]

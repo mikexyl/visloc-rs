@@ -2,6 +2,7 @@
 """Prepare immutable sensor calibration and a ROS2 multi-robot replay mission."""
 import argparse
 import json
+import shutil
 from pathlib import Path
 import yaml
 from run_graco_vio import Bag, prepare_calibration, load_truth, DEFAULT_CALIBRATION, REPO
@@ -18,11 +19,24 @@ def main():
     p.add_argument('--rate', type=float, default=.25)
     p.add_argument('--fixed-last-frame', action='store_true')
     p.add_argument('--loop-config', type=Path, default=REPO / '.runtime/multi_robot_models/loop_config.json')
+    p.add_argument('--min-similarity', type=float, help='Override JIST global cosine threshold for robots and backend (default: loop config, otherwise 0.8)')
     args = p.parse_args()
     if args.rate <= 0 or len(set(args.robots)) != len(args.robots):
         p.error('rate must be positive and robots unique')
+    loop_config = json.loads(args.loop_config.read_text())
+    similarity = args.min_similarity if args.min_similarity is not None else loop_config.get('min_similarity', .8)
+    if not 0 <= similarity <= 1:
+        p.error('min-similarity must be finite and between 0 and 1')
+    loop_config['min_similarity'] = similarity
+    for name in ('jist_engine', 'xfeat_engine', 'lighterglue_engine'):
+        model = Path(loop_config[name])
+        loop_config[name] = str((args.loop_config.parent / model).resolve() if not model.is_absolute() else model)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
+    (output / 'loop_config.json').write_text(json.dumps(loop_config, indent=2) + '\n')
+    manifest = args.loop_config.parent / 'manifest.json'
+    if manifest.exists():
+        shutil.copy2(manifest, output / 'manifest.json')
     peers = [f'a{i:02}' for i in args.robots]
     mission = {'rate': args.rate, 'epoch_ns': 1_000_000_000, 'robots': [], 'fixed_last_frame': args.fixed_last_frame}
     stereo = yaml.safe_load((DEFAULT_CALIBRATION / 'stereo.yaml').read_text())
@@ -40,7 +54,7 @@ def main():
         config = {'robot': robot, 'peers': peers,
                   'calibration': str(calibration_dir / 'basalt_calibration.json'),
                   'vio_config': str(REPO / 'configs/graco/aerial_vio.json'),
-                  'loop_config': str(args.loop_config.resolve()),
+                  'loop_config': str(output / 'loop_config.json'),
                   'output': str(output / 'robots' / robot), 'reliable_sensors': True,
                   'fixed_last_frame': args.fixed_last_frame,
                   'preprocess': {'raw_width': raw_sizes[0][0], 'raw_height': raw_sizes[0][1],
@@ -57,7 +71,8 @@ def main():
             'frames': len(frames), 'original_first_ns': frames[0][0],
             'original_last_ns': frames[-1][0], 'offset_ns': mission['epoch_ns'] - frames[0][0],
             'truth': str(calibration_dir / 'ground_truth.csv')})
-    backend = {'peers': peers, 'output': str(output / 'backend')}
+    backend = {'peers': peers, 'output': str(output / 'backend'),
+               'pgo': {'min_loop_similarity': similarity}}
     (output / 'backend.json').write_text(json.dumps(backend, indent=2) + '\n')
     mission['backend_config'] = str(output / 'backend.json')
     (output / 'mission.json').write_text(json.dumps(mission, indent=2) + '\n')

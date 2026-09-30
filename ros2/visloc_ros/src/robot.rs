@@ -1,5 +1,5 @@
 use crate::{
-    sensor::{self, Input, PreprocessConfig},
+    sensor::{self, CameraMode, Input, PreprocessConfig},
     wire::{self, Wire},
     AnyResult,
 };
@@ -32,6 +32,9 @@ pub struct RobotConfig {
     pub loop_config: PathBuf,
     pub output: PathBuf,
     pub preprocess: Option<PreprocessConfig>,
+    #[serde(default)]
+    pub camera_mode: CameraMode,
+    pub preprocess_right: Option<PreprocessConfig>,
     #[serde(default = "default_imu_startup")]
     pub imu_startup: Option<visloc_basalt::startup::StationaryStartupConfig>,
     #[serde(default)]
@@ -264,6 +267,11 @@ fn communications(
     vio_done: Arc<AtomicBool>,
     encoder_done: Arc<AtomicBool>,
 ) -> AnyResult<()> {
+    let min_similarity = if config.loop_enabled {
+        visloc_online_loop::Config::from_path(&config.loop_config)?.min_similarity
+    } else {
+        visloc_online_loop::Config::default().min_similarity
+    };
     let proposals =
         node.create_publisher::<m::Proposal>("/visloc/proposals".reliable().keep_last(256))?;
     let mut peers: BTreeMap<_, _> = config
@@ -337,11 +345,11 @@ fn communications(
                         continue;
                     }
                     let (candidates, stats) =
-                        retrieval.candidates_for(&sequence, 0.8, Some(&owner));
+                        retrieval.candidates_for(&sequence, min_similarity, Some(&owner));
                     writeln!(
                         log,
                         "{}",
-                        serde_json::json!({"event":"retrieval","query":sequence.key,"stats":stats,"candidates":candidates})
+                        serde_json::json!({"event":"retrieval","query":sequence.key,"min_similarity":min_similarity,"stats":stats,"candidates":candidates})
                     )?;
                     for (candidate, similarity) in candidates {
                         let pair = c::Pair::new(sequence.key.clone(), candidate);
@@ -373,7 +381,7 @@ fn communications(
                     retrieval.sequences.get(&pair.1),
                 ) {
                     let similarity = c::sequence::dot(&a.descriptor, &b.descriptor);
-                    if a.model_id == b.model_id && similarity >= 0.8 {
+                    if a.model_id == b.model_id && similarity >= min_similarity {
                         status.lock().unwrap().finished = false;
                         last_activity = Instant::now();
                         // Resolve matrices first; feature service traffic starts
@@ -638,6 +646,27 @@ pub fn run(mut config: RobotConfig) -> AnyResult<()> {
                 let _ = errors.try_send(Event::Error(format!("sensor queue overflow: {e}")));
             }
         })?;
+    let right_sub = if config.camera_mode == CameraMode::Stereo {
+        let topic = format!("/{}/camera_right/image", config.robot);
+        let options = if config.reliable_sensors {
+            topic.as_str().reliable().keep_last(32)
+        } else {
+            topic.as_str().best_effort().keep_last(8)
+        };
+        let tx = input_tx.clone();
+        let errors = event_errors.clone();
+        Some(
+            node.create_subscription(options, move |image: sensor_msgs::msg::Image| {
+                if let Err(e) = tx.try_send(Input::RightImage(image)) {
+                    crate::traffic::dropped(crate::traffic::Queue::Sensor);
+                    let _ =
+                        errors.try_send(Event::Error(format!("right sensor queue overflow: {e}")));
+                }
+            })?,
+        )
+    } else {
+        None
+    };
     let imu_options = if config.reliable_sensors {
         imu_topic.as_str().reliable().keep_last(2048)
     } else {
@@ -806,6 +835,7 @@ pub fn run(mut config: RobotConfig) -> AnyResult<()> {
     })?;
     let _keep = (
         image_sub,
+        right_sub,
         imu_sub,
         history_service,
         sequence_service,

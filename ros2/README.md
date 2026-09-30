@@ -60,8 +60,16 @@ Required exports are `JIST_r18_512_seqgem_frames.onnx`, `xfeat_320x224.onnx`, an
 
 ## GRACO replay
 
+For concurrent local replay with Fast DDS, use the supplied shared-memory
+profile. It reserves a 64 MiB segment with room for the 1.76 MB raw images and
+growing graph messages. The default transport buffers caused repeated sensor
+delivery stalls in the four-robot run. This opt-in profile applies to the
+processes launched from this shell; live-node configuration is unchanged.
+
 ```bash
 source scripts/source_multi_robot_ros2.bash
+export FASTRTPS_DEFAULT_PROFILES_FILE="$PWD/ros2/visloc_ros/config/fastdds_replay.xml"
+export OPENBLAS_NUM_THREADS=1
 .runtime/graco-venv/bin/python scripts/prepare_multi_robot_graco.py \
   --output results/graco/my_multi_robot_run --robots 5 6 7 8
 .runtime/graco-venv/bin/python scripts/run_multi_robot_mission.py \
@@ -76,9 +84,28 @@ Replay mission directories must be new. A robot restarted with its existing conf
 
 Each first camera timestamp maps to a shared playback epoch; integer camera/IMU intervals remain exact. `mission.json` records every original-to-replay timestamp offset. One `/clock` accompanies playback. The first frame can initialize from the first IMU sample at/after its timestamp; an empty first integration interval is allowed, while later empty intervals are errors. The nominal rate is 0.25x with bounded backpressure, so overload slows replay. Robots receive concurrent batches, with at most one unacknowledged camera frame per robot. The final solve waits for VIO, loop workers, and graph history to drain.
 
-The validation summary reports both nominal and effective playback rate. Add `--profile-replay` to `run_multi_robot_mission.py` to save a standard Python `replay_profile.pstats` file for diagnosing publisher/callback delays; this does not change sensor timestamps or estimator settings.
+The validation summary reports both nominal and effective playback rate. The
+replay keeps its executor attached and writes per-batch publication,
+acknowledgement-wait and CPU timing to `replay_timing.jsonl`, with median/p95
+values in `replay_summary.json`. Add `--profile-replay` to
+`run_multi_robot_mission.py` to save a standard Python `replay_profile.pstats`
+file for diagnosing publisher/callback delays; this does not change sensor
+timestamps or estimator settings.
 
 Set `loop_enabled: false` in a robot JSON config to run the raw-VIO regression control. This bypasses model construction and loop inference without changing sensor preprocessing or Basalt calls.
+
+Use `prepare_multi_robot_graco.py --min-similarity 0.7` to try a different
+JIST global cosine threshold. Preparation snapshots the loop configuration
+and sets both its `min_similarity` and the backend's
+`pgo.min_loop_similarity` to the same value. Without this override, it uses
+the loop configuration's value (0.8 by default). Native robot retrieval and
+proposal rechecking honor `min_similarity`; geometric verification thresholds
+are unchanged. For hand-written missions, set both robot and backend
+thresholds consistently. Thresholds must be finite and in [0, 1].
+The [full aerial 5–8 threshold comparison](JIST_07_VALIDATION.md) found no
+accuracy or connectivity gain at 0.7: matching attempts increased from 128 to
+912, while the same three constraints passed verification. The default
+therefore remains 0.8.
 
 VIO precision is fixed to f64. The `--scalar-mode` option, ROS `scalar_mode`
 configuration field, and core estimator precision selector have been removed.
@@ -90,6 +117,9 @@ default when preparing a mission. It
 estimates gyro offset from a verified stationary first second and replays all
 buffered frames. The 0.75 noise/bias multipliers and 800 px aerial calibration
 remain the same. See [full results and limitations](UNIFORM_ATE4_VALIDATION.md).
+The [four-robot rerun](MULTI_ROBOT_F64_VALIDATION.md) validates this profile
+with online loops and centralized PGO: all four trajectories stay below 4 m
+ATE RMSE, while the map remains split into three connected components.
 The separate `stationary-motion` mode also averages gravity and waits for
 motion, explicitly counting omitted startup frames; it is not a uniformly
 passing profile in either precision mode tested. To explicitly bypass startup,
@@ -112,6 +142,17 @@ Or run a single native node with `VISLOC_ROBOT_CONFIG=/path/robot.json ros2 run 
 
 Inputs are `/<robot>/camera/image` (`sensor_msgs/Image`: mono8, rgb8, or bgr8) and `/<robot>/imu` (`sensor_msgs/Imu`). ROS remapping supports existing camera/IMU topic names. Images must use the calibrated raw resolution; preprocessing applies area resizing then radtan undistortion. With `preprocess: null`, supply already rectified pinhole images at the calibrated processing resolution. Inputs must arrive in timestamp order within each sensor topic. Sensor callbacks enqueue only; VIO waits for the IMU watermark to cover each image.
 
+Set `camera_mode: "stereo"` to also subscribe to `/<robot>/camera_right/image`.
+Stereo inputs require exact matching exposure timestamps and two calibrated
+cameras. Provide `preprocess_right` with the right camera's own parameters when
+preprocessing raw images; leave both preprocessing fields null for rectified
+inputs. Pairing tolerates callback order between topics, waits for both images
+and IMU coverage, and bounds pending exposures to 32. Missing/evicted exposures
+are counted once, with no monocular fallback. The default remains `"mono"`.
+`tracking.jsonl` records left/right observation counts and the input mode for
+every processed frame. Sequence retrieval and verification use the left camera;
+stereo observations contribute to VIO and its metric landmarks.
+
 Live inputs use best-effort sensor QoS; replay uses reliable QoS. SLAM records are reliable. Current status, corrected paths, and graph snapshots are transient-local. Communication deadlines use monotonic time; estimation uses message timestamps. Basalt never consumes corrected poses.
 
 ## Sequence and verification contracts
@@ -119,7 +160,7 @@ Live inputs use best-effort sensor QoS; replay uses reliable QoS. SLAM records a
 - Every actual VIO keyframe enters the odometry graph. For retrieval, skip a keyframe only when more than 95% of its triangulated landmark IDs occur in the last retained keyframe. This runs before feature subsampling; an empty set is retained.
 - Each non-overlapping block contains ten retained keyframes. Enumerate all 56 first/last-plus-three selections, minimizing squared consecutive camera-center distances, with lexicographic ties. Missing keyframe ordinals reset incomplete blocks; intentional skips do not.
 - Broadcast a normalized 512-dimensional JIST sequence descriptor, selected/member identities, local covisibility neighborhood, and model identity. Cache all five normalized frame descriptors.
-- Before scoring, exclude same-session overlapping/adjacent blocks, the 20-second neighborhood, and two-hop covisibility with at least 15 shared landmarks per edge. All sequence members participate. IDs and times never exclude a different robot/session. Keep cosine similarity >=0.8 and up to three distinct neighborhoods.
+- Before scoring, exclude same-session overlapping/adjacent blocks, the 20-second neighborhood, and two-hop covisibility with at least 15 shared landmarks per edge. All sequence members participate. IDs and times never exclude a different robot/session. Keep cosine similarity above the configured inclusive threshold (0.8 by default) and up to three distinct neighborhoods.
 - Trigger retrieval on local completion and remote announcements/history. Canonical sequence pairs assign one verification owner by robot ID; that robot also serves its archived sessions. Exchange the frame matrix first; maximize the entire 5x5 similarity matrix, then fetch only that pair's sparse packets.
 - Sample XFeat at measured VIO feature positions. Fewer than 128 real features produces an empty feature packet and a rejected verification, never padding. Match with the existing trained LighterGlue engine.
 - Fundamental-matrix RANSAC precedes both P3P directions and pose refinement. Require at least 15 PnP inliers, a 0.5 ratio among that direction's available 2D–3D correspondences, a 3-pixel RANSAC threshold, mean error <=2.25 px, 2% image-area coverage and four occupied 4x4 cells. Either direction can pass; choose more inliers, then lower reprojection error. Matching attempts are journaled before GPU execution and survive restart. Match a canonical sequence pair once; the old temporal confirmation gate is disabled.
@@ -134,6 +175,12 @@ Edges store **T_to_from**, transforming points from the source body to the desti
 The central backend reuses visloc's sparse SE(3) LM with Huber delta 3, 20 iterations, and no more than one solve per second while dirty. Disconnected components solve separately with one anchor each. A verified bridge initializes the joining alignment and removes the redundant anchor. Only finite solutions whose robust objective does not increase are published. Failure retains the last published solution. The graph journal supports restart and peer history recovers its missing tail.
 
 Defaults are odometry 0.15 m / 0.03 rad and loop 0.20 m / 0.04 rad. These are **tuning parameters, not measured covariances**. Configure them in backend `pgo` fields `odometry_translation_sigma`, `odometry_rotation_sigma`, `loop_translation_sigma`, and `loop_rotation_sigma`.
+
+The active implementation uses sequential raw-VIO edges and verified relative-pose
+loops, with the corrected SE3 log Jacobian. The covisibility-Schur and pose-only
+reprojection experiments are preserved on branch
+`experiment/covisibility-schur-reprojection` (snapshot `668b0ef`). Their reports
+and code live on that branch; saved experiment data remains under `results/okvis2/`.
 
 Raw `/<robot>/vio/odometry` and `robot/odom -> robot/base_link` stay continuous. Revisioned `/visloc/graph`, `/<robot>/slam/path`, and `map_<component robot>_<session>_<root keyframe> -> robot/odom` provide corrections. Including the root keyframe distinguishes temporary disconnected fragments within the same session when records arrive out of order.
 
@@ -166,3 +213,49 @@ After evaluation, `scripts/summarize_multi_robot.py MISSION` writes `validation_
 Status and communication snapshots use atomic replacement. For legacy runs with interrupted diagnostic writes, `--allow-incomplete-traffic` produces a summary with explicitly unavailable nodes and partial service totals; it never reconstructs missing counters as measurements.
 
 Validation results and known dataset limitations are recorded separately in `VALIDATION.md`. Successful transport or synthetic graph tests do not establish improved dataset accuracy.
+
+## Recorded RealSense inputs
+
+`scripts/prepare_realsense_slam.py --bag BAG --output NEW_DIRECTORY` prepares
+the same native Rust sequence/refinement pipeline for the Jetson's ROS2 MCAP
+recordings. It uses the D455 calibration, left IR only at 640×480, f64 stationary
+gyro-only initialization, 0.75 IMU noise/bias multipliers, and JIST threshold 0.8.
+Separate acceleration samples are interpolated onto gyro timestamps; original
+integer timestamps and lossless compressed images are retained in a replay cache.
+Recorded GPS is retained separately and excluded from SLAM. Run the generated `mission.json`
+through `scripts/run_multi_robot_mission.py`; visualization uses the same cached
+images. The default nominal playback rate is 1×, configurable with `--rate`.
+Use `--camera-mode stereo` to cache both IR streams and replay only exact-stamp
+pairs. The preparation audit reports paired and unpaired image counts; the
+original per-camera stamps remain in the cache. Both modes use the same f64
+estimator, initialization, IMU parameters, and sequence/refinement backend.
+If capture starts before synchronized IMU is available, pass
+`--trim-imu-boundaries` to select only images inside IMU coverage. The excluded
+timestamps are audited and the images remain in the cache; replay honors the
+mission's selected first/last timestamps without extrapolating IMU samples.
+
+The [South-ece-rtk-test run](SOUTH_ECE_SLAM_VALIDATION.md) completed all 9,364
+frames but **failed accuracy**, with late VIO divergence and no accepted loops.
+GPS is unreliable on this dataset and is excluded from evaluation. The
+[stereo-inertial rerun](SOUTH_ECE_STEREO_VALIDATION.md) avoided the monocular
+runaway speed but still accepted no loops. No ATE is claimed. Full logs, calibration/model
+hashes, trajectories, image evidence, and a Rerun recording are retained.
+
+The [cuVSLAM Python comparison](SOUTH_ECE_CUVSLAM_COMPARISON.md) runs NVIDIA's
+stereo-inertial odometry on the same paired images and IMU cache. The final
+cuVSLAM run develops severe late drift; the report includes input-parity checks,
+failure diagnostics, timing limitations, plots, and a Rerun comparison. The
+optional NVIDIA environment is isolated from ordinary visloc and ROS builds.
+
+The dataset path was replaced on 2026-09-27. The
+[replacement-recording rerun](SOUTH_ECE_STEREO_20260927_VALIDATION.md) processed
+7,182 stereo pairs with zero runtime drops and one accepted loop from 17
+verification attempts. Two initial pairs were excluded because IMU coverage
+had not started. The previous VIO/cuVSLAM results remain archived and describe
+the older recording; GPS remains excluded and no ATE is claimed.
+
+A subsequent [evo evaluation against the supplied PPK reference](SOUTH_ECE_EVO_20260927.md)
+reports 0.781 m raw and 0.787 m loop-corrected translation RMSE, with rigid
+alignment and no scale fitting. It covers 656 matched reference epochs;
+reference gaps, strict quality flags, and the uncompensated antenna offset are
+documented. This offline evaluation does not feed GNSS into SLAM.
