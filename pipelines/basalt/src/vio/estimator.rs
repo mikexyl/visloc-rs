@@ -2585,7 +2585,11 @@ impl BasaltVioEstimator {
         } else {
             0
         };
-        if let Some(g) = self.gnss.as_ref().filter(|g| g.active()) {
+        if let Some(g) = self
+            .gnss
+            .as_ref()
+            .filter(|g| g.active() && g.config.coupling == visloc_gnss::Coupling::FrameWindow)
+        {
             let latest = self.window_states.last().map_or(0, |s| s.timestamp_ns);
             let cutoff = latest - (g.config.min_active_window_s * 1e9).round() as i64;
             let by_time = self
@@ -2614,7 +2618,21 @@ impl BasaltVioEstimator {
                     .map(|state| state.frame_id)
             })
             .flatten();
+        // GNSS propagation needs one actual keyframe's velocity and biases.
+        // Keep only the newest full keyframe; ordinary recent non-keyframes
+        // still follow the short Basalt retirement policy.
+        let gnss_keyframe = self
+            .gnss
+            .as_ref()
+            .filter(|g| {
+                g.active() && g.config.coupling == visloc_gnss::Coupling::KeyframePreintegration
+            })
+            .and_then(|_| self.window_states.iter().rev().find(|s| s.is_keyframe))
+            .map(|s| s.frame_id);
         for state in self.window_states.iter().take(states_to_remove) {
+            if Some(state.frame_id) == gnss_keyframe {
+                continue;
+            }
             if state.is_keyframe {
                 plan.convert_states.push(state.frame_id);
             } else {
@@ -6963,6 +6981,45 @@ mod tests {
         }
         assert!(outputs[4].window.attempted);
         assert!(outputs[4].window.lm.iter().any(|run| run.pass == "first"));
+    }
+
+    #[test]
+    fn gnss_keeps_only_latest_keyframe_navigation_without_extending_recent_frames() {
+        let mut e = BasaltVioEstimator::new(cam(), EstimatorConfig::default());
+        e.configure_gnss(visloc_gnss::Config {
+            enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+        e.gnss.as_mut().unwrap().bootstrap = Some(visloc_gnss::bootstrap::Bootstrap {
+            alignment: visloc_gnss::factor::Alignment {
+                origin_ecef_m: Vector3::new(6378137., 0., 0.),
+                yaw_rad: 0.,
+                translation_enu_m: Vector3::zeros(),
+            },
+            time_offset_s: 0.,
+            timing_std_s: 0.,
+            clock: Default::default(),
+        });
+        for frame_id in 0..7 {
+            e.window_states.push(WindowState {
+                frame_id,
+                timestamp_ns: frame_id as i64 * 33_333_333,
+                nav: Default::default(),
+                stored_current_nav: Default::default(),
+                linearized_nav: Default::default(),
+                linearized_delta: DVector::zeros(NAV_STATE_DOF),
+                is_keyframe: [1, 4].contains(&frame_id),
+                is_latest: frame_id == 6,
+                linearized: false,
+            });
+        }
+        let plan = e.marginalization_plan(6);
+        assert_eq!(plan.drop_states, vec![0, 2, 3]);
+        assert_eq!(plan.convert_states, vec![1]);
+        assert_eq!(plan.boundary_state, Some(5));
+        e.window_states.last_mut().unwrap().is_keyframe = true;
+        assert_eq!(e.marginalization_plan(6).convert_states, vec![1, 4]);
     }
 
     #[test]

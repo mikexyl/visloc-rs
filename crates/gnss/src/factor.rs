@@ -1,6 +1,6 @@
 use crate::navigation::{enu_to_ecef, SatelliteState};
 use crate::{Config, Mode, Observation, C, L1_HZ};
-use nalgebra::{Matrix3, SMatrix, SVector, UnitQuaternion, Vector3};
+use nalgebra::{Matrix2, Matrix3, SMatrix, SVector, UnitQuaternion, Vector3};
 use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Alignment {
@@ -52,13 +52,12 @@ fn skew(v: Vector3<f64>) -> Matrix3<f64> {
 }
 /// Column order: body pose6, velocity3, gyro bias3, accel bias3,
 /// ENU translation3/yaw1, GPS bias/Galileo bias/common drift3.
-pub fn linearize(
+fn raw(
     o: &PreparedObservation,
     body: &Body,
     alignment: &Alignment,
     clock: &Clock,
     lever: Vector3<f64>,
-    config: &Config,
 ) -> Linearization {
     let r = alignment.rotation();
     let rb = body.rotation.to_rotation_matrix().into_inner();
@@ -102,6 +101,54 @@ pub fn linearize(
         + dv * r * Vector3::z().cross(&local_v))[0];
     j[(0, 19 + o.observation.satellite.system.index())] = 1.;
     j[(1, 21)] = 1.;
+    Linearization {
+        residual: SVector::<f64, 2>::new(pr, rate),
+        jacobian: j,
+        cost: 0.,
+    }
+}
+
+/// Unwhitened residual/Jacobian, used to propagate navigation/time uncertainty.
+pub fn raw_linearize(
+    o: &PreparedObservation,
+    body: &Body,
+    alignment: &Alignment,
+    clock: &Clock,
+    lever: Vector3<f64>,
+) -> Linearization {
+    raw(o, body, alignment, clock, lever)
+}
+
+pub fn linearize(
+    o: &PreparedObservation,
+    body: &Body,
+    alignment: &Alignment,
+    clock: &Clock,
+    lever: Vector3<f64>,
+    config: &Config,
+) -> Linearization {
+    linearize_with_covariance(o, body, alignment, clock, lever, config, Matrix2::zeros())
+}
+
+/// Additional covariance is frozen at the factor's current linearization point.
+/// Whiten correlated code/rate noise jointly only when both channels are active.
+pub fn linearize_with_covariance(
+    o: &PreparedObservation,
+    body: &Body,
+    alignment: &Alignment,
+    clock: &Clock,
+    lever: Vector3<f64>,
+    config: &Config,
+    extra: Matrix2<f64>,
+) -> Linearization {
+    let lin = raw(o, body, alignment, clock, lever);
+    let mut j = lin.jacobian;
+    let angular = o.gyro_rad_s - body.gyro_bias;
+    let r = alignment.rotation();
+    let rb = body.rotation.to_rotation_matrix().into_inner();
+    let dv = -(o.satellite.position_m - alignment.position(body.position + rb * lever))
+        .normalize()
+        .transpose();
     let sigma_pr = o
         .observation
         .pseudorange_std_m
@@ -110,18 +157,41 @@ pub fn linearize(
     let sigma_rate = (o.observation.doppler_std_hz * C / L1_HZ)
         .max(config.range_rate_floor_m_s)
         .hypot(config.lever_arm_std_m * (dv * r * rb * skew(angular)).norm());
-    let mut residual = SVector::<f64, 2>::new(pr / sigma_pr, rate / sigma_rate);
+    let mut covariance = extra;
+    covariance[(0, 0)] += sigma_pr.powi(2);
+    covariance[(1, 1)] += sigma_rate.powi(2);
+    let active = [
+        o.use_pseudorange && config.mode == Mode::PseudorangeDoppler,
+        o.use_doppler && config.mode != Mode::WindowOnly,
+    ];
+    let mut residual = lin.residual;
+    if active.iter().all(|a| *a) {
+        let whitening = covariance
+            .cholesky()
+            .expect("positive measurement covariance")
+            .l()
+            .try_inverse()
+            .expect("positive diagonal");
+        residual = whitening * residual;
+        j = whitening * j;
+    } else {
+        for row in 0..2 {
+            if active[row] {
+                residual[row] /= covariance[(row, row)].sqrt();
+                j.row_mut(row).scale_mut(1. / covariance[(row, row)].sqrt());
+            } else {
+                residual[row] = 0.;
+                j.row_mut(row).fill(0.);
+            }
+        }
+    }
     let mut cost = 0.;
     for row in 0..2 {
-        if (row == 0 && (!o.use_pseudorange || config.mode == Mode::DopplerOnly))
-            || (row == 1 && !o.use_doppler)
-        {
+        if !active[row] {
             residual[row] = 0.;
             j.row_mut(row).fill(0.);
             continue;
         }
-        j.row_mut(row)
-            .scale_mut(1. / if row == 0 { sigma_pr } else { sigma_rate });
         let x = residual[row].abs();
         let w = if x <= config.huber_sigma {
             1.
@@ -263,5 +333,40 @@ mod tests {
         let mut opposite = o.clone();
         opposite.observation.doppler_hz = -o.observation.doppler_hz;
         assert!(linearize(&opposite, &b, &a, &c, l, &cfg).residual[1] != lin.residual[1]);
+    }
+    #[test]
+    fn correlated_whitening_preserves_objective_and_disabled_channels_do_not_leak() {
+        let (mut o, b, a, c, cfg, l) = fixture();
+        let extra = Matrix2::new(100., 2., 2., 0.2);
+        let raw = raw_linearize(&o, &b, &a, &c, l);
+        let mut covariance = extra;
+        covariance[(0, 0)] += o
+            .observation
+            .pseudorange_std_m
+            .max(cfg.pseudorange_floor_m)
+            .powi(2);
+        covariance[(1, 1)] += (o.observation.doppler_std_hz * C / L1_HZ)
+            .max(cfg.range_rate_floor_m_s)
+            .powi(2);
+        let f = linearize_with_covariance(&o, &b, &a, &c, l, &cfg, extra);
+        assert!(
+            (f.residual.norm_squared()
+                - raw
+                    .residual
+                    .dot(&(covariance.try_inverse().unwrap() * raw.residual)))
+            .abs()
+                < 1e-4
+        );
+        o.use_pseudorange = false;
+        let rate = linearize_with_covariance(&o, &b, &a, &c, l, &cfg, extra);
+        assert_eq!(rate.residual[0], 0.);
+        assert_eq!(rate.jacobian.row(0).norm(), 0.);
+        let mut changed = o.clone();
+        changed.observation.pseudorange_m += 1e6;
+        assert_eq!(
+            rate.residual,
+            linearize_with_covariance(&changed, &b, &a, &c, l, &cfg, extra).residual
+        );
+        assert!(rate.residual[1].abs() < linearize(&o, &b, &a, &c, l, &cfg).residual[1].abs());
     }
 }

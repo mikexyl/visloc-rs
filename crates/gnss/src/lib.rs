@@ -78,12 +78,23 @@ pub enum Mode {
     #[default]
     PseudorangeDoppler,
     DopplerOnly,
+    /// Same retained-keyframe window, without GNSS factors, for ablation.
+    WindowOnly,
+}
+/// The legacy epoch-state path is retained for controlled comparisons.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Coupling {
+    FrameWindow,
+    #[default]
+    KeyframePreintegration,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub enabled: bool,
     pub mode: Mode,
+    pub coupling: Coupling,
     pub gasket_gap_mm: f64,
     pub lever_arm_std_m: f64,
     pub min_cn0_dbhz: u8,
@@ -95,8 +106,10 @@ pub struct Config {
     pub clock_bias_walk_m_sqrt_s: f64,
     pub clock_drift_walk_m_s_sqrt_s: f64,
     pub max_queue_epochs: usize,
-    /// Bound delayed USB observations by sensor time and navigation-state count.
+    /// Legacy frame-window limits; keyframe coupling keeps the normal short window.
     pub nominal_imu_period_s: f64,
+    /// Maximum age when first binding a delayed epoch; does not grow the Nav window.
+    pub max_epoch_age_s: f64,
     pub min_active_window_s: f64,
     pub max_navigation_states: usize,
     pub max_bootstrap_seconds: f64,
@@ -112,6 +125,7 @@ impl Default for Config {
         Self {
             enabled: false,
             mode: Mode::PseudorangeDoppler,
+            coupling: Coupling::KeyframePreintegration,
             gasket_gap_mm: 0.6,
             lever_arm_std_m: 0.02,
             min_cn0_dbhz: 25,
@@ -124,6 +138,7 @@ impl Default for Config {
             clock_drift_walk_m_s_sqrt_s: 1.,
             max_queue_epochs: 256,
             nominal_imu_period_s: 0.005,
+            max_epoch_age_s: 0.5,
             min_active_window_s: 0.5,
             max_navigation_states: 32,
             max_bootstrap_seconds: 120.,
@@ -150,6 +165,7 @@ impl Config {
             self.timing_search_s,
             self.min_active_window_s,
             self.nominal_imu_period_s,
+            self.max_epoch_age_s,
         ];
         if positive.iter().any(|x| !x.is_finite() || *x <= 0.)
             || !self.gasket_gap_mm.is_finite()

@@ -16,16 +16,18 @@ use crate::{
     timing::TimingBreakdown,
     BasaltNavState, ImuSample,
 };
-use nalgebra::{DMatrix, DVector, UnitQuaternion, Vector3};
+mod motion;
+use motion::{EpochMotion, Matrix15};
+use nalgebra::{DMatrix, DVector, Matrix2, UnitQuaternion, Vector3};
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use visloc_gnss::{
     bootstrap::{self, Bootstrap, Solution, VioSample},
     calibration::{lever_arm, LeverArm},
     factor::{self, Alignment, Body, Clock, PreparedObservation},
     navigation::{atmospheric_delay, azimuth_elevation, Ephemeris, Navigation},
     ubx::{Decoder, Message},
-    Config, Diagnostics, Epoch, Mode,
+    Config, Coupling, Diagnostics, Epoch, Mode,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -89,6 +91,10 @@ pub struct GnssRuntime {
     pub initialization: bootstrap::InitializationDiagnostics,
     prior: Option<Prior>,
     hidden: BTreeMap<u64, BasaltNavState>,
+    epoch_keyframes: BTreeMap<u64, u64>,
+    motions: BTreeMap<u64, EpochMotion>,
+    seen_epochs: BTreeSet<(u16, u64)>,
+    seen_order: VecDeque<(u16, u64)>,
     clocks: BTreeMap<u64, ClockEpoch>,
     decisions: BTreeMap<(u64, visloc_gnss::Satellite), (bool, bool)>,
     consumed_before: i64,
@@ -126,6 +132,10 @@ impl GnssRuntime {
             initialization: Default::default(),
             prior: None,
             hidden: BTreeMap::new(),
+            epoch_keyframes: BTreeMap::new(),
+            motions: BTreeMap::new(),
+            seen_epochs: BTreeSet::new(),
+            seen_order: VecDeque::new(),
             clocks: BTreeMap::new(),
             decisions: BTreeMap::new(),
             consumed_before: i64::MIN,
@@ -196,15 +206,17 @@ impl GnssRuntime {
         if e.clock_reset {
             self.diagnostics.clock_resets += 1;
         }
-        if self
-            .epochs
-            .iter()
-            .any(|x| x.epoch.week == e.week && x.epoch.tow_s == e.tow_s)
-        {
+        let identity = (e.week, e.tow_s.to_bits());
+        if !self.seen_epochs.insert(identity) {
             self.record(Record::Decision(serde_json::json!({
                 "reason":"duplicate_epoch", "week":e.week, "tow_s":e.tow_s,
             })));
             return;
+        }
+        self.seen_order.push_back(identity);
+        while self.seen_order.len() > self.config.max_queue_epochs.saturating_mul(16) {
+            self.seen_epochs
+                .remove(&self.seen_order.pop_front().unwrap());
         }
         let seed = self.solutions.last().map(|s| s.ecef_m);
         let solution = bootstrap::solve_epoch(&e, &self.navigation, &self.config, seed);
@@ -244,7 +256,7 @@ impl GnssRuntime {
             .bootstrap
             .as_ref()
             .map_or(0, |b| (b.time_offset_s * 1e9).round() as i64);
-        if time + offset <= self.consumed_before {
+        if self.config.coupling == Coupling::FrameWindow && time + offset <= self.consumed_before {
             self.diagnostics.stale_epochs += 1;
             self.record(Record::Decision(serde_json::json!({
                 "reason":"outside_active_window", "week":e.week, "tow_s":e.tow_s,
@@ -333,6 +345,12 @@ impl GnssRuntime {
         self.config.enabled && self.bootstrap.is_some()
     }
     fn build(&mut self, source: &WindowProblem) -> Result<JointProblem, String> {
+        if self.config.coupling == Coupling::KeyframePreintegration {
+            return self.build_keyframes(source, None);
+        }
+        self.build_frame_window(source)
+    }
+    fn build_frame_window(&mut self, source: &WindowProblem) -> Result<JointProblem, String> {
         let boot = self
             .bootstrap
             .as_ref()
@@ -438,125 +456,9 @@ impl GnssRuntime {
                 clock: e.clock.clone(),
                 reset: e.epoch.clock_reset,
             });
-            let nav = &base.states[index].nav;
-            let body = body(nav);
-            let p = boot
-                .alignment
-                .position(body.position + body.rotation * self.lever_arm.imu_to_antenna_m);
-            for o in &e.epoch.observations {
-                let unique = !self.decisions.contains_key(&(e.id, o.satellite));
-                if o.cn0_dbhz < self.config.min_cn0_dbhz {
-                    if unique {
-                        self.diagnostics.low_cn0 += 1;
-                        self.record_decision(
-                            e.id,
-                            Some(o.satellite),
-                            "low_cn0",
-                            None,
-                            None,
-                            false,
-                            false,
-                        );
-                    }
-                    continue;
-                }
-                let Some(satellite) = self
-                    .navigation
-                    .select(o.satellite, e.epoch.gps_seconds())
-                    .and_then(|ep| ep.at_transmission(e.epoch.gps_seconds(), o.pseudorange_m))
-                else {
-                    if unique {
-                        self.diagnostics.missing_ephemeris += 1;
-                        self.record_decision(
-                            e.id,
-                            Some(o.satellite),
-                            "missing_ephemeris",
-                            None,
-                            None,
-                            false,
-                            false,
-                        );
-                    }
-                    continue;
-                };
-                if azimuth_elevation(p, satellite.position_m).1
-                    < self.config.min_elevation_deg.to_radians()
-                {
-                    if unique {
-                        self.diagnostics.low_elevation += 1;
-                        self.record_decision(
-                            e.id,
-                            Some(o.satellite),
-                            "low_elevation",
-                            None,
-                            None,
-                            false,
-                            false,
-                        );
-                    }
-                    continue;
-                }
-                let mut prepared = PreparedObservation {
-                    observation: o.clone(),
-                    atmosphere_m: atmospheric_delay(
-                        p,
-                        satellite.position_m,
-                        e.epoch.tow_s,
-                        self.navigation.ionosphere,
-                    ),
-                    satellite,
-                    gyro_rad_s: sample.gyro_rad_s,
-                    use_pseudorange: self.config.mode != Mode::DopplerOnly,
-                    use_doppler: true,
-                };
-                let mut gate = self.config.clone();
-                gate.huber_sigma = f64::MAX;
-                let clock = &self.clocks[&e.id].clock;
-                let residual = factor::linearize(
-                    &prepared,
-                    &body,
-                    &boot.alignment,
-                    clock,
-                    self.lever_arm.imu_to_antenna_m,
-                    &gate,
-                )
-                .residual;
-                if residual[0].abs() > self.config.reject_sigma {
-                    prepared.use_pseudorange = false;
-                }
-                if residual[1].abs() > self.config.reject_sigma {
-                    prepared.use_doppler = false;
-                }
-                if unique {
-                    if self.config.mode != Mode::DopplerOnly {
-                        if prepared.use_pseudorange {
-                            self.diagnostics.accepted_pseudoranges += 1;
-                        } else {
-                            self.diagnostics.rejected_pseudoranges += 1;
-                        }
-                    }
-                    if prepared.use_doppler {
-                        self.diagnostics.accepted_dopplers += 1;
-                    } else {
-                        self.diagnostics.rejected_dopplers += 1;
-                    }
-                }
-                let flags = (prepared.use_pseudorange, prepared.use_doppler);
-                if self.decisions.get(&(e.id, o.satellite)) != Some(&flags) {
-                    self.record_decision(
-                        e.id,
-                        Some(o.satellite),
-                        "residual_gate",
-                        Some(residual[0]),
-                        Some(residual[1]),
-                        flags.0,
-                        flags.1,
-                    );
-                }
-                if prepared.use_pseudorange || prepared.use_doppler {
-                    observations.push((index, e.id, prepared));
-                }
-            }
+            let (screened, _) =
+                self.screen_epoch(&e, index, &base.states[index].nav, &sample, &boot, None);
+            observations.extend(screened);
             epochs.push((e.id, index));
         }
         // Replace each affected IMU link; no original measurement survives.
@@ -621,6 +523,364 @@ impl GnssRuntime {
             self.prior.clone(),
         )
     }
+    #[allow(clippy::too_many_arguments)]
+    fn screen_epoch(
+        &mut self,
+        e: &TimedEpoch,
+        index: usize,
+        nav: &BasaltNavState,
+        sample: &ImuSample,
+        boot: &Bootstrap,
+        motion: Option<(&EpochMotion, &BasaltNavState)>,
+    ) -> (
+        Vec<(usize, u64, PreparedObservation)>,
+        BTreeMap<(u64, visloc_gnss::Satellite), Matrix2<f64>>,
+    ) {
+        let body = body(nav);
+        let p = boot
+            .alignment
+            .position(body.position + body.rotation * self.lever_arm.imu_to_antenna_m);
+        let mut observations = Vec::new();
+        let mut covariances = BTreeMap::new();
+        for o in &e.epoch.observations {
+            let unique = !self.decisions.contains_key(&(e.id, o.satellite));
+            if o.cn0_dbhz < self.config.min_cn0_dbhz {
+                if unique {
+                    self.diagnostics.low_cn0 += 1;
+                    self.record_decision(
+                        e.id,
+                        Some(o.satellite),
+                        "low_cn0",
+                        None,
+                        None,
+                        false,
+                        false,
+                    );
+                }
+                continue;
+            }
+            let Some(satellite) = self
+                .navigation
+                .select(o.satellite, e.epoch.gps_seconds())
+                .and_then(|ep| ep.at_transmission(e.epoch.gps_seconds(), o.pseudorange_m))
+            else {
+                if unique {
+                    self.diagnostics.missing_ephemeris += 1;
+                    self.record_decision(
+                        e.id,
+                        Some(o.satellite),
+                        "missing_ephemeris",
+                        None,
+                        None,
+                        false,
+                        false,
+                    );
+                }
+                continue;
+            };
+            if azimuth_elevation(p, satellite.position_m).1
+                < self.config.min_elevation_deg.to_radians()
+            {
+                if unique {
+                    self.diagnostics.low_elevation += 1;
+                    self.record_decision(
+                        e.id,
+                        Some(o.satellite),
+                        "low_elevation",
+                        None,
+                        None,
+                        false,
+                        false,
+                    );
+                }
+                continue;
+            }
+            let mut prepared = PreparedObservation {
+                observation: o.clone(),
+                atmosphere_m: atmospheric_delay(
+                    p,
+                    satellite.position_m,
+                    e.epoch.tow_s,
+                    self.navigation.ionosphere,
+                ),
+                satellite,
+                gyro_rad_s: sample.gyro_rad_s,
+                use_pseudorange: self.config.mode != Mode::DopplerOnly,
+                use_doppler: true,
+            };
+            let mut gate = self.config.clone();
+            gate.huber_sigma = f64::MAX;
+            let clock = &self.clocks[&e.id].clock;
+            let covariance = motion.map_or_else(Matrix2::zeros, |(m, anchor)| {
+                measurement_covariance(
+                    m,
+                    anchor,
+                    &prepared,
+                    &body,
+                    &boot.alignment,
+                    clock,
+                    self.lever_arm.imu_to_antenna_m,
+                    boot.timing_std_s,
+                )
+            });
+            let residual = factor::linearize_with_covariance(
+                &prepared,
+                &body,
+                &boot.alignment,
+                clock,
+                self.lever_arm.imu_to_antenna_m,
+                &gate,
+                covariance,
+            )
+            .residual;
+            if residual[0].abs() > self.config.reject_sigma {
+                prepared.use_pseudorange = false;
+            }
+            if residual[1].abs() > self.config.reject_sigma {
+                prepared.use_doppler = false;
+            }
+            if unique {
+                if self.config.mode != Mode::DopplerOnly {
+                    if prepared.use_pseudorange {
+                        self.diagnostics.accepted_pseudoranges += 1;
+                    } else {
+                        self.diagnostics.rejected_pseudoranges += 1;
+                    }
+                }
+                if prepared.use_doppler {
+                    self.diagnostics.accepted_dopplers += 1;
+                } else {
+                    self.diagnostics.rejected_dopplers += 1;
+                }
+            }
+            let flags = (prepared.use_pseudorange, prepared.use_doppler);
+            if self.decisions.get(&(e.id, o.satellite)) != Some(&flags) {
+                self.record_decision(
+                    e.id,
+                    Some(o.satellite),
+                    "residual_gate",
+                    Some(residual[0]),
+                    Some(residual[1]),
+                    flags.0,
+                    flags.1,
+                );
+            }
+            if prepared.use_pseudorange || prepared.use_doppler {
+                observations.push((index, e.id, prepared.clone()));
+                covariances.insert((e.id, o.satellite), covariance);
+            }
+        }
+        (observations, covariances)
+    }
+    fn build_keyframes(
+        &mut self,
+        source: &WindowProblem,
+        retiring: Option<&[u64]>,
+    ) -> Result<JointProblem, String> {
+        let boot = self
+            .bootstrap
+            .as_ref()
+            .ok_or("GNSS is not initialized")?
+            .clone();
+        let mut base = source.clone();
+        if self.prior.is_some() {
+            base.prior = None;
+            base.anchor_point = None;
+        }
+        let actual = base.states.len();
+        let last = base
+            .states
+            .last()
+            .ok_or("empty camera state window")?
+            .timestamp_ns;
+        let offset = (boot.time_offset_s * 1e9).round() as i64;
+        let frontier_time = self
+            .prior
+            .as_ref()
+            .into_iter()
+            .flat_map(|p| &p.blocks)
+            .filter_map(|b| {
+                if let Key::Clock(id) = b.key {
+                    self.clocks.get(&id).map(|c| c.time)
+                } else {
+                    None
+                }
+            })
+            .max();
+        let mut epochs = Vec::new();
+        let mut observations = Vec::new();
+        let mut motions = BTreeMap::new();
+        let mut covariances = BTreeMap::new();
+        let mut rejected = BTreeSet::new();
+        for e in self.epochs.iter().cloned().collect::<Vec<_>>() {
+            let t = e.time + offset;
+            if self.config.mode == Mode::WindowOnly {
+                if t <= last {
+                    rejected.insert(e.id);
+                }
+                continue;
+            }
+            if retiring.is_none() && t > last {
+                continue;
+            }
+            if !self.epoch_keyframes.contains_key(&e.id)
+                && last.saturating_sub(t) as f64 * 1e-9 > self.config.max_epoch_age_s
+            {
+                rejected.insert(e.id);
+                self.diagnostics.stale_epochs += 1;
+                self.record_decision(
+                    e.id,
+                    None,
+                    "delayed_epoch_age_limit",
+                    None,
+                    None,
+                    false,
+                    false,
+                );
+                continue;
+            }
+            // A pre-marginalization snapshot omits newer retained keyframes.
+            // Missing from this prefix is not the same as having retired.
+            if retiring.is_some_and(|ids| {
+                self.epoch_keyframes
+                    .get(&e.id)
+                    .is_none_or(|owner| !ids.contains(owner))
+            }) {
+                continue;
+            }
+            let index = if let Some(owner) = self.epoch_keyframes.get(&e.id) {
+                base.states.iter().position(|s| s.frame_id == *owner)
+            } else if retiring.is_none() {
+                base.states
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.is_keyframe)
+                    .min_by_key(|(_, s)| ((s.timestamp_ns as i128 - t as i128).abs(), s.frame_id))
+                    .map(|(i, _)| i)
+            } else {
+                None
+            };
+            let Some(index) = index else {
+                // On activation the previous keyframe may already be Pose6.
+                // Wait for the next actual keyframe rather than inventing velocity.
+                if self.epoch_keyframes.contains_key(&e.id) {
+                    rejected.insert(e.id);
+                    self.diagnostics.stale_epochs += 1;
+                    self.record_decision(e.id, None, "retired_keyframe", None, None, false, false);
+                }
+                continue;
+            };
+            let anchor = &base.states[index];
+            if retiring.is_some_and(|ids| !ids.contains(&anchor.frame_id)) {
+                continue;
+            }
+            if frontier_time.is_some_and(|f| t <= f) && !self.epoch_keyframes.contains_key(&e.id) {
+                rejected.insert(e.id);
+                self.diagnostics.stale_epochs += 1;
+                self.record_decision(
+                    e.id,
+                    None,
+                    "older_than_clock_frontier",
+                    None,
+                    None,
+                    false,
+                    false,
+                );
+                continue;
+            }
+            if !self.motions.contains_key(&e.id)
+                && self
+                    .imu
+                    .last()
+                    .is_some_and(|s| anchor.timestamp_ns.max(t) > s.timestamp_ns)
+            {
+                // The sensor worker intentionally gives VIO past IMU packets
+                // only. Wait for the next update to bracket a newly selected
+                // keyframe instead of extrapolating or losing the epoch.
+                self.record(Record::Decision(serde_json::json!({"epoch_id":e.id,
+                    "reason":"awaiting_keyframe_imu","keyframe_id":anchor.frame_id,
+                    "keyframe_time_ns":anchor.timestamp_ns,"epoch_time_ns":t})));
+                continue;
+            }
+            let motion = if let Some(m) = self.motions.get(&e.id) {
+                m.clone()
+            } else {
+                match EpochMotion::new(
+                    &self.imu,
+                    anchor.timestamp_ns,
+                    t,
+                    &anchor.nav,
+                    base.gravity_world,
+                    base.imu_noise,
+                    base.bias_walk_noise,
+                    self.config.nominal_imu_period_s,
+                ) {
+                    Ok(m) => m,
+                    Err(error) => {
+                        rejected.insert(e.id);
+                        self.diagnostics.stale_epochs += 1;
+                        self.record(Record::Decision(serde_json::json!({"epoch_id":e.id,"reason":"missing_keyframe_imu","error":error})));
+                        continue;
+                    }
+                }
+            };
+            self.epoch_keyframes.insert(e.id, anchor.frame_id);
+            self.motions.insert(e.id, motion.clone());
+            self.clocks.entry(e.id).or_insert(ClockEpoch {
+                id: e.id,
+                time: t,
+                clock: e.clock.clone(),
+                reset: e.epoch.clock_reset,
+            });
+            let (nav, _) = motion.evaluate(&anchor.nav);
+            let (screened, noise) = self.screen_epoch(
+                &e,
+                index,
+                &nav,
+                &motion.sample,
+                &boot,
+                Some((&motion, &anchor.nav)),
+            );
+            observations.extend(screened);
+            covariances.extend(noise);
+            motions.insert(e.id, motion);
+            epochs.push((e.id, index));
+        }
+        self.epochs.retain(|e| !rejected.contains(&e.id));
+        let mut clocks: Vec<_> = epochs
+            .iter()
+            .filter_map(|(id, _)| self.clocks.get(id).cloned())
+            .collect();
+        if let Some(prior) = &self.prior {
+            for block in &prior.blocks {
+                if let Key::Clock(id) = block.key {
+                    if !clocks.iter().any(|c| c.id == id) {
+                        clocks.push(
+                            self.clocks
+                                .get(&id)
+                                .ok_or("missing clock frontier")?
+                                .clone(),
+                        );
+                    }
+                }
+            }
+        }
+        clocks.sort_by_key(|c| (c.time, c.id));
+        let mut joint = JointProblem::new(
+            base,
+            actual,
+            epochs,
+            clocks,
+            observations,
+            boot.alignment,
+            self.config.clone(),
+            self.lever_arm.imu_to_antenna_m,
+            self.prior.clone(),
+        )?;
+        joint.motions = motions;
+        joint.covariances = covariances;
+        Ok(joint)
+    }
     pub(crate) fn solve(
         &mut self,
         source: &mut WindowProblem,
@@ -642,7 +902,7 @@ impl GnssRuntime {
         if state.iter().any(|v| !v.is_finite() || v.abs() > 1e9) {
             return Err(error("invalid joint GNSS solution magnitude".into()));
         }
-        self.record(Record::Decision(serde_json::json!({"reason":"joint_solve","timestamp_ns":source.states.last().map(|s|s.timestamp_ns),"initial_cost":initial_cost,"final_cost":result.cost,"iterations":result.iterations,"trace":result.trace.iter().map(|t|serde_json::json!({"iteration":t.iteration,"cost_before":t.cost_before,"actual_cost":t.actual_cost,"step_norm":t.step_norm,"decision":format!("{:?}",t.decision)})).collect::<Vec<_>>()})));
+        self.record(Record::Decision(serde_json::json!({"reason":"joint_solve","coupling":self.config.coupling,"camera_nav_states":problem.actual_states,"gnss_nav_states":problem.base.states.len()-problem.actual_states,"epoch_clocks":problem.clocks.len(),"state_dof":state.len(),"timestamp_ns":source.states.last().map(|s|s.timestamp_ns),"initial_cost":initial_cost,"final_cost":result.cost,"iterations":result.iterations,"trace":result.trace.iter().map(|t|serde_json::json!({"iteration":t.iteration,"cost_before":t.cost_before,"actual_cost":t.actual_cost,"step_norm":t.step_norm,"decision":format!("{:?}",t.decision)})).collect::<Vec<_>>()})));
         let (factor_count, factor_rows) = problem.factor_shape.get();
         let joint_landmarks = problem.base.landmarks.len();
         let joint_links = problem.base.imu_links.len();
@@ -709,6 +969,9 @@ impl GnssRuntime {
     }
     fn writeback(&mut self, p: &JointProblem, x: &DVector<f64>) {
         for (id, index) in &p.epochs {
+            if self.config.coupling == Coupling::KeyframePreintegration {
+                continue;
+            }
             let offset = p.base.poses.len() * 6 + index * 15;
             self.hidden
                 .insert(*id, decode_state(x.rows(offset, 15).as_slice()));
@@ -732,9 +995,17 @@ impl GnssRuntime {
         let mut gate = self.config.clone();
         gate.huber_sigma = f64::MAX;
         for (index, id, o) in &p.observations {
-            let nav = decode_state(x.rows(p.base.poses.len() * 6 + index * 15, 15).as_slice());
+            let (nav, _) = p.epoch_nav(x, *index, *id);
             let c = &self.clocks[id].clock;
-            let f = factor::linearize(o, &body(&nav), &p.alignment(x), c, p.lever, &gate);
+            let f = factor::linearize_with_covariance(
+                o,
+                &body(&nav),
+                &p.alignment(x),
+                c,
+                p.lever,
+                &gate,
+                p.covariance(*id, o.observation.satellite),
+            );
             self.record(Record::Decision(serde_json::json!({"epoch_id":id,"sensor_time_ns":self.clocks[id].time,"solve_timestamp_ns":p.base.states[p.actual_states-1].timestamp_ns,"satellite":o.observation.satellite,"reason":"optimized_residual","pseudorange_sigma":f.residual[0],"doppler_sigma":f.residual[1],"clock":c,"body_position":nav.imu_to_world.translation,"use_pseudorange":o.use_pseudorange,"use_doppler":o.use_doppler})));
         }
     }
@@ -745,7 +1016,13 @@ impl GnssRuntime {
         drop_states: &[u64],
         convert: &[u64],
     ) -> Result<(), String> {
-        let problem = self.build(source)?;
+        let problem = if self.config.coupling == Coupling::KeyframePreintegration {
+            let retiring: Vec<_> = drop_states.iter().chain(convert).copied().collect();
+            self.build_keyframes(source, Some(&retiring))?
+        } else {
+            self.build(source)?
+        };
+        let consumed: BTreeSet<_> = problem.epochs.iter().map(|(id, _)| *id).collect();
         let x = problem.initial();
         let lin = problem
             .linearize(&x)
@@ -760,8 +1037,9 @@ impl GnssRuntime {
         let frontier = problem
             .clocks
             .iter()
-            .filter(|c| c.time <= boundary)
-            .last()
+            .rfind(|c| {
+                self.config.coupling == Coupling::KeyframePreintegration || c.time <= boundary
+            })
             .map(|c| c.id);
         let mut keep = Vec::new();
         let mut marginal = Vec::new();
@@ -814,7 +1092,15 @@ impl GnssRuntime {
         self.prior = Some(Prior { blocks, j, r });
         self.consumed_before = boundary;
         let offset = (self.bootstrap.as_ref().unwrap().time_offset_s * 1e9).round() as i64;
-        self.epochs.retain(|e| e.time + offset > boundary);
+        if self.config.coupling == Coupling::KeyframePreintegration {
+            self.epochs.retain(|e| !consumed.contains(&e.id));
+        } else {
+            self.epochs.retain(|e| e.time + offset > boundary);
+        }
+        self.epoch_keyframes
+            .retain(|id, _| self.epochs.iter().any(|e| e.id == *id));
+        self.motions
+            .retain(|id, _| self.epochs.iter().any(|e| e.id == *id));
         self.hidden
             .retain(|id, _| self.epochs.iter().any(|e| e.id == *id));
         self.clocks
@@ -886,6 +1172,24 @@ fn predict(
     b.velocity_world_m_s += g * dt + a.imu_to_world.rotation * d.delta_velocity;
     b
 }
+#[allow(clippy::too_many_arguments)]
+fn measurement_covariance(
+    m: &EpochMotion,
+    anchor: &BasaltNavState,
+    o: &PreparedObservation,
+    body: &Body,
+    alignment: &Alignment,
+    clock: &Clock,
+    lever: Vector3<f64>,
+    timing_std: f64,
+) -> Matrix2<f64> {
+    let raw = factor::raw_linearize(o, body, alignment, clock, lever);
+    let j = raw.jacobian.fixed_columns::<15>(0);
+    let (nav, _) = m.evaluate(anchor);
+    let time = j * m.time_derivative(&nav);
+    let q = j * m.covariance(anchor) * j.transpose() + time * time.transpose() * timing_std.powi(2);
+    (q + q.transpose()) * 0.5
+}
 fn body(n: &BasaltNavState) -> Body {
     Body {
         position: n.imu_to_world.translation,
@@ -900,6 +1204,8 @@ struct JointProblem {
     epochs: Vec<(u64, usize)>,
     clocks: Vec<ClockEpoch>,
     observations: Vec<(usize, u64, PreparedObservation)>,
+    motions: BTreeMap<u64, EpochMotion>,
+    covariances: BTreeMap<(u64, visloc_gnss::Satellite), Matrix2<f64>>,
     alignment_seed: Alignment,
     config: Config,
     lever: Vector3<f64>,
@@ -990,6 +1296,8 @@ impl JointProblem {
             epochs,
             clocks,
             observations,
+            motions: BTreeMap::new(),
+            covariances: BTreeMap::new(),
             alignment_seed: alignment,
             config,
             lever,
@@ -1035,6 +1343,21 @@ impl JointProblem {
     fn clock_offset(&self, i: usize) -> usize {
         self.base.state_dof() + 4 + i * 3
     }
+    fn epoch_nav(&self, x: &DVector<f64>, index: usize, id: u64) -> (BasaltNavState, Matrix15) {
+        let nav = decode_state(
+            x.rows(self.base.poses.len() * 6 + index * 15, 15)
+                .as_slice(),
+        );
+        self.motions
+            .get(&id)
+            .map_or_else(|| (nav.clone(), Matrix15::identity()), |m| m.evaluate(&nav))
+    }
+    fn covariance(&self, id: u64, satellite: visloc_gnss::Satellite) -> Matrix2<f64> {
+        self.covariances
+            .get(&(id, satellite))
+            .copied()
+            .unwrap_or_default()
+    }
     fn extra(&self, x: &DVector<f64>) -> Result<Vec<WhitenedFactorRowStack>, LmFailure> {
         let mut factors = Vec::new();
         let n = x.len();
@@ -1058,7 +1381,7 @@ impl JointProblem {
         }
         for (index, id, o) in &self.observations {
             let offset = self.base.poses.len() * 6 + index * 15;
-            let nav = decode_state(x.rows(offset, 15).as_slice());
+            let (nav, transition) = self.epoch_nav(x, *index, *id);
             let clock_index = self
                 .clocks
                 .iter()
@@ -1069,17 +1392,18 @@ impl JointProblem {
                 bias_m: [x[c], x[c + 1]],
                 drift_m_s: x[c + 2],
             };
-            let lin = factor::linearize(
+            let lin = factor::linearize_with_covariance(
                 o,
                 &body(&nav),
                 &self.alignment(x),
                 &clock,
                 self.lever,
                 &self.config,
+                self.covariance(*id, o.observation.satellite),
             );
             let mut j = DMatrix::zeros(2, n);
             j.view_mut((0, offset), (2, 15))
-                .copy_from(&lin.jacobian.columns(0, 15));
+                .copy_from(&(lin.jacobian.fixed_columns::<15>(0) * transition));
             j.view_mut((0, self.base.state_dof()), (2, 4))
                 .copy_from(&lin.jacobian.columns(15, 4));
             if self.config.mode == Mode::DopplerOnly {
@@ -1099,7 +1423,12 @@ impl JointProblem {
         }
         // A conservative bootstrap clock prior fixes Doppler-only clock
         // bias gauges. Its RAWX support predates the active factor window.
-        if self.prior.is_none() && !self.clocks.is_empty() {
+        if !self
+            .prior
+            .as_ref()
+            .is_some_and(|p| p.blocks.iter().any(|b| matches!(b.key, Key::Clock(_))))
+            && !self.clocks.is_empty()
+        {
             let mut j = DMatrix::zeros(3, n);
             let mut r = DVector::zeros(3);
             let c = &self.clocks[0];
@@ -1738,6 +2067,7 @@ mod tests {
         let (p, imu) = source(start);
         let mut cfg = Config::default();
         cfg.enabled = true;
+        cfg.coupling = Coupling::FrameWindow;
         let mut runtime =
             GnssRuntime::new(cfg, &UnitQuaternion::identity(), Vector3::zeros()).unwrap();
         runtime.record_imu(&imu);
@@ -1795,5 +2125,298 @@ mod tests {
             .blocks
             .iter()
             .all(|b| !matches!(b.key, Key::Epoch(_))));
+    }
+    #[test]
+    fn keyframe_epochs_keep_original_imu_and_are_consumed_only_with_their_owner() {
+        let epoch = Epoch {
+            week: 2400,
+            tow_s: 123.45,
+            leap_seconds: 18,
+            leap_seconds_valid: true,
+            clock_reset: false,
+            receipt_ns: 0,
+            observations: Vec::new(),
+        };
+        let start = epoch.nominal_utc_ns().unwrap() - 50_000_000;
+        let (mut p, imu) = source(start);
+        p.states[0].is_keyframe = true;
+        let mut runtime = GnssRuntime::new(
+            Config {
+                enabled: true,
+                ..Default::default()
+            },
+            &UnitQuaternion::identity(),
+            Vector3::zeros(),
+        )
+        .unwrap();
+        runtime.record_imu(&imu);
+        runtime.bootstrap = Some(Bootstrap {
+            alignment: Alignment {
+                origin_ecef_m: Vector3::new(6378137., 0., 0.),
+                yaw_rad: 0.,
+                translation_enu_m: Vector3::zeros(),
+            },
+            time_offset_s: 0.,
+            timing_std_s: 0.02,
+            clock: Clock::default(),
+        });
+        runtime.push_epoch(epoch.clone());
+        let joint = runtime.build(&p).unwrap();
+        assert_eq!(joint.base.states.len(), p.states.len());
+        assert_eq!(joint.base.imu_links, p.imu_links);
+        assert_eq!(joint.epochs, vec![(0, 0)]);
+        assert!(joint.blocks.iter().all(|b| !matches!(b.key, Key::Epoch(_))));
+        assert!(joint.motions.contains_key(&0));
+        runtime.marginalize(&p, &[], &[1], &[]).unwrap();
+        assert_eq!(runtime.epochs.len(), 1);
+        assert!(runtime
+            .prior
+            .as_ref()
+            .unwrap()
+            .blocks
+            .iter()
+            .all(|b| !matches!(b.key, Key::Clock(_))));
+        runtime.marginalize(&p, &[], &[], &[u64::MAX]).unwrap();
+        assert!(runtime.epochs.is_empty());
+        let prior = runtime.prior.as_ref().unwrap();
+        assert!(prior
+            .blocks
+            .iter()
+            .any(|b| b.key == Key::Pose(u64::MAX) && b.dof == 6));
+        assert!(prior.blocks.iter().any(|b| b.key == Key::Clock(0)));
+        runtime.push_epoch(epoch);
+        assert!(
+            runtime.epochs.is_empty(),
+            "consumed epochs must remain deduplicated"
+        );
+    }
+    #[test]
+    fn new_mode_waits_for_actual_keyframe_velocity_and_window_only_has_no_gnss_rows() {
+        let epoch = Epoch {
+            week: 2400,
+            tow_s: 123.45,
+            leap_seconds: 18,
+            leap_seconds_valid: true,
+            clock_reset: false,
+            receipt_ns: 0,
+            observations: Vec::new(),
+        };
+        let start = epoch.nominal_utc_ns().unwrap() - 50_000_000;
+        let (p, imu) = source(start);
+        let mut runtime = GnssRuntime::new(
+            Config {
+                enabled: true,
+                ..Default::default()
+            },
+            &UnitQuaternion::identity(),
+            Vector3::zeros(),
+        )
+        .unwrap();
+        runtime.record_imu(&imu);
+        runtime.bootstrap = Some(Bootstrap {
+            alignment: Alignment {
+                origin_ecef_m: Vector3::new(6378137., 0., 0.),
+                yaw_rad: 0.,
+                translation_enu_m: Vector3::zeros(),
+            },
+            time_offset_s: 0.,
+            timing_std_s: 0.02,
+            clock: Clock::default(),
+        });
+        runtime.push_epoch(epoch);
+        assert!(runtime.build(&p).unwrap().epochs.is_empty());
+        assert_eq!(runtime.epochs.len(), 1);
+        runtime.config.mode = Mode::WindowOnly;
+        let joint = runtime.build(&p).unwrap();
+        assert!(joint.epochs.is_empty());
+        assert!(joint.clocks.is_empty());
+        assert!(joint.observations.is_empty());
+        assert!(runtime.epochs.is_empty());
+    }
+    #[test]
+    fn startup_backlog_is_not_replayed_as_long_backward_keyframe_factors() {
+        let epoch = Epoch {
+            week: 2400,
+            tow_s: 123.45,
+            leap_seconds: 18,
+            leap_seconds_valid: true,
+            clock_reset: false,
+            receipt_ns: 0,
+            observations: Vec::new(),
+        };
+        let (p, imu) = source(epoch.nominal_utc_ns().unwrap() + 1_000_000_000);
+        let mut runtime = GnssRuntime::new(
+            Config {
+                enabled: true,
+                ..Default::default()
+            },
+            &UnitQuaternion::identity(),
+            Vector3::zeros(),
+        )
+        .unwrap();
+        runtime.record_imu(&imu);
+        runtime.bootstrap = Some(Bootstrap {
+            alignment: Alignment {
+                origin_ecef_m: Vector3::new(6378137., 0., 0.),
+                yaw_rad: 0.,
+                translation_enu_m: Vector3::zeros(),
+            },
+            time_offset_s: 0.,
+            timing_std_s: 0.,
+            clock: Default::default(),
+        });
+        runtime.push_epoch(epoch);
+        assert!(runtime.build(&p).unwrap().epochs.is_empty());
+        assert!(runtime.epochs.is_empty());
+        assert_eq!(runtime.diagnostics.stale_epochs, 1);
+        assert!(
+            matches!(runtime.records.back(),Some(Record::Decision(v)) if v["reason"]=="delayed_epoch_age_limit")
+        );
+    }
+    #[test]
+    fn actual_satellite_rows_enter_prior_once_when_keyframe_retires() {
+        let satellite = visloc_gnss::Satellite {
+            system: visloc_gnss::System::Gps,
+            prn: 1,
+        };
+        let epoch = Epoch {
+            week: 2400,
+            tow_s: 123.45,
+            leap_seconds: 18,
+            leap_seconds_valid: true,
+            clock_reset: false,
+            receipt_ns: 0,
+            observations: vec![visloc_gnss::Observation {
+                satellite,
+                signal: 0,
+                pseudorange_m: 20_183_000.,
+                doppler_hz: 0.,
+                pseudorange_std_m: 3.,
+                doppler_std_hz: 1.,
+                cn0_dbhz: 45,
+                lock_ms: 1000,
+            }],
+        };
+        let (mut p, imu) = source(epoch.nominal_utc_ns().unwrap() - 50_000_000);
+        p.states[0].is_keyframe = true;
+        let mut runtime = GnssRuntime::new(
+            Config {
+                enabled: true,
+                reject_sigma: 1e12,
+                ..Default::default()
+            },
+            &UnitQuaternion::identity(),
+            Vector3::zeros(),
+        )
+        .unwrap();
+        runtime.record_imu(&imu);
+        runtime.push_ephemeris(Ephemeris {
+            satellite,
+            week: 2400,
+            toe: 123.45,
+            toc: 123.45,
+            issue: 1,
+            healthy: true,
+            sqrt_a: 5153.795,
+            eccentricity: 0.,
+            m0: 0.,
+            delta_n: 0.,
+            omega0: visloc_gnss::OMEGA_E * 123.45,
+            inclination: 0.9,
+            argument: 0.,
+            omega_dot: 0.,
+            inclination_dot: 0.,
+            cuc: 0.,
+            cus: 0.,
+            crc: 0.,
+            crs: 0.,
+            cic: 0.,
+            cis: 0.,
+            af0: 0.,
+            af1: 0.,
+            af2: 0.,
+            group_delay_s: 0.,
+        });
+        runtime.bootstrap = Some(Bootstrap {
+            alignment: Alignment {
+                origin_ecef_m: Vector3::new(6378137., 0., 0.),
+                yaw_rad: 0.,
+                translation_enu_m: Vector3::zeros(),
+            },
+            time_offset_s: 0.,
+            timing_std_s: 0.02,
+            clock: Default::default(),
+        });
+        runtime.push_epoch(epoch);
+        let full = runtime.build(&p).unwrap();
+        assert_eq!(full.observations.len(), 1);
+        let f = full.extra(&full.initial()).unwrap();
+        assert!(f[0].state_jacobian.columns(0, 15).norm() > 0.);
+        let unrelated = runtime.build_keyframes(&p, Some(&[1])).unwrap();
+        assert!(unrelated.observations.is_empty());
+        runtime.marginalize(&p, &[], &[1], &[]).unwrap();
+        assert_eq!(runtime.build(&p).unwrap().observations.len(), 1);
+        runtime.marginalize(&p, &[], &[], &[u64::MAX]).unwrap();
+        let prior = runtime.prior.as_ref().unwrap();
+        let align = prior
+            .blocks
+            .iter()
+            .find(|b| b.key == Key::Alignment)
+            .unwrap();
+        assert!(prior.j.columns(align.offset, align.dof).norm() > 1e-10);
+        let consumed = runtime.build(&p).unwrap();
+        assert!(consumed.epochs.is_empty());
+        assert!(consumed.observations.is_empty());
+    }
+    #[test]
+    fn new_keyframe_epoch_waits_for_imu_bracket_and_survives_an_unrelated_prefix() {
+        let epoch = Epoch {
+            week: 2400,
+            tow_s: 123.45,
+            leap_seconds: 18,
+            leap_seconds_valid: true,
+            clock_reset: false,
+            receipt_ns: 0,
+            observations: Vec::new(),
+        };
+        let (mut p, imu) = source(epoch.nominal_utc_ns().unwrap() - 50_000_000);
+        p.states[1].is_keyframe = true;
+        let mut runtime = GnssRuntime::new(
+            Config {
+                enabled: true,
+                ..Default::default()
+            },
+            &UnitQuaternion::identity(),
+            Vector3::zeros(),
+        )
+        .unwrap();
+        runtime.record_imu(&imu[..imu.len() - 1]);
+        runtime.bootstrap = Some(Bootstrap {
+            alignment: Alignment {
+                origin_ecef_m: Vector3::new(6378137., 0., 0.),
+                yaw_rad: 0.,
+                translation_enu_m: Vector3::zeros(),
+            },
+            time_offset_s: 0.,
+            timing_std_s: 0.,
+            clock: Default::default(),
+        });
+        runtime.push_epoch(epoch);
+        assert!(runtime.build(&p).unwrap().epochs.is_empty());
+        assert_eq!(runtime.epochs.len(), 1);
+        assert_eq!(runtime.diagnostics.stale_epochs, 0);
+        runtime.record_imu(&imu[imu.len() - 1..]);
+        assert_eq!(runtime.build(&p).unwrap().epochs, vec![(0, 1)]);
+        let mut prefix = p.clone();
+        prefix.states.truncate(1);
+        prefix.imu_links.clear();
+        assert!(runtime
+            .build_keyframes(&prefix, Some(&[u64::MAX]))
+            .unwrap()
+            .epochs
+            .is_empty());
+        assert_eq!(runtime.epochs.len(), 1);
+        assert_eq!(runtime.diagnostics.stale_epochs, 0);
+        assert_eq!(runtime.epoch_keyframes.get(&0), Some(&1));
     }
 }

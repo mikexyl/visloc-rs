@@ -43,13 +43,42 @@ uses the same conservative Klobuchar model, **not Galileo NeQuick**. Satellite
 transmission states and atmospheric delays are frozen within each window
 problem; their small derivatives are not part of the state Jacobian.
 
-GNSS epochs own separate navigation/clock identities. Camera blocks retain their
-existing indices; hidden epoch states are appended. An observation inside an IMU
-interval replaces that interval with boundary-interpolated subintervals; the
-unsplit factor is removed. Split intervals integrate continuous position/rotation/velocity process-noise covariance, with the calibrated packet period converting the existing per-packet noise standard deviations. This avoids singular covariance for sub-packet intervals. The ordinary VIO covariance path remains unchanged. The joint prior retains camera pose/navigation
-blocks, ENU translation/yaw, and a clock frontier. Rank-aware orthogonal
-projection eliminates epoch states and old clocks without adding information
-in nullspaces. Retained rotation charts include their left-tangent derivatives.
+By default, `coupling: "keyframe_preintegration"` retains the newest actual
+keyframe as Nav15 (pose, velocity, and biases), alongside Basalt's ordinary
+short recent-camera window. Older keyframes become Pose6 when replaced by a
+new keyframe. Actual keyframe selection remains unchanged. GNSS does not add
+optimized navigation states or replace IMU links in this mode.
+
+Each epoch binds to a retained actual keyframe. Boundary-interpolated IMU
+preintegration evaluates its navigation at the true GNSS timestamp, forward
+or backward. The backward reconstruction follows SRI-GVINS Section III-C,
+Equations 22–29; left-tangent analytical Jacobians chain the GNSS rows to the
+keyframe. The measurement covariance includes propagated IMU uncertainty,
+a frozen-dynamics bias-diffusion approximation, and the bootstrapped timing
+uncertainty. Code/rate covariance is whitened jointly when both channels are
+active; an inactive channel cannot contaminate the active channel.
+
+The propagation reuses IMU data also supporting VIO. Treating its uncertainty
+as additional measurement noise omits cross-correlations with the VIO prior
+and across epochs/satellites. This is an approximation, not exact independent
+fusion or a reproduction of the SRI-GVINS filter. Satellite and atmosphere
+states, propagation covariance, and robust residual decisions are refreshed
+for each window construction and frozen during its LM solve.
+
+An epoch stays a live factor until its owning keyframe retires. Its GNSS rows
+then enter the square-root FEJ prior exactly once. Marginalizing ordinary
+non-keyframes does not assimilate that live GNSS factor. The joint prior
+retains camera pose/navigation blocks, ENU translation/yaw, and one clock
+frontier. Rank-aware projection eliminates old clocks and retired velocity/
+bias states without adding information in nullspaces. Rotation charts include
+their left-tangent derivatives.
+
+`coupling: "frame_window"` retains the previous experimental implementation
+for comparisons: hidden GNSS epoch Nav15 blocks replace affected IMU links
+with boundary-interpolated subintervals, and camera navigation retirement is
+delayed by `min_active_window_s` (0.5 s) up to `max_navigation_states` (32).
+These legacy settings do not expand the new keyframe window. The ordinary
+GNSS-disabled VIO covariance and solver paths remain unchanged.
 
 RAWX timing is corrected for estimated receiver clock bias, independently of
 USB receipt time. Raw code/Doppler bootstrap ECEF position, velocity, separate
@@ -59,15 +88,28 @@ gate before activation. The offset is frozen after initialization. A known-PPS
 configuration may explicitly supply `fixed_time_offset_s`; absent means estimate,
 not zero. PPK is never used for this step.
 
-The original three-state window was too short for this recording's USB latency.
-Once GNSS activates, its navigation window retains at least 0.5 seconds where
-capacity permits, bounded by 32 camera navigation states. These are tuning
-parameters (`min_active_window_s`, `max_navigation_states`). Tracking and
-keyframe selection are unchanged; navigation retirement is delayed. Disabled
-GNSS and pre-activation VIO keep the original path. Epochs older than the active
-window are rejected and logged. Queues, bootstrap history, IMU history, and
-broadcast ephemeris history are bounded. During outages VIO continues and the
-clock frontier's random-walk uncertainty grows with elapsed sensor time.
+The measured indexed arrival age after clock mapping is 68 ms median,
+85 ms p95, and 202 ms maximum at the next camera update on this recording.
+The previous 0.5 s full-state window was a conservative implementation choice;
+the -80 ms clock offset alone does not require 16–18 camera navigation states.
+
+`max_epoch_age_s` (0.5 s by default) rejects stale epochs when first binding
+them, without retaining extra camera states. This removes the startup backlog
+and bounds delayed live input. Epochs already owned by an active keyframe
+remain live until retirement. On activation, if the last actual keyframe has
+already become Pose6, GNSS waits for the next actual keyframe instead of
+inventing velocity/bias values. Missing keyframe-to-epoch IMU support, retired
+owners, and epochs older than the marginalized clock frontier are rejected
+and logged. If the chosen keyframe needs the next IMU packet, the epoch is
+deferred until that packet reaches the estimator; VIO inputs are not modified.
+A keyframe omitted from a pre-marginalization prefix remains a live owner. Epoch IDs remain deduplicated after retirement. Queues, bootstrap
+history, ten-second IMU history, and ephemeris history stay bounded. Outages
+continue VIO and clock random-walk uncertainty grows over elapsed sensor time.
+
+`mode: "window_only"` is an ablation: bootstrap determines the same activation
+time and keyframe-retention policy, but no GNSS measurement/clock rows are
+added. It isolates effects of retaining keyframe navigation and the joint
+marginalization path.
 
 Doppler-only is a diagnostic: raw code still bootstraps position/clocks/timing,
 but code factors are disabled. Geographic translation remains fixed because
@@ -103,7 +145,7 @@ and `/clock` remain estimation time. Communication deadlines use steady time.
 Prepare and run (source ROS2 first):
 
 ```sh
-python scripts/prepare_raw_gnss_experiment.py BASELINE_RUN RECORDING OUTPUT
+python scripts/prepare_raw_gnss_experiment.py BASELINE_RUN RECORDING OUTPUT --include-window-only
 python scripts/run_multi_robot_mission.py OUTPUT/baseline_no_loops/mission.json --domain-id 211
 python scripts/run_multi_robot_mission.py OUTPUT/doppler_only_no_loops/mission.json --domain-id 212
 python scripts/run_multi_robot_mission.py OUTPUT/pseudorange_doppler_no_loops/mission.json --domain-id 213
@@ -115,21 +157,21 @@ ROS_DOMAIN_ID=213 ROS_LOCALHOST_ONLY=1 python scripts/test_raw_gnss_ros_contract
 ```
 
 The preparation script hashes recording/calibration identities and creates all
-six 0.25x stereo-inertial missions. Results are excluded from Git. Evaluation
+six 0.25x stereo-inertial missions plus the optional window-only ablation.
+Use `--coupling frame_window` to explicitly reproduce the legacy configuration. Results are excluded from Git. Evaluation
 uses evo translation APE with one rigid alignment, scale fixed to 1, 20 ms
 association, and nominal antenna lever compensation on every estimate.
 South-ece's supplied PPK is a correlated reference derived from the same rover
 observations and covers only part of the route. No interpolation across missing
 reference intervals or full-route accuracy claim is made.
 
-The expanded navigation window is currently much slower than ordinary VIO.
+The legacy expanded navigation window is much slower than ordinary VIO.
 The GNSS solver reduces exact nonzero factor columns and reuses Basalt's bound,
 one-shot landmark trial token; ordinary VIO retains its existing solver path.
 The regression checks compare reduced systems and landmark recovery, and
 ordered replay comparisons check raw pose bits across these implementations.
 Replay backpressure preserves every sensor input when computation exceeds the
-requested playback interval. This version is not ready for the live camera
-frame rate. Enable `visloc-basalt/basalt-timing-breakdown` at build time and
+requested playback interval. Live-rate acceptance must be measured separately for each coupling mode. Enable `visloc-basalt/basalt-timing-breakdown` at build time and
 `VISLOC_BASALT_TIMING_BREAKDOWN=1` at runtime for the optional timing sidecar.
 
 The joint square-root prior is estimator-owned. The legacy VIO `MargData`
@@ -140,7 +182,7 @@ uses the native joint prior directly and records its diagnostics separately.
 Carrier-phase RTK, additional constellations, online extrinsic calibration,
 NeQuick, and changes to loop/PGO factors remain outside this experiment.
 
-## South-ece validation
+## Legacy frame-window South-ece validation
 
 The six complete 0.25x stereo replays each processed 7,182 frames with no sensor,
 graph, communication, or GNSS queue drops. Against the same 656 associated PPK
@@ -172,3 +214,47 @@ recording/model identities, launch-build hashes, effective configurations,
 diagnostics, and communication counts remain alongside it. Per-run manifests
 describe the binaries used for each replay; the final-source manifest is stored
 separately. The implementation remains opt-in and experimental.
+
+## Keyframe coupling validation
+
+The replacement couples GNSS through retained actual keyframe navigation,
+without hidden epoch Nav15 blocks. Three complete 0.25x stereo replays processed
+7,182 frames each: window-only, Doppler-only, and code plus Doppler. All used
+3–4 camera Nav15 blocks before marginalization, zero GNSS Nav15 blocks, and
+zero input/GNSS queue drops. All 6,219 joint solves per run returned finite,
+non-increasing objectives. The fused runs deferred 145 epochs until their
+keyframe IMU bracket arrived, rejected no epochs for missing brackets/retired
+owners/clock-frontier age, discarded 183 startup backlog epochs, and used 866
+GNSS epochs. Initialization and frozen timing stayed at 32.11 s and -80 ms.
+
+On the same 656 associated PPK poses, raw ATE was 0.778310 m for window-only,
+0.778236 m for Doppler-only, and 0.777796 m for code plus Doppler. The verified
+ordinary VIO baseline remains 0.767399 m; legacy code plus Doppler was
+0.855707 m. Thus the new implementation removes most of the legacy regression
+but does not demonstrate an accuracy benefit over ordinary VIO (+0.010398 m,
++1.35%). GNSS has little effect on the shape here: direct unaligned position
+changes from the window-only run were 5.6 mm RMS / 17.4 mm maximum for code plus
+Doppler. This comparison does not establish geographic absolute accuracy.
+
+A repeated same-build 1,250-frame diagnostic at 4x requested speed measured
+78.4 ms median active processing for keyframe coupling versus 497.9 ms for the
+legacy frame window, a 6.3x reduction. Full new runs measured about 52 ms median
+active processing at 0.25x. Replays ran concurrently, so timings include machine
+contention; even the faster path exceeds the 30 Hz camera budget. Calibration,
+raw sensor intervals, VIO input ordering, and loop/PGO formulation are unchanged.
+
+The final regression suite has 450 active passes (402 Basalt, 9 GNSS unit,
+2 broadcast, 10 ROS2, 18 multi-robot, 9 loop), with the same 59 existing Basalt
+fixture-dependent ignores. New coverage checks forward/backward manifold
+Jacobians, propagated covariance, correlated whitening and channel masking,
+actual satellite information entering the prior once, retained-keyframe
+selection, deferred IMU brackets, and incomplete marginalization prefixes.
+GNSS-disabled numerical parity passes, and every replay preserves baseline
+raw pose bits through frame 962, before GNSS activation at frame 963.
+
+Report and evo results: `results/gnss/south_ece_keyframes_20261001/report.md`.
+Recording identities, per-run source/binary hashes, the runtime benchmark,
+complete-run checks, configurations, and diagnostics are saved alongside it.
+The final fused runs use loops disabled; loop-enabled full replay has not been
+repeated for the new coupling. The default coupling is keyframe preintegration
+when GNSS is explicitly enabled; GNSS itself remains disabled by default.

@@ -13,8 +13,8 @@ from evo.core import metrics, sync
 from evo.core.trajectory import PoseTrajectory3D
 from evo.tools import file_interface
 
-RUN_NAMES = {mode + suffix for mode in ('baseline', 'doppler_only', 'pseudorange_doppler')
-             for suffix in ('_no_loops', '_loops')}
+RUN_NAMES = {mode + suffix for mode in ('baseline', 'window_only', 'doppler_only', 'pseudorange_doppler')
+             for suffix in ('_no_loops', '_loops')} | {'legacy_pseudorange_doppler'}
 
 
 def gnss_statistics(files, first_ns):
@@ -121,6 +121,14 @@ def analyze(output, reference):
         result['raw_trajectory_sha256'] = hashlib.sha256((files / 'trajectory.csv').read_bytes()).hexdigest()
         events = [json.loads(line) for line in (files / 'events.jsonl').read_text().splitlines()]
         result['process_ms'] = {k: float(np.percentile([v['process_ms'] for v in events if v.get('event') == 'vio'], quantile)) for k, quantile in [('median', 50), ('p95', 95), ('max', 100)]}
+        if result.get('gnss') and result['gnss']['initialization_latency_s'] is not None:
+            activation_ns = int(times[0]) + int(result['gnss']['initialization_latency_s'] * 1e9)
+            active_ms = [v['process_ms'] for v in events if v.get('event') == 'vio'
+                         and v['timestamp_ns'] >= activation_ns]
+            result['active_process_ms'] = {k: float(np.percentile(active_ms, q))
+                                          for k, q in [('median', 50), ('p95', 95), ('max', 100)]}
+        config = json.loads((files / 'config.json').read_text())
+        result['coupling'] = config.get('gnss', {}).get('coupling', 'frame_window') if config.get('gnss', {}).get('enabled') else 'disabled'
         result['loops'] = sum(1 for line in (files / 'loops.jsonl').read_text().splitlines() if line)
         result['communication'] = json.loads((files / 'communication.json').read_text())
         # Earlier experiment binaries charged GNSS publications to the service

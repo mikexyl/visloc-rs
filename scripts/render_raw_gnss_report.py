@@ -14,9 +14,103 @@ LABELS = ('VIO baseline', 'Doppler only', 'Pseudorange + Doppler')
 COLORS = ('#3569b0', '#dc7d27', '#298969')
 
 
+def render_keyframe_comparison(root):
+    data = json.loads((root / 'evaluation.json').read_text())
+    runs = data['runs']
+    entries = [('baseline_no_loops', 'VIO baseline', '#3569b0'),
+               ('legacy_pseudorange_doppler', 'Legacy code + Doppler', '#a05a60'),
+               ('window_only_no_loops', 'Keyframe window only', '#8060a8'),
+               ('doppler_only_no_loops', 'Keyframe Doppler', '#dc7d27'),
+               ('pseudorange_doppler_no_loops', 'Keyframe code + Doppler', '#298969')]
+    entries = [e for e in entries if e[0] in runs]
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), constrained_layout=True)
+    for i, (name, label, color) in enumerate(entries):
+        r = runs[name]
+        axes[0].bar(i, r['metrics']['raw']['rmse'], color=color)
+        ape = file_interface.load_res_file(root / name / 'evaluation/raw_ape.zip', load_trajectories=True)
+        ref = ape.trajectories['reference']
+        elapsed = ref.timestamps - ref.timestamps[0] + r['metrics']['raw']['first_elapsed_s']
+        errors = ape.np_arrays['error_array'].copy()
+        errors[np.r_[False, np.diff(ref.timestamps) > .5]] = np.nan
+        axes[1].plot(elapsed, errors, label=label, color=color, linewidth=1.1)
+    axes[0].set(xticks=range(len(entries)), xticklabels=[e[1].replace(' ', '\n', 1) for e in entries],
+                ylabel='ATE RMSE (m)', title='Rigid alignment, scale fixed to 1')
+    axes[0].tick_params(axis='x', labelsize=8)
+    axes[1].set(xlabel='Sensor elapsed time (s)', ylabel='Translation error (m)',
+                title='Available correlated PPK coverage')
+    axes[1].legend(fontsize=8)
+    for ax in axes: ax.grid(axis='y', alpha=.2)
+    fig.savefig(root / 'accuracy.png', dpi=180); plt.close(fig)
+    fig, ax = plt.subplots(figsize=(7, 6), constrained_layout=True)
+    for i, (name, label, color) in enumerate(entries):
+        ape = file_interface.load_res_file(root / name / 'evaluation/raw_ape.zip', load_trajectories=True)
+        ref, est = ape.trajectories['reference'], ape.trajectories['estimate']
+        pts = est.positions_xyz.copy(); pts[np.r_[False, np.diff(ref.timestamps) > .5]] = np.nan
+        ax.plot(pts[:, 0], pts[:, 1], color=color, linewidth=1.2, label=label)
+        if i == 0: ax.scatter(ref.positions_xyz[:, 0], ref.positions_xyz[:, 1], s=3, color='#333333', alpha=.4, label='Correlated PPK')
+    ax.set(xlabel='East (m)', ylabel='North (m)', title='Evaluated antenna trajectories')
+    ax.set_aspect('equal', adjustable='datalim'); ax.grid(alpha=.2); ax.legend(fontsize=8)
+    fig.savefig(root / 'trajectories.png', dpi=180); plt.close(fig)
+    baseline = runs['baseline_no_loops']['metrics']['raw']['rmse']
+    lines = ['# South-ece keyframe GNSS comparison', '',
+        'Stereo-inertial f64 Basalt; stationary gyro-only startup; measured calibration; '
+        'fixed nominal antenna lever. New missions replay at 0.25× with loops disabled. '
+        'Baseline and legacy full-run accuracy are reused from the previous verified recording. '
+        'The legacy imported run enabled loop processing but accepted zero loops; its raw trajectory '
+        'was bit-identical to its loop-disabled counterpart.', '',
+        'evo translation APE uses one rigid alignment, no scale fitting, 20 ms association, '
+        'and antenna lever compensation for all modes. PPK shares the rover measurements and '
+        'is a correlated, partial reference. It does not enter estimation or timing initialization.', '',
+        '| Mode | Raw ATE (m) | Change from VIO | 1 s displacement RMSE (m) | Matched poses |',
+        '|---|---:|---:|---:|---:|']
+    for name, label, _ in entries:
+        r = runs[name]['metrics']['raw']
+        lines.append(f"| {label} | {r['rmse']:.6f} | {r['rmse']-baseline:+.6f} | {r['displacement_error_1s']['rmse_m']:.6f} | {r['matched_poses']} |")
+    fused = runs.get('pseudorange_doppler_no_loops')
+    if fused:
+        diff = fused['metrics']['raw']['rmse'] - baseline
+        verdict = 'improved' if diff < 0 else 'did not improve'
+        lines += ['', f"Keyframe code plus Doppler {verdict} ATE against ordinary VIO on this reference: "
+            f"{diff:+.6f} m ({diff/baseline*100:+.2f}%). GNSS remains opt-in and experimental."]
+    lines += ['', '![ATE comparison](accuracy.png)', '', '![Evaluated trajectories](trajectories.png)', '',
+        '## Runtime and diagnostics', '',
+        '| Mode | All-frame median / p95 (ms) | Active median / p95 (ms) | Frames | Used GNSS epochs | Input / GNSS drops |',
+        '|---|---:|---:|---:|---:|---:|']
+    for name, label, _ in entries:
+        r = runs[name]; active = r.get('active_process_ms'); g = r.get('gnss') or {}
+        active_text = f"{active['median']:.1f} / {active['p95']:.1f}" if active else 'inactive'
+        lines.append(f"| {label} | {r['process_ms']['median']:.1f} / {r['process_ms']['p95']:.1f} | {active_text} | {r['frames']} | {g.get('used_epochs',0)} | {r['communication']['sensor_ingress_drops']} / {g.get('diagnostics',{}).get('dropped_epochs',0)} |")
+    bench = root / 'runtime_benchmark.json'
+    if bench.exists():
+        b = json.loads(bench.read_text()); old = b['debug_frame_window']; new = b['debug_keyframes']
+        lines += ['', f"Same-build, same-input 1,250-frame diagnostic (4× requested speed), active frames "
+            f"after 32.2 s: legacy median {old['process_ms']['median']:.1f} ms; keyframe median "
+            f"{new['process_ms']['median']:.1f} ms ({old['process_ms']['median']/new['process_ms']['median']:.1f}× reduction). "
+            'The two diagnostics ran concurrently, so these measurements include shared-machine contention.',
+            '', f"Keyframe solve camera Nav15 count: {new['camera_nav_states']}; additional GNSS Nav15 count: "
+            f"{new['gnss_nav_states']}. Legacy counts: {old['camera_nav_states']} and {old['gnss_nav_states']}. "
+            'Counts are recorded before current-frame marginalization; the new mode keeps at most one older full keyframe in addition to the short recent-camera window.']
+    lines += ['', 'Even the faster path exceeds the 33.3 ms budget of the recorded 30 Hz camera. '
+        '0.25× replay uses backpressure; this is not a real-time acceptance claim. Full-run legacy timings '
+        'come from the previous experiment and should not be treated as a controlled benchmark.', '',
+        'The window-only ablation shares activation, keyframe retention, and joint marginalization with '
+        'the fused modes but contributes no GNSS or clock rows. Propagated-IMU uncertainty and '
+        'timing uncertainty are included in GNSS weighting; correlations from reused IMU data across '
+        'VIO and GNSS are approximated rather than fully retained.', '',
+        f"Reference: {data['reference_rows']} accepted PPK rows over {data['reference_span_s']:.1f} s; "
+        'the complete recording spans 239.7 s. Missing intervals are excluded. Accuracy outside this '
+        'coverage is unknown. Per-run configurations, source/binary hashes, timing and satellite '
+        'decisions, clock/frontier diagnostics, and evo ZIPs are saved alongside this report.', '',
+        'The new full comparisons use loops disabled. Existing ROS2, multi-robot, and loop tests pass; '
+        'loop-enabled full replays of the new coupling have not been repeated.']
+    (root / 'report.md').write_text('\n'.join(lines)+'\n')
+    print(root / 'report.md')
+
 def render(root):
     data = json.loads((root / 'evaluation.json').read_text())
     runs = data['runs']
+    if 'window_only_no_loops' in runs or 'legacy_pseudorange_doppler' in runs:
+        return render_keyframe_comparison(root)
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.1), constrained_layout=True)
     for i, (mode, label, color) in enumerate(zip(MODES, LABELS, COLORS)):
         for suffix, marker in (('_no_loops', 'o'), ('_loops', 's')):
