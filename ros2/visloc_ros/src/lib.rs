@@ -7,3 +7,4 @@ pub type AnyResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 pub mod traffic;
 
 pub mod archive;
+pub mod visualization;

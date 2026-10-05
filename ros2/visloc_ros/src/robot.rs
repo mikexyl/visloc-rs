@@ -43,6 +43,9 @@ pub struct RobotConfig {
     pub fixed_last_frame: bool,
     #[serde(default = "enabled")]
     pub loop_enabled: bool,
+    /// Best-effort keyframe display journal; never changes estimator inputs.
+    #[serde(default = "enabled")]
+    pub visualization_enabled: bool,
     #[serde(default = "default_capacity")]
     pub max_keyframes: usize,
 }
@@ -74,6 +77,7 @@ mod config_tests {
         let startup = config.imu_startup.as_ref().unwrap();
         assert!(!startup.average_gravity);
         assert!(!startup.wait_for_motion);
+        assert!(config.visualization_enabled);
         assert_eq!(startup.window_ns, 1_000_000_000);
         let saved = serde_json::to_value(config).unwrap();
         assert!(saved.get("scalar_mode").is_none());

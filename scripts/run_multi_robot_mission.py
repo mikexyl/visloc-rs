@@ -15,6 +15,8 @@ def main():
     p.add_argument('mission', type=Path)
     p.add_argument('--domain-id', type=int, default=217)
     p.add_argument('--profile-replay', action='store_true', help='Save Python replay timing to replay_profile.pstats')
+    p.add_argument('--rerun-connect', help='Stream the online map to an existing Rerun gRPC endpoint')
+    p.add_argument('--no-online-viewer', action='store_true', help='Disable the independent online display process')
     args = p.parse_args()
     mission = json.loads(args.mission.read_text())
     root = args.mission.resolve().parent
@@ -22,8 +24,15 @@ def main():
     env.setdefault('ROS_LOG_DIR', str(root / 'ros_logs'))
     binaries = Path(os.environ.get('VISLOC_ROS_INSTALL', REPO / '.runtime/ros2_install')) / 'visloc_ros/lib/visloc_ros'
     logs, processes = [], []
-    replay = None
+    replay = viewer = None
     try:
+        if not args.no_online_viewer:
+            log = (root / 'online_viewer.log').open('w'); logs.append(log)
+            command = [sys.executable, str(REPO / 'scripts/visualize_multi_robot_live.py'),
+                       str(args.mission.resolve()), '--exit-when-finished']
+            if args.rerun_connect:
+                command += ['--connect', args.rerun_connect]
+            viewer = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT)
         for binary, key, config, name in [('backend', 'VISLOC_BACKEND_CONFIG', mission['backend_config'], 'backend')] + [
                 ('robot', 'VISLOC_ROBOT_CONFIG', r['config'], r['robot']) for r in mission['robots']]:
             log = (root / f'{name}.log').open('w'); logs.append(log)
@@ -34,6 +43,9 @@ def main():
         replay_command += [str(REPO / 'scripts/replay_multi_robot_graco.py'), str(args.mission.resolve())]
         replay = subprocess.Popen(replay_command, env=env)
         while replay.poll() is None:
+            if viewer and viewer.poll() is not None:
+                print(f'Online viewer exited ({viewer.returncode}); see {root}/online_viewer.log', flush=True)
+                viewer = None  # Display failures must not interrupt sensor processing.
             failed = [p.returncode for p in processes if p.poll() is not None]
             if failed:
                 replay.terminate(); replay.wait()
@@ -47,7 +59,18 @@ def main():
                 raise TimeoutError('Final centralized PGO did not finish')
             time.sleep(.2)
         print(f'Completed multi-robot replay: {root}', flush=True)
+        if viewer:
+            try:
+                viewer.wait(timeout=60)
+                if viewer.returncode:
+                    print(f'Online viewer exited ({viewer.returncode}); see {root}/online_viewer.log', flush=True)
+            except subprocess.TimeoutExpired:
+                print('Online map still draining; stopping with its latest live snapshot', flush=True)
     finally:
+        if viewer and viewer.poll() is None:
+            viewer.terminate()
+            try: viewer.wait(timeout=10)
+            except subprocess.TimeoutExpired: viewer.kill(); viewer.wait()
         if replay and replay.poll() is None:
             replay.terminate()
             try: replay.wait(timeout=10)

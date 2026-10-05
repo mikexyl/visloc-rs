@@ -4,6 +4,11 @@ All notable changes to `visloc-rs` will be documented here.
 
 ## Unreleased
 
+- Add an online ROS2 Rerun recorder with bounded landmark refinement, persistent
+  landmark identities, and calibrated stereo camera entities with synchronized
+  images and camera-follow views. Display processing follows pose-graph updates
+  independently of VIO and records queue drops and refinement diagnostics.
+
 ## 0.2.0 - 2026-09-15
 
 ### Highlights
