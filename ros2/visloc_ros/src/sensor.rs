@@ -336,6 +336,37 @@ pub fn run(
     let mut processed_frames = 0;
     status.lock().unwrap().initializing = startup.is_some();
     let (width, height) = calibration.resolutions[0];
+    let cam = &calibration.cameras[0];
+    let display_camera = visloc_multi_robot::CameraModel {
+        width,
+        height,
+        intrinsics: [cam.fx, cam.fy, cam.cx, cam.cy],
+        camera_to_body: Transform::from(calibration.camera_to_imu(0).unwrap()),
+    };
+    let display = config
+        .visualization_enabled
+        .then(|| crate::visualization::Writer::new(&config.output))
+        .transpose()?;
+    let camera_display = if config.visualization_enabled {
+        let cameras = (0..if stereo { 2 } else { 1 })
+            .map(|i| {
+                let cam = &calibration.cameras[i];
+                let (width, height) = calibration.resolutions[i];
+                visloc_multi_robot::CameraModel {
+                    width,
+                    height,
+                    intrinsics: [cam.fx, cam.fy, cam.cx, cam.cy],
+                    camera_to_body: Transform::from(calibration.camera_to_imu(i as _).unwrap()),
+                }
+            })
+            .collect();
+        Some(crate::visualization::CameraWriter::new(
+            &config.output,
+            cameras,
+        )?)
+    } else {
+        None
+    };
     let preprocessor =
         Preprocessor::new(width as usize, height as usize, config.preprocess.as_ref())?;
     let right_preprocessor = if stereo {
@@ -493,6 +524,13 @@ pub fn run(
                 let frame_id = frame.frame_id;
                 let t = frame.timestamp_ns;
                 let gray: Vec<u8> = frame.cam0.pixels().iter().map(|v| (v >> 8) as u8).collect();
+                let camera_images = camera_display.as_ref().map(|_| {
+                    let mut images = vec![gray.clone()];
+                    if let Some(right) = &frame.cam1 {
+                        images.push(right.pixels().iter().map(|v| (v >> 8) as u8).collect());
+                    }
+                    images
+                });
                 let start = std::time::Instant::now();
                 let result = adapter.process_without_marg_data_no_trace(frame)?;
                 let left_tracks = result
@@ -516,6 +554,9 @@ pub fn run(
                 let pose = result.estimator.state.imu_to_world.clone();
                 let transform = Transform::from(&pose);
                 transform.se3()?;
+                if let (Some(display), Some(images)) = (&camera_display, camera_images) {
+                    display.submit(&owner, frame_id, t, &transform, images);
+                }
                 let [x, y, z] = transform.translation;
                 let [qx, qy, qz, qw] = transform.rotation_xyzw;
                 writeln!(csv, "{frame_id},{t},{x},{y},{z},{qw},{qx},{qy},{qz}")?;
@@ -611,6 +652,9 @@ pub fn run(
                             })
                             .collect(),
                     };
+                    if let Some(display) = &display {
+                        display.submit(&frame, &record, &display_camera)?;
+                    }
                     match loop_tx.try_send(LoopCommand::Frame(frame, record)) {
                         Ok(()) => (),
                         Err(TrySendError::Full(_)) => status.lock().unwrap().dropped_keyframes += 1,
@@ -657,6 +701,12 @@ pub fn run(
                 )?;
             }
             loop_tx.send(LoopCommand::Finish)?;
+            if let Some(display) = display {
+                display.finish()?;
+            }
+            if let Some(display) = camera_display {
+                display.finish()?;
+            }
             events.send(Event::VioFinished)?;
             return Ok(());
         }

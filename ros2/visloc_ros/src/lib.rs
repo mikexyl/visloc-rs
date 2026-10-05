@@ -9,3 +9,4 @@ pub mod traffic;
 pub mod archive;
 
 pub mod gnss_wire;
+pub mod visualization;

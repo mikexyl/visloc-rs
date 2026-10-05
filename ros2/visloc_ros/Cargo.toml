@@ -26,7 +26,7 @@ nalgebra = "0.33"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 uuid = { version = "1", features = ["v4"] }
-opencv = { version = "=0.96.0", default-features = false, features = ["imgproc", "calib3d", "clang-runtime"] }
+opencv = { version = "=0.96.0", default-features = false, features = ["imgproc", "imgcodecs", "calib3d", "clang-runtime"] }
 
 visloc-gnss = { path = "../../crates/gnss" }
 

@@ -80,6 +80,12 @@ export OPENBLAS_NUM_THREADS=1
   results/graco/my_multi_robot_run/mission.json
 ```
 
+The mission launcher also starts an independent **online** Rerun map process.
+It writes `online.rrd` as VIO runs; add `--rerun-connect rerun+http://HOST:9876/proxy`
+to stream to an existing viewer. It never starts a Rerun server. Use
+`--no-online-viewer` to omit this process. The `visualize_multi_robot.py` command
+above remains a separate, optional final-result playback.
+
 Replay mission directories must be new. A robot restarted with its existing config creates a new session subdirectory, restores its durable keyframe/loop records and sparse-feature archives, and continues serving earlier sessions. `active_session.json` identifies the current output directory. The keyframe capacity includes archived sessions. Use `--robots 5 7 --max-frames 400` for the two-robot smoke test. Defaults are **left camera only**, f64 Basalt with stationary gyro-only initialization, the existing aerial calibration, 800-pixel width, and 0.75 noise/bias multipliers. Right images and ground truth never enter the estimator. The source bags remain unchanged.
 
 Each first camera timestamp maps to a shared playback epoch; integer camera/IMU intervals remain exact. `mission.json` records every original-to-replay timestamp offset. One `/clock` accompanies playback. The first frame can initialize from the first IMU sample at/after its timestamp; an empty first integration interval is allowed, while later empty intervals are errors. The nominal rate is 0.25x with bounded backpressure, so overload slows replay. Robots receive concurrent batches, with at most one unacknowledged camera frame per robot. The final solve waits for VIO, loop workers, and graph history to drain.
@@ -191,6 +197,81 @@ Queues are bounded: sensor ingress 8192, pending camera images 32, loop worker 4
 Outputs include raw/corrected trajectories, calibration snapshots and model hashes, effective configs, frozen sequence feature archives, retrieval decisions, selected pairs, geometric outcomes, VIO/encoding/verification timing, queue drops, service failure counts, graph revisions, and component memberships. Exchange-through-verification latency includes descriptor/feature service calls and GPU queueing for a successful attempt, measured with steady time; it excludes earlier failed attempts and retrieval backlog. Replay counts actual serialized topic payload bytes. Each requesting node separately records service calls and typed field payload bytes, explicitly excluding CDR framing/padding and DDS overhead. These are application payload measurements, not total network traffic. `communication.json` also counts sensor-ingress, communication, and backend graph queue overflows; image-buffer and loop-keyframe drops are in robot status.
 
 `evaluate_multi_robot.py` reports metric SE(3) ATE: per-robot raw and corrected results, plus **one rigid alignment for each connected component**, with no scale fitting for reported accuracy. Existing evaluator Sim(3) fields are diagnostic only. Dense corrected poses interpolate graph corrections. Rerun records robot-colored raw/corrected trajectories, selected frame pairs, sparse landmarks, loop edges, and disconnected-component status. Only robots sharing a component appear in a shared map; isolated trajectories retain separate views.
+
+The online sparse map renders one point per `(component, robot, session,
+landmark ID)`. Every actual VIO keyframe supplies its measured pixels, metric
+camera-frame landmarks, calibration, and raw body pose through a dedicated
+display writer, including when loop closure is disabled. This writer has a
+four-packet queue with nonblocking submission; a slow disk drops display packets
+and reports them in `visualization_status.json`. The viewer follows its flushed
+`visualization.jsonl` and the backend's atomically published graph snapshots.
+This is local display transport; robot/backend communication remains ROS2.
+
+Every processed camera frame also supplies a matched body pose and the same
+undistorted grayscale images consumed by VIO. A separate four-packet camera
+worker encodes JPEGs (quality 90) and then flushes `camera_frames.jsonl`; encoding
+and disk I/O never run on the estimator thread. `camera_status.json` reports
+written/dropped image pairs. The camera stream is independent of keyframe
+selection and loop inference. Monocular mode records only the left camera;
+stereo records both with their own intrinsics and camera-to-body transforms.
+
+Rerun logs `component -> body -> cam0/cam1 -> image`, with explicit optical
+RDF coordinates (+X right, +Y down, +Z forward), calibrated pinholes, and images
+on the same exact `sensor` timestamp as their body pose. The `sensor` playback
+timeline preserves every exposure; `live` additionally records arrival and map
+processing time. Camera poses use the latest available map/odometry correction
+at or before their timestamp, scoped to the robot/session. A late graph revision
+also moves the held camera after input drains. Component changes clear the old
+camera entity. The default blueprint includes a map overview, a **Follow camera**
+3D view tracking the left pinhole, and separate left/right image views.
+
+The display process refines changed landmarks against observations received so
+far with the **current** camera poses held fixed. It does not wait for the final
+graph. Defaults require two distinct keyframes, 1 degree of viewing-ray parallax,
+and at most 3 px reprojection error in 60% of retained views. Each observation
+uses its own intrinsics and camera-to-body transform. Duplicates add no support;
+IDs never merge across robots or sessions. Tracks without a metric VIO estimate
+are omitted. Bounds are 30,000 tracks, eight views per track (oldest plus latest),
+and 20,000 trajectory records. Least recently observed tracks are evicted at
+capacity and counted. The refinement queue coalesces updates by landmark ID;
+each tick processes at most 64 tracks or 100 ms, whichever comes first (a running
+single-point solve completes). Rerun clouds publish at most once per second.
+
+Retained points are anchored to an observing body pose: graph corrections move
+them immediately, then queue geometric refinement. Point inspection marks
+`refinement_pending` until that work finishes. A component merge clears retired
+entities rather than leaving duplicate surfaces. `online.map.jsonl` records live
+point counts, pending work, memory bounds, rejection reasons, and evictions.
+Older binaries without the display journal are supported by following selected
+sequence feature archives as they arrive, at the lower sequence-completion rate.
+
+Attach a viewer to an already running mission with:
+
+```bash
+python scripts/visualize_multi_robot_live.py /path/to/mission.json \
+  --output /path/to/new/online.rrd --connect rerun+http://HOST:9876/proxy
+```
+
+Use `--min-observations`, `--min-parallax-deg`, `--reprojection-px`,
+`--max-tracks`, and `--max-views` to configure the live display. Set the robot
+config's `visualization_enabled` to false to disable its display writer for
+parity measurements. Neither the writer nor viewer changes Basalt inputs/state.
+
+This is a visualization refinement; the backend still optimizes poses, and the
+refined display points are not fed to VIO or loop verification. Single-view and
+weak-parallax landmarks are hidden by default to prioritize stable geometry.
+The optional offline viewer uses the final graph and exports `.landmarks.csv`
+and `.landmarks.json` beside its RRD for inspection:
+
+```bash
+python scripts/visualize_multi_robot.py /path/to/mission.json \
+  --output /path/to/new/playback_refined.rrd
+```
+
+Use `--landmark-min-observations`, `--landmark-min-parallax-deg`, and
+`--landmark-max-reprojection-px` to adjust display quality. The optional
+`--show-archived-landmarks` adds the old unmerged estimates in a separate faint
+diagnostic layer. Saving an RRD does not start a Rerun server.
 
 ```bash
 cargo test -p visloc-multi-robot
