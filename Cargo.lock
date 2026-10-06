@@ -889,6 +889,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "visloc-gtsam"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "nalgebra",
+ "serde",
+ "thiserror",
+ "visloc-core",
+]
+
+[[package]]
 name = "visloc-io"
 version = "0.2.0"
 dependencies = [
@@ -930,8 +941,8 @@ dependencies = [
  "sha2",
  "thiserror",
  "visloc-core",
+ "visloc-gtsam",
  "visloc-online-loop",
- "visloc-slam",
  "visloc-vision",
 ]
 
@@ -943,7 +954,7 @@ dependencies = [
  "serde",
  "serde_json",
  "visloc-core",
- "visloc-slam",
+ "visloc-gtsam",
  "visloc-tensorrt",
  "visloc-vision",
 ]

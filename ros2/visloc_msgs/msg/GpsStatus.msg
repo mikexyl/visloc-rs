@@ -1,0 +1,4 @@
+uint64 revision
+uint64 total_records
+uint64 active_factors
+uint64 aligned_components

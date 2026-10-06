@@ -1,0 +1,16 @@
+[package]
+name = "visloc-gtsam"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+license = "MIT OR Apache-2.0"
+description = "Safe Rust snapshot interface to the native GTSAM C++ pose-graph solver"
+
+[dependencies]
+nalgebra.workspace = true
+serde = { version = "1", features = ["derive"] }
+thiserror.workspace = true
+visloc-core = { path = "../core" }
+
+[build-dependencies]
+cc = "1"

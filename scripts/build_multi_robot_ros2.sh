@@ -4,6 +4,9 @@ VISLOC_REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 VISLOC_ROS_INSTALL=${VISLOC_ROS_INSTALL:-"$VISLOC_REPO/.runtime/ros2_install"}
 VISLOC_ROS_BUILD=${VISLOC_ROS_BUILD:-"$VISLOC_REPO/.runtime/ros2_build"}
 cd "$VISLOC_REPO"
+if [[ ! -f "${VISLOC_GTSAM_ROOT:-$VISLOC_REPO/.runtime/gtsam-native/install}/lib/libgtsam.a" ]]; then
+  bash scripts/build_gtsam_native.sh
+fi
 source /opt/ros/humble/setup.bash
 source .runtime/ros2-venv/bin/activate
 python -m colcon --log-base .runtime/ros2_log build \

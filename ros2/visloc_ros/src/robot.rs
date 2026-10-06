@@ -48,6 +48,8 @@ pub struct RobotConfig {
     pub visualization_enabled: bool,
     #[serde(default = "default_capacity")]
     pub max_keyframes: usize,
+    #[serde(default)]
+    pub gps: crate::gps::InputConfig,
 }
 fn default_imu_startup() -> Option<visloc_basalt::startup::StationaryStartupConfig> {
     Some(Default::default())
@@ -82,6 +84,26 @@ mod config_tests {
         let saved = serde_json::to_value(config).unwrap();
         assert!(saved.get("scalar_mode").is_none());
         assert!(saved["imu_startup"].is_object());
+    }
+
+    #[test]
+    fn gps_input_requires_explicit_opt_in() {
+        let config: RobotConfig = serde_json::from_value(required_config()).unwrap();
+        assert!(!config.gps.enabled);
+        for gps in [
+            serde_json::json!({}),
+            serde_json::json!({"fix_topic": "/gps/fix"}),
+            serde_json::json!({"enabled": false}),
+        ] {
+            let mut value = required_config();
+            value["gps"] = gps;
+            let config: RobotConfig = serde_json::from_value(value).unwrap();
+            assert!(!config.gps.enabled);
+        }
+        let mut value = required_config();
+        value["gps"] = serde_json::json!({"enabled": true});
+        let config: RobotConfig = serde_json::from_value(value).unwrap();
+        assert!(config.gps.enabled);
     }
 
     #[test]
@@ -634,6 +656,14 @@ pub fn run(mut config: RobotConfig) -> AnyResult<()> {
             if let Err(e)=result {let _=events.send(Event::Error(e.to_string()));}
         })?;
     }
+    let gps_adapter = crate::gps::start(
+        &node,
+        &config.gps,
+        &owner,
+        &config.output,
+        &root,
+        config.reliable_sensors,
+    )?;
     let image_topic = format!("/{}/camera/image", config.robot);
     let imu_topic = format!("/{}/imu", config.robot);
     let image_options = if config.reliable_sensors {
@@ -838,6 +868,7 @@ pub fn run(mut config: RobotConfig) -> AnyResult<()> {
         })();if let Err(e)=result {eprintln!("ROS output error: {e}");}
     })?;
     let _keep = (
+        gps_adapter,
         image_sub,
         right_sub,
         imu_sub,

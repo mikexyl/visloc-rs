@@ -1,0 +1,9 @@
+uint64 cursor
+---
+string session
+GpsFix[] fixes
+uint64 cursor
+bool more
+bool finished
+uint64 dropped_inputs
+uint64 rejected_inputs

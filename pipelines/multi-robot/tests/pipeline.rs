@@ -178,6 +178,9 @@ fn configurable_similarity_retrieves_and_accepts_new_candidates() {
 
 #[test]
 fn invalid_similarity_configuration_is_rejected() {
+    // Removed optimizer switches must not silently resurrect a fallback path.
+    assert!(serde_json::from_str::<BackendConfig>(r#"{"optimizer":"visloc"}"#).is_err());
+    assert!(serde_json::from_str::<BackendConfig>(r#"{"gtsam":{"python":"python3"}}"#).is_err());
     assert_eq!(
         serde_json::from_str::<BackendConfig>("{}")
             .unwrap()

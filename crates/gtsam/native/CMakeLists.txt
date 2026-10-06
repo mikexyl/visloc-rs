@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.16)
+project(visloc_gtsam_tests LANGUAGES CXX)
+find_package(GTSAM 4.3.0 EXACT CONFIG REQUIRED)
+enable_testing()
+add_executable(visloc_gtsam_tests tests.cpp bridge.cpp)
+target_compile_features(visloc_gtsam_tests PRIVATE cxx_std_17)
+target_link_libraries(visloc_gtsam_tests PRIVATE gtsam)
+add_test(NAME native_gtsam_factors COMMAND visloc_gtsam_tests)

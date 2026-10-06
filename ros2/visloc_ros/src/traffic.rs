@@ -89,3 +89,18 @@ pub fn received(v: &impl Payload) {
 pub fn snapshot() -> serde_json::Value {
     serde_json::json!({"service_attempts":CALLS.load(Ordering::Relaxed),"service_responses":RESPONSES.load(Ordering::Relaxed),"service_request_field_bytes":SENT.load(Ordering::Relaxed),"service_response_field_bytes":RECEIVED.load(Ordering::Relaxed),"sensor_ingress_drops":QUEUE_DROPS[0].load(Ordering::Relaxed),"communication_queue_drops":QUEUE_DROPS[1].load(Ordering::Relaxed),"graph_queue_drops":QUEUE_DROPS[2].load(Ordering::Relaxed),"note":"Typed field payload bytes; excludes CDR lengths, padding, encapsulation, DDS headers and retransmission. Counted at requesting node."})
 }
+
+payload!(
+    m::GpsFix,
+    v,
+    v.key.bytes() + 16 + v.time_source.len() + 24 + 72 + 13
+);
+payload!(s::GetGpsHistory_Request, v, {
+    let _ = v;
+    8
+});
+payload!(
+    s::GetGpsHistory_Response,
+    v,
+    v.session.len() + v.fixes.iter().map(Payload::bytes).sum::<usize>() + 26
+);

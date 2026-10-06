@@ -39,8 +39,9 @@ Python and ONNX Runtime are only needed for replay and conversion validation.
    If candidate-side landmarks fail verification, reverse PnP uses query-side
    landmarks and inverts the resulting constraint to preserve edge direction.
 6. Verified camera constraints are converted into body constraints using the
-   calibrated camera-to-IMU transform, including its lever arm. The existing
-   sparse robust SE(3) pose-graph optimizer refines the map trajectory. The old
+   calibrated camera-to-IMU transform, including its lever arm. The native
+   [GTSAM C++ wrapper](gtsam_pose_graph.md) refines the map trajectory using
+   sparse robust SE(3) optimization. The old
    VLAD retrieval and brute-force descriptor matcher are not invoked.
 
 The input queue is bounded and nonblocking. GPU sessions are created on and
@@ -68,6 +69,7 @@ in the calibrated, undistorted VIO image resolution.
 
 ```bash
 python3 scripts/build_loop_tensorrt.py --model-dir /path/to/onnx_model
+bash scripts/build_gtsam_native.sh
 RUSTFLAGS='-C target-feature=+avx2,+fma' cargo build --locked --release \
   --example basalt_stream_vio --features basalt-lm-workspace-reuse,tensorrt-loop
 target/graco-venv/bin/python scripts/run_graco_vio.py \

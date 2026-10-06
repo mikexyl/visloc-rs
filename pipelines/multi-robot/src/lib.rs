@@ -12,3 +12,6 @@ pub use types::*;
 #[error("{0}")]
 pub struct Error(pub String);
 pub type Result<T> = std::result::Result<T, Error>;
+
+pub mod gps;
+pub use gps::{GpsConfig, GpsDatum, GpsRecord, GpsSnapshot};

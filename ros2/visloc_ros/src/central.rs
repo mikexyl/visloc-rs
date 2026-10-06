@@ -27,6 +27,7 @@ pub struct Config {
 enum Update {
     Keyframe(c::KeyframeRecord),
     Loop(c::LoopConstraint),
+    Gps(c::GpsRecord),
     Finish,
 }
 pub fn run(config: Config) -> AnyResult<()> {
@@ -68,6 +69,15 @@ pub fn run(config: Config) -> AnyResult<()> {
                     .lock()
                     .unwrap()
                     .insert_keyframe(serde_json::from_value(r.clone())?)?;
+            }
+            if let Some(d) = v.get("gps_datum").filter(|d| !d.is_null()) {
+                state.lock().unwrap().gps_datum = Some(serde_json::from_value(d.clone())?);
+            }
+            if let Some(r) = v.get("gps") {
+                state
+                    .lock()
+                    .unwrap()
+                    .insert_gps(serde_json::from_value(r.clone())?)?;
             }
             if let Some(r) = v.get("loop") {
                 state
@@ -141,6 +151,26 @@ pub fn run(config: Config) -> AnyResult<()> {
             }
         },
     )?;
+    let mut gps_subscriptions = Vec::new();
+    if config.pgo.gps.enabled {
+        for robot in &config.peers {
+            let tx = tx.clone();
+            gps_subscriptions.push(
+                node.create_subscription(
+                    format!("/{robot}/slam/gps")
+                        .as_str()
+                        .reliable()
+                        .keep_last(256),
+                    move |r: m::GpsFix| {
+                        if let Err(e) = tx.try_send(Update::Gps(c::GpsRecord::from_wire(r))) {
+                            crate::traffic::dropped(crate::traffic::Queue::Graph);
+                            eprintln!("GPS graph queue: {e}");
+                        }
+                    },
+                )?,
+            );
+        }
+    }
     let finish_tx = tx.clone();
     let finish = node.create_service::<s::Finish, _>(
         "/visloc/backend/finish",
@@ -160,6 +190,9 @@ pub fn run(config: Config) -> AnyResult<()> {
                         .iter()
                         .map(|r| Peer::new(&node, r, true))
                         .collect::<AnyResult<_>>()?;
+                    let mut gps_peers: Vec<(Client<s::GetGpsHistory>, u64, String)> = if config.pgo.gps.enabled {
+                        config.peers.iter().map(|r| Ok((node.create_client(format!("/{r}/slam/gps_history").as_str())?, 0, String::new()))).collect::<AnyResult<_>>()?
+                    } else { Vec::new() };
                     loop {
                         for peer in &mut peers {
                             if !peer.history.service_is_ready()? {
@@ -177,6 +210,22 @@ pub fn run(config: Config) -> AnyResult<()> {
                                 Err(e) => eprintln!("graph history retry: {e}"),
                             }
                         }
+                        for (client, cursor, session) in &mut gps_peers {
+                            if !client.service_is_ready()? { continue; }
+                            match crate::robot::request(&node, client, s::GetGpsHistory_Request { cursor:*cursor }) {
+                                Ok(mut page) => {
+                                    if *session != page.session {
+                                        match crate::robot::request(&node, client, s::GetGpsHistory_Request {cursor:0}) {
+                                            Ok(first) => { *session = first.session.clone(); page = first; },
+                                            Err(e) => { eprintln!("GPS history session reset retries exhausted: {e}"); continue; },
+                                        }
+                                    }
+                                    for record in page.fixes { tx.send(Update::Gps(c::GpsRecord::from_wire(record)))?; }
+                                    *cursor = page.cursor;
+                                },
+                                Err(e) => eprintln!("GPS history retries exhausted: {e}"),
+                            }
+                        }
                         std::thread::sleep(Duration::from_millis(250));
                     }
                 })();
@@ -187,6 +236,12 @@ pub fn run(config: Config) -> AnyResult<()> {
     }
     let graph = node.create_publisher::<m::GraphSnapshot>(
         "/visloc/graph".reliable().transient_local().keep_last(1),
+    )?;
+    let gps_status = node.create_publisher::<m::GpsStatus>(
+        "/visloc/gps_status"
+            .reliable()
+            .transient_local()
+            .keep_last(1),
     )?;
     let transforms =
         node.create_publisher::<tf2_msgs::msg::TFMessage>("/tf".reliable().keep_last(64))?;
@@ -210,6 +265,17 @@ pub fn run(config: Config) -> AnyResult<()> {
         for snapshot in results.try_iter() {
             let result = (|| -> AnyResult<()> {
                 graph.publish(snapshot.wire())?;
+                gps_status.publish(m::GpsStatus {
+                    revision: snapshot.revision,
+                    total_records: snapshot.gps.diagnostics.len() as u64,
+                    active_factors: snapshot
+                        .gps
+                        .diagnostics
+                        .iter()
+                        .filter(|d| d.reason == "active")
+                        .count() as u64,
+                    aligned_components: snapshot.gps.aligned_components.len() as u64,
+                })?;
                 for (robot, publisher) in &paths {
                     let mut poses: Vec<_> = snapshot
                         .poses
@@ -264,7 +330,14 @@ pub fn run(config: Config) -> AnyResult<()> {
             }
         }
     })?;
-    let _keep = (subscriptions, status_subscriptions, loop_sub, finish, pump);
+    let _keep = (
+        subscriptions,
+        gps_subscriptions,
+        status_subscriptions,
+        loop_sub,
+        finish,
+        pump,
+    );
     executor.spin(SpinOptions::default()).first_error()?;
     Ok(())
 }
@@ -285,6 +358,16 @@ fn optimize(
         .create(true)
         .append(true)
         .open(config.output.join("revisions.jsonl"))?;
+    let mut gps_revisions = if config.pgo.gps.enabled {
+        Some(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(config.output.join("gps_revisions.jsonl"))?,
+        )
+    } else {
+        None
+    };
     let snapshot_path = config.output.join("graph_snapshot.json");
     let mut previous = if snapshot_path.exists() {
         serde_json::from_slice(&std::fs::read(&snapshot_path)?)?
@@ -309,6 +392,22 @@ fn optimize(
                         writeln!(journal, "{}", serde_json::json!({"loop":r}))?;
                     }
                 }
+                Update::Gps(r) => match state.insert_gps(r.clone()) {
+                    Ok(true) => writeln!(
+                        journal,
+                        "{}",
+                        serde_json::json!({"gps":r,"gps_datum":state.gps_datum})
+                    )?,
+                    Ok(false) => {}
+                    Err(e) => {
+                        eprintln!("GPS record rejected: {e}");
+                        writeln!(
+                            revisions,
+                            "{}",
+                            serde_json::json!({"event":"gps_rejected","key":r.key,"error":e.to_string()})
+                        )?;
+                    }
+                },
                 Update::Finish => force = true,
             }
         }
@@ -319,10 +418,19 @@ fn optimize(
             match graph.solve(&previous) {
                 Ok(snapshot) => {
                     atomic_json(&snapshot_path, &snapshot)?;
+                    if config.pgo.gps.enabled {
+                        let gps_revision = serde_json::json!({"revision":snapshot.revision,"input_revision":snapshot.input_revision,
+                            "latest_keyframe_timestamp_ns":snapshot.poses.iter().map(|p|p.timestamp_ns).max(),"gps":snapshot.gps});
+                        atomic_json(&config.output.join("gps_diagnostics.json"), &gps_revision)?;
+                        if let Some(log) = &mut gps_revisions {
+                            writeln!(log, "{gps_revision}")?;
+                            log.flush()?;
+                        }
+                    }
                     writeln!(
                         revisions,
                         "{}",
-                        serde_json::json!({"revision":snapshot.revision,"input_revision":snapshot.input_revision,"keyframes":snapshot.poses.len(),"loops":snapshot.loops.len(),"components":snapshot.components,"initial_cost":snapshot.initial_cost,"final_cost":snapshot.final_cost,"solve_ms":snapshot.solve_ms})
+                        serde_json::json!({"revision":snapshot.revision,"input_revision":snapshot.input_revision,"keyframes":snapshot.poses.len(),"loops":snapshot.loops.len(),"components":snapshot.components,"initial_cost":snapshot.initial_cost,"final_cost":snapshot.final_cost,"solve_ms":snapshot.solve_ms,"optimizer_reports":snapshot.optimizer_reports})
                     )?;
                     for robot in &config.peers {
                         let mut out = std::fs::File::create(

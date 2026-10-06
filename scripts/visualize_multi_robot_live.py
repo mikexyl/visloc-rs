@@ -138,6 +138,7 @@ class MissionPublisher:
         self.cameras = CameraPublisher(rr, mission.get('epoch_ns', 0))
         self.components = set()
         self.camera_paths = ()
+        self.gps_revision = -1
 
     def publish(self, follower, elapsed):
         import rerun.blueprint as rrb
@@ -200,6 +201,34 @@ class MissionPublisher:
                 if a and b and identity(a['component']) == identity(b['component']) == component:
                     edges.append([a['body_to_map']['translation'], b['body_to_map']['translation']])
             rr.log(root + '/loop_edges', rr.LineStrips3D(edges, colors=[255,50,170]))
+        if self.gps_revision != follower.graph['revision']:
+            self.gps_revision = follower.graph['revision']
+            gps = follower.graph.get('gps', {})
+            aligned = {identity(key) for key in gps.get('aligned_components', [])}
+            clouds = defaultdict(lambda: dict(used=[], downweighted=[], unused=[], residuals=[]))
+            for diagnostic in gps.get('diagnostics', []):
+                endpoint = diagnostic.get('from')
+                pose = poses.get(identity(endpoint)) if endpoint else None
+                if not pose or identity(pose['component']) not in aligned or diagnostic.get('position_enu') is None:
+                    continue
+                component = identity(pose['component'])
+                path = f"{origin(component)}/{diagnostic['key']['robot']}/gps"
+                cloud = clouds[path]
+                measured = list(diagnostic['position_enu'])
+                predicted = diagnostic.get('predicted_enu')
+                # Project the display marker to the trajectory's height. The
+                # Receiver height is ignored; marker height is display-only.
+                measured[2] = predicted[2] if predicted else pose['body_to_map']['translation'][2]
+                if diagnostic['reason'] == 'active':
+                    group = 'used' if diagnostic['robust_weight'] >= .25 else 'downweighted'
+                    cloud[group].append(measured)
+                    cloud['residuals'].append([predicted, measured])
+                else:
+                    cloud['unused'].append(measured)
+            for path, cloud in clouds.items():
+                for group, color in [('used',[40,210,120]), ('downweighted',[255,75,65]), ('unused',[140,140,140])]:
+                    rr.log(path+'/'+group, rr.Points3D(cloud[group], colors=color, radii=.12))
+                rr.log(path+'/residuals', rr.LineStrips3D(cloud['residuals'], colors=[255,180,40]))
         self.landmarks.publish(points)
         audit['camera_frames'] = self.cameras.image_frames
         audit['camera_images'] = self.cameras.image_count
@@ -207,6 +236,10 @@ class MissionPublisher:
             f"Live graph revision: {follower.graph['revision']} | Components: {len(components)}\n"
             f"Display landmarks: {len(points)} | Pending refinements: {audit['pending_tracks']}\n"
             f"Received keyframes: {follower.read_packets} | Evicted tracks: {audit.get('evicted_tracks', 0)}\n"
+            f"GPS aligned components: {len(follower.graph.get('gps', {}).get('aligned_components', []))}; "
+            f"retained factors: {sum(d['reason']=='active' for d in follower.graph.get('gps', {}).get('diagnostics', []))}; "
+            f"within tolerance: {sum(d.get('within_tolerance', False) for d in follower.graph.get('gps', {}).get('diagnostics', []))}. "
+            "GPS markers projected to trajectory height.\n"
             'Online point refinement with current poses held fixed. No feedback to VIO.'))
         for key in ('displayed_landmarks', 'pending_tracks', 'observations_retained'):
             rr.log('metrics/map/' + key, rr.Scalars(audit[key]))

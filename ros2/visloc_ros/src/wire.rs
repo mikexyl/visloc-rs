@@ -262,6 +262,9 @@ impl Wire for c::GraphSnapshot {
             initial_cost: m.initial_cost,
             final_cost: m.final_cost,
             solve_ms: m.solve_ms,
+            gps: Default::default(),
+            // Detailed optimizer diagnostics are persisted in backend journals.
+            optimizer_reports: Default::default(),
         }
     }
 }
@@ -307,5 +310,39 @@ pub fn tf(
                 w: qw,
             },
         },
+    }
+}
+
+impl Wire for c::GpsRecord {
+    type Msg = m::GpsFix;
+    fn wire(&self) -> Self::Msg {
+        m::GpsFix {
+            key: self.key.wire(),
+            timestamp_ns: self.timestamp_ns,
+            receipt_timestamp_ns: self.receipt_timestamp_ns,
+            time_source: self.time_source.clone(),
+            has_position: self.lla.is_some(),
+            lla: self.lla.unwrap_or([0.; 3]),
+            status: self.status,
+            has_quality: self.quality.is_some(),
+            quality: self.quality.unwrap_or(0),
+            has_hdop: self.hdop.is_some(),
+            hdop: self.hdop.unwrap_or(0.),
+            has_covariance: self.covariance_enu.is_some(),
+            covariance_enu: self.covariance_enu.unwrap_or([0.; 9]),
+        }
+    }
+    fn from_wire(m: Self::Msg) -> Self {
+        Self {
+            key: c::Key::from_wire(m.key),
+            timestamp_ns: m.timestamp_ns,
+            receipt_timestamp_ns: m.receipt_timestamp_ns,
+            time_source: m.time_source,
+            lla: m.has_position.then_some(m.lla),
+            status: m.status,
+            quality: m.has_quality.then_some(m.quality),
+            hdop: m.has_hdop.then_some(m.hdop),
+            covariance_enu: m.has_covariance.then_some(m.covariance_enu),
+        }
     }
 }

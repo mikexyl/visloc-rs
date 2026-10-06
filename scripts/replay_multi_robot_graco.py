@@ -19,8 +19,8 @@ from rclpy.serialization import serialize_message
 from sensor_msgs.msg import Image, Imu
 from nav_msgs.msg import Odometry
 from rosgraph_msgs.msg import Clock
-from visloc_msgs.msg import Status, SequenceAnnouncement, LoopConstraint, GraphSnapshot
-from visloc_msgs.srv import Finish
+from visloc_msgs.msg import Status, SequenceAnnouncement, LoopConstraint, GraphSnapshot, GpsFix, GpsStatus
+from visloc_msgs.srv import Finish, GetGpsHistory
 from replay_sensor_source import open_source
 
 def stamp(message, ns):
@@ -32,6 +32,7 @@ class Replay(Node):
         self.mission, self.output = mission, output
         self.status, self.ack, self.bytes = {}, {}, {}
         self.latest_graph = None
+        self.gps_status = None
         self.subs = []
         # Keep the node attached across callbacks. The convenience spin_once
         # function otherwise adds/removes it and wakes/rebuilds the wait set
@@ -58,6 +59,18 @@ class Replay(Node):
                 right_pub=self.create_publisher(Image, f'/{name}/camera_right/image', reliable) if stereo else None,
                 imu_pub=self.create_publisher(Imu, f'/{name}/imu', QoSProfile(depth=2048, reliability=ReliabilityPolicy.RELIABLE)),
                 finish=self.create_client(Finish, f'/{name}/slam/finish')))
+            stream = self.streams[-1]
+            stream['gps_index'] = 0
+            stream['gps'] = []
+            stream['gps_pub'] = None
+            if robot_config.get('gps', {}).get('enabled', False):
+                stream['gps'] = [record for line in Path(robot['gps_records']).read_text().splitlines()
+                                 if (record := json.loads(line))['timestamp_ns'] <= frames[-1][0]]
+                stream['gps_pub'] = self.create_publisher(GpsFix, f'/{name}/gps/normalized', reliable)
+                stream['gps_finish'] = self.create_client(Finish, f'/{name}/slam/gps_finish')
+                stream['gps_history'] = self.create_client(GetGpsHistory, f'/{name}/slam/gps_history')
+                self.subs.append(self.create_subscription(GpsFix, f'/{name}/slam/gps', lambda m: self.count('gps_normalized_output',m), reliable))
+        self.subs.append(self.create_subscription(GpsStatus, '/visloc/gps_status', lambda m: setattr(self, 'gps_status', m), status_qos))
         self.backend_finish = self.create_client(Finish, '/visloc/backend/finish')
         backend_config = json.loads(Path(mission['backend_config']).read_text())
         self.backend_finished = Path(backend_config['output']) / 'finished.json'
@@ -86,6 +99,7 @@ class Replay(Node):
         self.spin_until(lambda: len(self.status) == len(self.streams) and all(s.ready for s in self.status.values()), 180, 'robot readiness')
         self.spin_until(lambda: all(s['image_pub'].get_subscription_count() and s['imu_pub'].get_subscription_count()
                                    and (s['right_pub'] is None or s['right_pub'].get_subscription_count())
+                                   and (s['gps_pub'] is None or s['gps_pub'].get_subscription_count())
                                    for s in self.streams), 30, 'sensor discovery')
         queue = [(s['frames'][0][0] + s['robot']['offset_ns'], i, 0) for i, s in enumerate(self.streams)]
         heapq.heapify(queue)
@@ -126,6 +140,20 @@ class Replay(Node):
                     m = Image(); stamp(m.header.stamp, ns); m.header.frame_id = f"{robot['robot']}/camera_right"
                     m.width, m.height, m.step, m.encoding, m.is_bigendian = raw.width, raw.height, raw.step, raw.encoding, raw.is_bigendian
                     m.data = array.array('B', np.asarray(raw.data, dtype=np.uint8).tobytes()); stream['right_pub'].publish(m)
+                while stream['gps_index'] < len(stream['gps']) and stream['gps'][stream['gps_index']]['timestamp_ns'] <= original_ns:
+                    record = stream['gps'][stream['gps_index']]
+                    gps = GpsFix()
+                    gps.key.robot = robot['robot']; gps.key.session = 'replay'; gps.key.id = record['key']['id']
+                    gps.timestamp_ns = record['timestamp_ns'] + robot['offset_ns']
+                    gps.receipt_timestamp_ns = record['receipt_timestamp_ns'] + robot['offset_ns']
+                    gps.time_source = record['time_source']
+                    gps.has_position = record['lla'] is not None; gps.lla = record['lla'] or [0.] * 3
+                    gps.status = record['status']
+                    gps.has_quality = record['quality'] is not None; gps.quality = record['quality'] or 0
+                    gps.has_hdop = record['hdop'] is not None; gps.hdop = record['hdop'] or 0.
+                    gps.has_covariance = record['covariance_enu'] is not None; gps.covariance_enu = record['covariance_enu'] or [0.] * 9
+                    stream['gps_pub'].publish(gps); self.count('gps_input', gps)
+                    stream['gps_index'] += 1
                 waiting.append((robot['robot'], ns, robot['stationary_startup']))
                 if index + 1 < len(frames):
                     heapq.heappush(queue, (frames[index + 1][0] + robot['offset_ns'], robot_index, index + 1))
@@ -160,6 +188,29 @@ class Replay(Node):
         expected = sum(s.keyframes for s in self.status.values())
         expected_loops = sum(s.loops for s in self.status.values())
         self.spin_until(lambda: self.latest_graph is not None and len(self.latest_graph.poses) == expected and len(self.latest_graph.loops) == expected_loops, 180, 'complete centralized graph')
+        expected_gps = sum(len(stream['gps']) for stream in self.streams)
+        for stream in self.streams:
+            if stream['gps_pub'] is None:
+                continue
+            expected_records = len(stream['gps'])
+            deadline = time.monotonic() + 30
+            while True:
+                future = stream['gps_history'].call_async(GetGpsHistory.Request(cursor=expected_records))
+                self.spin_until(future.done, 3, 'GPS history drain')
+                page = future.result()
+                if page.dropped_inputs or page.rejected_inputs:
+                    raise RuntimeError(f'GPS ingestion drops/rejections: {page.dropped_inputs}/{page.rejected_inputs}')
+                if page.cursor == expected_records:
+                    break
+                if time.monotonic() > deadline:
+                    raise TimeoutError('GPS input records missing from history')
+            future = stream['gps_finish'].call_async(Finish.Request())
+            self.spin_until(future.done, 3, 'GPS finish')
+            if not future.result().accepted:
+                raise RuntimeError('GPS worker refused drain')
+        if expected_gps:
+            self.spin_until(lambda: self.gps_status is not None and self.gps_status.total_records == expected_gps,
+                            60, 'complete GPS graph records')
         previous_revision = self.latest_graph.revision
         future = self.backend_finish.call_async(Finish.Request(last_image_timestamp_ns=0))
         self.spin_until(future.done, 15, 'backend final solve request')
@@ -183,6 +234,7 @@ class Replay(Node):
                    'final_graph_revision': self.latest_graph.revision,
                    'final_graph_input_revision': self.latest_graph.input_revision,
                    'topic_cdr_bytes_note': 'Serialized message payloads observed once per publication; excludes DDS framing and service traffic.'}
+        summary['gps_records_published'] = expected_gps
         summary['replay_timing'] = {key: {'median_ms': float(np.median([v[key] for v in timings])),
                                         'p95_ms': float(np.percentile([v[key] for v in timings], 95))}
                                    for key in ('publish_ms', 'ack_wait_ms', 'cpu_ms')}

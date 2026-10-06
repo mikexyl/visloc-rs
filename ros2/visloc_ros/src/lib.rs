@@ -8,3 +8,5 @@ pub mod traffic;
 
 pub mod archive;
 pub mod visualization;
+
+pub mod gps;

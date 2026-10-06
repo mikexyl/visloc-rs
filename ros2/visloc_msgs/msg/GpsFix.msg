@@ -1,0 +1,13 @@
+Key key
+int64 timestamp_ns
+int64 receipt_timestamp_ns
+string time_source
+bool has_position
+float64[3] lla
+int8 status
+bool has_quality
+uint8 quality
+bool has_hdop
+float64 hdop
+bool has_covariance
+float64[9] covariance_enu

@@ -19,7 +19,7 @@ use visloc_core::{
     geometry::{reproject, Pose},
     types::Camera,
 };
-use visloc_slam::{LinearSolver, PoseGraph, PoseGraphEdgeKind, PoseGraphSe3Config, RobustKernel};
+use visloc_gtsam::PoseGraph;
 use visloc_vision::{
     pnp::{Correspondence2D3D, GaussNewtonPoseRefiner, P3PGrunert},
     ransac::{PnPRansac, RobustPoseEstimator},
@@ -149,6 +149,7 @@ struct Worker {
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(a, b)| a * b).sum()
 }
+#[cfg(test)]
 fn pose(transform: SE3) -> Pose {
     Pose {
         world_to_camera: rigid_pose(transform),
@@ -161,8 +162,8 @@ fn rigid_pose(mut transform: SE3) -> SE3 {
     transform
 }
 
-fn graph_correction(raw: &SE3, optimized: &Pose) -> SE3 {
-    rigid_pose(optimized.camera_to_world().compose(&raw.inverse()))
+fn graph_correction(raw: &SE3, optimized: &SE3) -> SE3 {
+    rigid_pose(optimized.compose(&raw.inverse()))
 }
 fn body_constraint(camera_to_body: &SE3, newer_camera_from_older_camera: &SE3) -> SE3 {
     camera_to_body
@@ -275,7 +276,7 @@ impl Worker {
         let correction = self.snapshot.correction_at(frame.timestamp_ns);
         self.graph.add_pose(
             frame.id,
-            pose(correction.compose(&frame.body_to_world).inverse()),
+            correction.compose(&frame.body_to_world),
         );
         if let Some(previous) = self.keyframes.last() {
             // Odometry measurements always use the uncorrected VIO poses.
@@ -287,7 +288,6 @@ impl Worker {
                 previous.id,
                 frame.id,
                 measurement,
-                PoseGraphEdgeKind::Sequential,
                 information(0.15, 0.03),
             );
         } else {
@@ -439,7 +439,6 @@ impl Worker {
                 let old = &self.keyframes[candidate];
                 let new = &self.keyframes[current];
                 let corrected = self.graph.poses[&old.id]
-                    .camera_to_world()
                     .compose(&v.measurement.inverse());
                 let correction = corrected.compose(&new.raw_body_to_world.inverse());
                 let consistent = self.pending.as_ref().is_some_and(|p| {
@@ -462,19 +461,17 @@ impl Worker {
                         old.id,
                         new.id,
                         v.measurement,
-                        PoseGraphEdgeKind::LoopClosure,
                         information(0.2, 0.04),
                     );
-                    let optimized = trial
-                        .optimize_se3_iterative(&PoseGraphSe3Config {
-                            max_iterations: 20,
-                            initial_lambda: Some(1e-4),
-                            chordal_init: false,
-                            robust_kernel: RobustKernel::Huber { delta: 3.0 },
-                            linear_solver: LinearSolver::Sparse,
-                            ..Default::default()
-                        })
-                        .map_err(|e| Error(format!("Pose graph: {e:?}")))?;
+                    let optimized = match trial.optimize() {
+                        Ok(report) => report,
+                        Err(error) => {
+                            event["reason"] = "optimizer_rejected".into();
+                            event["optimizer_error"] = error.to_string().into();
+                            self.log(event)?;
+                            return Ok(());
+                        }
+                    };
                     if optimized.final_cost.is_finite()
                         && optimized.final_cost <= optimized.initial_cost
                         && trial
@@ -505,6 +502,7 @@ impl Worker {
                         event["reason"] = "verified_and_confirmed".into();
                         event["graph_cost_before"] = optimized.initial_cost.into();
                         event["graph_cost_after"] = optimized.final_cost.into();
+                        event["optimizer"] = serde_json::to_value(&optimized).unwrap();
                     } else {
                         event["reason"] = "optimizer_rejected".into();
                     }
@@ -543,7 +541,7 @@ impl Worker {
             .poses
             .iter()
             .map(|(&id, p)| {
-                let t = p.camera_to_world().translation;
+                let t = p.translation;
                 (id, [t.x, t.y, t.z])
             })
             .collect();
@@ -835,7 +833,7 @@ mod tests {
                 rotation64,
                 Vector3::new(i as f64 * 0.1, 15.0, 1.0),
             ));
-            let optimized = pose(correction.compose(&raw).inverse());
+            let optimized = rigid_pose(correction.compose(&raw));
             correction = graph_correction(&raw, &optimized);
         }
         assert!(

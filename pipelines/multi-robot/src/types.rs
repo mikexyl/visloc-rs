@@ -280,4 +280,8 @@ pub struct GraphSnapshot {
     pub initial_cost: f64,
     pub final_cost: f64,
     pub solve_ms: f64,
+    #[serde(default)]
+    pub optimizer_reports: Vec<visloc_gtsam::OptimizerReport>,
+    #[serde(default)]
+    pub gps: crate::gps::GpsSnapshot,
 }
