@@ -9,6 +9,14 @@ spec.loader.exec_module(module)
 
 
 class BrowserControllerTests(unittest.TestCase):
+    def test_status_query_is_limited_to_visloc(self):
+        c = module.Controller()
+        c.command = Mock(return_value='{"Names":"visloc-realsense","State":"running"}\n')
+        self.assertTrue(c.running(c.containers(), 'visloc-realsense'))
+        c.command.assert_called_once_with('docker', 'container', 'ls', '-a',
+                                         '--filter', 'name=^/visloc-realsense$',
+                                         '--format', '{{json .}}')
+
     def controller(self, **containers):
         controller = module.Controller()
         state = {name: {'State': value} for name, value in containers.items()}
@@ -48,6 +56,27 @@ class BrowserControllerTests(unittest.TestCase):
         c, calls = self.controller(**{'visloc-realsense':'running','dpvo-online-robot0':'running'})
         c.perform('stop')
         self.assertEqual(calls, [('docker','stop','--time','20','visloc-realsense')])
+
+    def test_successful_stop_releases_mapping_resources(self):
+        c, _ = self.controller(**{'visloc-realsense': 'running'})
+        c.on_mapping_stopped = Mock()
+        c._work('stop')
+        c.on_mapping_stopped.assert_called_once_with()
+        self.assertEqual(c.error, '')
+
+    def test_failed_stop_does_not_mark_mapping_as_stopped(self):
+        c, _ = self.controller(**{'visloc-realsense': 'running'})
+        c.command = Mock(side_effect=RuntimeError('stop failed'))
+        c.on_mapping_stopped = Mock()
+        c._work('stop')
+        c.on_mapping_stopped.assert_not_called()
+        self.assertEqual(c.error, 'stop failed')
+
+    def test_start_does_not_acquire_mapping_resources(self):
+        c, _ = self.controller(**{'visloc-realsense': 'running'})
+        c.on_mapping_stopped = Mock()
+        c._work('start')
+        c.on_mapping_stopped.assert_not_called()
 
     def test_start_is_idempotent(self):
         c, calls = self.controller(**{'visloc-realsense':'running'})

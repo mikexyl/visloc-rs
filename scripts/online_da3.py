@@ -202,6 +202,13 @@ class Pipeline:
         self.events.write(json.dumps(record, allow_nan=False)+'\n')
         self.events.flush()
 
+    def prepare_window(self, window):
+        """Optional worker-owned landmark filtering before coverage or scale fitting."""
+        return window, {}
+
+    def archive_fields(self, window):
+        return {}
+
     def accept(self, frame):
         self.stats['keyframes'] += 1
         if self.window and frame.ordinal != self.window[-1].ordinal + 1:
@@ -224,6 +231,8 @@ class Pipeline:
             self.stats['interval_skips'] += 1
             self.event(dict(event, decision='minimum_interval'))
             return
+        window, diagnostics = self.prepare_window(window)
+        event.update(diagnostics)
         visible = coverage(window, self.history, self.config.history_depth_tolerance)
         event['coverage'] = visible
         supported_views = sum(v['cells'] >= 8 for v in visible['by_view'])
@@ -288,7 +297,8 @@ class Pipeline:
                             timestamps_ns=np.array([f.timestamp_ns for f in window]),
                             keyframe_ordinals=np.array([f.ordinal for f in window]),
                             scale=np.array(scale),
-                            metadata=np.array(json.dumps(event, allow_nan=False)), **consistency_data)
+                            metadata=np.array(json.dumps(event, allow_nan=False)),
+                            **self.archive_fields(window), **consistency_data)
         for i, f in enumerate(window):
             h, w = aligned[i].shape
             small_size = (max(2, w//5), max(2, h//5))
@@ -305,9 +315,10 @@ class Pipeline:
 
 
 class OnlineDepth:
-    def __init__(self, config, output):
+    def __init__(self, config, output, pipeline_factory=Pipeline):
         config.validate()
         self.config, self.output = config, Path(output)
+        self.pipeline_factory = pipeline_factory
         self.output.mkdir(parents=True, exist_ok=True)
         self.queue = queue.Queue(config.queue_capacity)
         self.results = queue.Queue()
@@ -335,7 +346,7 @@ class OnlineDepth:
                                           'input camera poses only; upstream DA3 inverse Umeyama scale'),
                             inference='native TensorRT bridge, no PyTorch or CPU fallback')
             (self.output/'model.json').write_text(json.dumps(manifest, indent=2)+'\n')
-            pipeline = Pipeline(self.config, model, self.output, self.results.put)
+            pipeline = self.pipeline_factory(self.config, model, self.output, self.results.put)
             self.ready.set()
             while not self.stop.is_set() or not self.queue.empty():
                 try:

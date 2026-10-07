@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from resource_monitor import ResourceMonitor
 from map_store import MapStore
+from gps_monitor import GpsMonitor
 
 
 def main():
@@ -19,11 +20,13 @@ def main():
     parser.add_argument('--host', default='0.0.0.0')
     parser.add_argument('--port', type=int, default=8090)
     parser.add_argument('--controls', action='store_true', help='Enable local Docker start/stop controls')
+    parser.add_argument('--gps-device', default='auto', help='u-blox USB auto-detection, explicit serial path, or off')
     args = parser.parse_args()
+    gps = GpsMonitor(args.gps_device)
     controller = None
     if args.controls:
         from controller import Controller
-        controller = Controller()
+        controller = Controller(on_mapping_stopped=gps.pause)
     token = secrets.token_urlsafe(32)
     lock = threading.Lock()
     state = {'sequence': 0, 'packet': None, 'received': 0}
@@ -49,7 +52,9 @@ def main():
 
         def do_GET(self):
             path = self.path.split('?')[0]
-            if path == '/api/resources':
+            if path == '/api/gps':
+                self.reply(json.dumps(gps.snapshot(), allow_nan=False).encode())
+            elif path == '/api/resources':
                 self.reply(json.dumps(resources.snapshot(), allow_nan=False).encode())
             elif path == '/api/map':
                 query = parse_qs(urlsplit(self.path).query)
@@ -134,6 +139,7 @@ def main():
                     if not base64.b64decode(data, validate=True).startswith(b'\xff\xd8'):
                         raise ValueError('JPEG required')
                 with lock:
+                    gps.pose_update(packet['stream'], packet['p'])
                     map_store.update(packet['stream'], points)
                     # Full map has its own cached, binary, rate-limited endpoint.
                     # Do not resend even active landmarks with every pose/image poll.
@@ -148,11 +154,13 @@ def main():
 
     print(f'Online viewer: http://127.0.0.1:{args.port} (waiting for VIO)', flush=True)
     with ThreadingHTTPServer((args.host, args.port), Handler) as server:
+        gps.start()
         resources.start()
         map_store.start()
         try:
             server.serve_forever()
         finally:
+            gps.close()
             resources.close()
             map_store.close()
 

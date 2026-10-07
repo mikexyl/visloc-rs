@@ -14,6 +14,65 @@ the camera poses. Depth is displayed in Rerun alongside monocular VIO.
 
 ## Run
 
+### Native ROS2 mission recorder
+
+The live mission recorder also supports DA3, alongside stereo-inertial VIO and
+loop closure:
+
+```bash
+source scripts/source_multi_robot_ros2.bash
+.runtime/graco-venv/bin/python scripts/run_multi_robot_mission.py \
+  /path/to/fresh/mission.json --da3-config configs/graco/da3_five_view.json
+```
+
+Enable `visualization_enabled` on each robot (the default). The independent
+recorder joins the keyframe journal to the calibrated left-camera image journal
+by robot, session and exact timestamp. It uses the recorder's quality-90 JPEG
+images, already undistorted, with no second rectification. Stereo remains active
+in VIO; DA3 consumes five consecutive **left-camera VIO keyframes**. Missing
+keyframe ordinals reset the window. Image joins and inference queues are bounded;
+missing-image and worker drops are reported. No Rerun server is started.
+
+Before the coverage gate, the worker reuses `build_landmark_map`, the same
+fixed-pose robust refinement used by the online sparse visualization. Each
+five-keyframe window yields one point per robot/session/track ID. Defaults require
+at least two distinct observations, one degree of inlier parallax, and reprojection
+error at most three pixels in at least 60% of observations. Individual outlying
+measurements of an otherwise valid track are also excluded. No metric VIO seed
+means no landmark; raw rejected points are never used as a fallback. These
+refinements use only the current window's observations and raw VIO poses.
+
+Filtered landmarks drive the existing FOV novelty gate and optional landmark
+scale fit. **The supplied configuration still disables landmark scale fitting**:
+camera-conditioned DA3 depth is converted to metres from its predicted/supplied
+camera poses. Confidence `>= max(3, P70)` and five-view depth reprojection
+consistency remain mandatory in this profile. Landmark filtering does not by
+itself prove dense depth accuracy.
+
+For a less restrictive confidence trial, use
+`configs/graco/da3_five_view_relaxed.json`: confidence `>= max(1.5, P30)`
+nominally retains the highest-scoring 70% before geometric consistency checks.
+The landmark, FOV, depth reprojection, and pose-only scale settings are unchanged.
+Keep the strict profile's recording for comparison; coverage history can change
+which later windows are inferred, so compare identical windows separately.
+
+Depth is inferred and checked in raw odometry coordinates. For display, each
+camera-local cloud is attached to its own optimized keyframe pose and moves when
+PGO updates; corrections never change DA3 coverage history or feed into VIO.
+Cloud samples remain unfused, and inter-window surface agreement remains WIP.
+
+The mission's `online.rrd` includes the dense clouds, camera-follow views, depth
+images and sparse landmarks. `da3/<robot>/<session>/` saves the existing engine
+manifest, events, five-view archives and worker summary. Archives also contain
+the filtered landmark IDs, measured pixels, view indices and refined raw-world
+points. `da3/summary.json` reports the journal joins and all worker summaries.
+
+Run `tests/test_online_mission_depth.py` alongside the existing DA3 and landmark
+tests to check filtering, exact image pairing, dropped/missing keyframes, and
+camera-local cloud updates after PGO.
+
+### Standalone GRACO replay
+
 After building the estimator, installing `scripts/requirements-graco.txt` in
 `.runtime/graco-venv`, and building the engine described below:
 

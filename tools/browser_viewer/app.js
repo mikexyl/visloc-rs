@@ -6,6 +6,7 @@ const pointers=new Map();
 const retainedMap=new RetainedMapLayer();
 let showMap=true,autoFit=true,mapStream=null,mapPollStarted=false;
 let drawPending=false,lastDraw=0;
+let gpsPoints=[];
 function draw(){
  if(drawPending)return;
  drawPending=true;
@@ -54,12 +55,13 @@ function drawNow(){const w=canvas.clientWidth,h=canvas.clientHeight,dpr=Math.min
  line(session.frames.filter((_,i)=>i%stride===0).map(f=>f.p),'#d5e2ed',1.6);
  const trail=session.frames.slice(0,index+1).filter((_,i)=>i%stride===0).map(f=>f.p);trail.push(current.p);line(trail,'#167cf3',2.7);
  if(showMap)retainedMap.paint(ctx,w,h,dpr,center,yaw,pitch,zoom,span);
+ line(gpsPoints,'#169b62',2.7);
  const axis=span/zoom*.08;
  [[axis,0,0],[0,axis,0],[0,0,axis]].forEach((v,i)=>line([current.p,rotate(v,current.q).map((n,j)=>n+current.p[j])],['#e5606b','#24a781','#427ff2'][i],2.2));
  const p=project(current.p);ctx.beginPath();ctx.arc(...p,5,0,2*Math.PI);ctx.fillStyle='#132e49';ctx.fill();ctx.strokeStyle='white';ctx.lineWidth=2;ctx.stroke();
  ctx.font='11px system-ui';ctx.fillStyle='#6f8799';ctx.fillText(`Grid ${step.toPrecision(1)} m · Body axes X / Y / Z`,14,h-36);
 }
-function fit(){if(!session || !session.frames.length)return;const min=[Infinity,Infinity,Infinity],max=[-Infinity,-Infinity,-Infinity];session.frames.forEach(f=>f.p.forEach((v,i)=>{min[i]=Math.min(min[i],v);max[i]=Math.max(max[i],v)}));center=min.map((v,i)=>(v+max[i])/2);span=Math.max(1,...max.map((v,i)=>v-min[i]))*1.5;zoom=1;follow=false;$('follow').setAttribute('aria-pressed','false');draw();}
+function fit(){if(!session || !session.frames.length)return;const min=[Infinity,Infinity,Infinity],max=[-Infinity,-Infinity,-Infinity];session.frames.concat(gpsPoints.map(p=>({p}))).forEach(f=>f.p.forEach((v,i)=>{min[i]=Math.min(min[i],v);max[i]=Math.max(max[i],v)}));center=min.map((v,i)=>(v+max[i])/2);span=Math.max(1,...max.map((v,i)=>v-min[i]))*1.5;zoom=1;follow=false;$('follow').setAttribute('aria-pressed','false');draw();}
 function error(message){$('error').textContent=message;$('error').hidden=!message;}
 async function frame(next){next=clamp(next,0,session.frames.length-1);const generation=++requested;loading=true;
  try{const blobs=await Promise.all([0,1].map(async camera=>{const r=await fetch(`/api/image?camera=${camera}&frame=${next}`);if(!r.ok)throw Error(`Camera image unavailable (${r.status})`);return r.blob()}));
@@ -85,6 +87,7 @@ setInterval(()=>{if(!playing||!session)return;const now=performance.now();playTi
 function startLive(){
  if(session.controls)startControls();
  startMapPolling();
+ startGpsPolling();
  $('title').textContent='Online VIO';$('mode').textContent='Waiting for VIO';
  $('play').hidden=true;$('speed').parentElement.hidden=true;$('timeline').hidden=true;
  document.querySelector('footer').textContent='Online sensor-only VIO · Coloured axes show body orientation';
@@ -99,7 +102,7 @@ function startLive(){
     const f=data.packet;
     const sources=f.images.map(b=>'data:image/jpeg;base64,'+b);
     await Promise.all(sources.map(src=>new Promise((resolve,reject)=>{const img=new Image();img.onload=resolve;img.onerror=()=>reject(Error('Invalid stereo image'));img.src=src;})));
-    if(stream!==f.stream){session.frames=[];stream=f.stream;mapStream=stream;retainedMap.reset(stream);autoFit=true;$('map-count').textContent='Loading accumulated map…';}
+    if(stream!==f.stream){session.frames=[];gpsPoints=[];stream=f.stream;mapStream=stream;retainedMap.reset(stream);autoFit=true;$('map-count').textContent='Loading accumulated map…';}
     $('map-tools').hidden=false;
     sequence=data.sequence;session.frames.push({t:f.t,p:f.p,q:f.q});if(session.frames.length>3000)session.frames.shift();
     index=session.frames.length-1;$('left').src=sources[0];$('right').src=sources[1];
@@ -140,4 +143,29 @@ function startControls(){
  }
  $('start-vio').onclick=()=>action('start');$('stop-vio').onclick=()=>action('stop');
  refresh();setInterval(refresh,2000);
+}
+
+
+function startGpsPolling(){
+ $('gps-panel').hidden=false;
+ async function poll(){
+  if(!document.hidden){
+   const abort=new AbortController(),timer=setTimeout(()=>abort.abort(),2500);
+   try{
+    const r=await fetch('/api/gps',{signal:abort.signal,cache:'no-store'});
+    if(!r.ok)throw Error('GPS unavailable');
+    const g=await r.json(),f=g.fix;
+    const quality={0:'No position fix',1:'Standalone GPS',2:'Differential GPS',4:'RTK fixed',5:'RTK float'};
+    const fresh=g.age!==null&&g.age<=3;
+    const aligned=g.aligned&&g.stream===mapStream;
+    gpsPoints=aligned?g.points:[];
+    $('gps-status').textContent=`${fresh?(quality[f?.quality]||'Unsupported fix'):g.age===null?g.status:'GPS stale / disconnected'}${f?` · ${f.satellites} satellites · HDOP ${f.hdop.toFixed(1)}`:''} · ${aligned?'Alignment locked':f&&f.hdop>3?'Waiting for better GPS quality':'Waiting for fix, live VIO and 10 m movement'}`;
+    $('gps-difference').textContent=`Horizontal difference: ${fresh&&aligned&&g.horizontal_difference_m!==null?g.horizontal_difference_m.toFixed(2)+' m':'—'}`;
+    draw();
+   }catch(e){$('gps-status').textContent='GPS connection unavailable';$('gps-difference').textContent='Horizontal difference: —';}
+   finally{clearTimeout(timer);}
+  }
+  setTimeout(poll,1000);
+ }
+ poll();
 }

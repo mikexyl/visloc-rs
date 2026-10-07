@@ -11,12 +11,13 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class Controller:
-    def __init__(self, root=ROOT):
+    def __init__(self, root=ROOT, on_mapping_stopped=None):
         self.root = root
         self.lock = threading.Lock()
         self.operation = None
         self.message = ''
         self.error = ''
+        self.on_mapping_stopped = on_mapping_stopped
 
     def command(self, *args, timeout=30, env=None):
         result = subprocess.run(args, cwd=self.root, env=env, text=True,
@@ -26,7 +27,10 @@ class Controller:
         return result.stdout
 
     def containers(self):
-        raw = self.command('docker', 'container', 'ls', '-a', '--format', '{{json .}}')
+        # Listing unrelated containers is expensive on the Jetson runtime.
+        # Lifecycle decisions only require this exact container name.
+        raw = self.command('docker', 'container', 'ls', '-a',
+                           '--filter', 'name=^/visloc-realsense$', '--format', '{{json .}}')
         return {row['Names']: row for row in (json.loads(line) for line in raw.splitlines())}
 
     @staticmethod
@@ -53,6 +57,8 @@ class Controller:
     def _work(self, action):
         try:
             self.perform(action)
+            if action == 'stop' and self.on_mapping_stopped:
+                self.on_mapping_stopped()
         except Exception as error:
             with self.lock:
                 self.error = str(error)

@@ -172,3 +172,75 @@ overrides `/opt/google/chrome/chrome`. Deployed to the Jetson on 2026-09-17. Its
 shared-memory labeling were verified on the board; desktop and mobile Chrome
 checks confirmed the Start/Stop controls remain visible. The retained-map HTTP
 protocol also passed on a disposable on-board server.
+
+## USB GPS comparison (visualization only)
+
+The live server opens a u-blox receiver under `/dev/serial/by-id/` only after
+receiving valid mapping/VIO frames. Starting the viewer or opening its page
+does not probe or open the GPS port. A successful Stop action releases the port;
+if the publisher exits or disconnects, three seconds without frames also releases
+it. The next active stream reconnects automatically. Late frames from an
+explicitly stopped session do not reopen the device.
+Use `--gps-device /dev/ttyACM0` for an explicit device or `--gps-device off` to
+opt out. The service user needs read access to the serial device (on this Jetson
+it belongs to `video`, already one of the user's groups). No extra Python
+packages, Docker device mapping, receiver configuration commands, or estimator
+changes are needed. Do not run another serial reader on the same port.
+
+The reader validates NMEA GGA checksums and reports fix type, satellites, HDOP,
+and stale/disconnected status at `/api/gps`. While mapping is stopped, the endpoint
+reports GPS idle and retains any historical comparison path, without holding the
+receiver. It retries after USB disconnection only while mapping frames remain
+active. Invalid, estimated, and HDOP > 3 fixes are excluded from
+comparison. GGA support follows the receiver's default NMEA output; a receiver
+configured for UBX-only output will show waiting for NMEA.
+
+Each valid GPS fix is paired with the most recent VIO pose received within
+0.5 seconds. This is **approximate host receipt timing**, not sensor timestamp
+synchronization: camera processing, serial, and network latency can cause
+additional displacement error. Use slow motion for this initial comparison.
+WGS84 positions become local ENU metres. After at least eight paired fixes and
+10 m horizontal displacement in both trajectories, a unit-scale yaw/translation
+fit is frozen (initial horizontal residual must be <= 3 m). Gravity-aligned VIO
+Z-up is assumed. Alignment never updates during that publisher session, so
+subsequent drift remains visible. A new VIO publisher resets the comparison.
+If alignment does not lock, obtain a better sky view and move farther.
+
+The green GPS path and blue VIO path share the scene; **Fit path** includes both.
+The horizontal difference compares matched positions, not their latest
+independently received endpoints. Up to 3,000 paired GPS points are retained;
+reloads recover the current path and alignment from the server. An invalid or
+stale fix suppresses the current difference while retaining the historical path.
+Receiver noise, initial alignment uncertainty, and the GPS antenna-to-camera
+offset contribute to the difference. Standalone GPS is not centimetre ground
+truth; RTK fixed requires an appropriate correction source, which this feature
+does not configure. GPS data never enters VIO estimation or optimization.
+
+Validation: `python3 tests/test_browser_gps.py` covers NMEA validation, invalid
+and stale pairing, rigid alignment, retained drift, session reset, and a real
+pseudo-terminal reader, idle port ownership, stop/stream-timeout release, and
+restart/reconnection. On-board no-fix reception was checked on 2026-09-23;
+an outdoor motion/RTK accuracy run remains necessary.
+
+The mapping-only device lifecycle was deployed on 2026-09-26. GPS/controller
+unit tests and GPS/map HTTP tests pass on the Jetson (27 tests). The GPS HTTP
+test checks actual serial descriptors using an isolated pseudo-terminal. The
+running production viewer reported `GPS idle · waiting for mapping` with no
+serial descriptors open and no mapping container running. The real receiver
+was not opened for this idle-state verification.
+
+```sh
+python3 tests/test_browser_gps.py
+python3 tests/test_browser_controller.py
+python3 tests/test_browser_gps_http.py
+```
+
+### Idle control polling
+
+The controller lists only the exact `visloc-realsense` container using Docker's
+name filter. Do not replace this with an unfiltered container list: on the
+Jetson, polling all containers every two seconds reproduced ~18.5% host CPU
+versus ~1.7% with the viewer paused (2026-09-24). The work appeared in dockerd
+and containerd, so the viewer process's own CPU understated its impact. The
+filtered query took 21 ms versus 877 ms unfiltered in that check. Other containers
+are neither inspected nor stopped by these lifecycle controls.

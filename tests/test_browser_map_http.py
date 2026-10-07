@@ -21,7 +21,7 @@ class MapHttpTests(unittest.TestCase):
             port = listener.getsockname()[1]
         cls.url = f'http://127.0.0.1:{port}'
         cls.process = subprocess.Popen([sys.executable, str(root/'tools/browser_viewer/live_server.py'),
-                                        '--host', '127.0.0.1', '--port', str(port)],
+                                        '--host', '127.0.0.1', '--port', str(port), '--gps-device', 'off'],
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(100):
             try:
