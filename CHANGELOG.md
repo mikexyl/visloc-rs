@@ -15,9 +15,9 @@ All notable changes to `visloc-rs` will be documented here.
   artifacts, and document current defaults, measured scope, and the missed
   endpoint loop. See `docs/global_bundle_adjustment.md`.
 
-- Enable opt-in DA3 in the native mission recorder, reusing robust multi-view
-  landmark filtering before FOV gating and moving dense clouds with graph poses.
-  Depth remains WIP and the supplied profile retains pose-only metric scaling.
+- Replace the experimental dense mapping workers with a pinned ScaRF-SLAM
+  source checkout and offline RGB/visloc pose adapter. Remove the old DA3
+  alignment/filtering code, TensorRT depth tools, recorder hooks, and tests.
 
 - Add an online ROS2 Rerun recorder with bounded landmark refinement, persistent
   landmark identities, and calibrated stereo camera entities with synchronized

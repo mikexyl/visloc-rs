@@ -26,7 +26,6 @@ from scipy.spatial.transform import Rotation
 import yaml
 
 from evaluate_euroc_trajectory import evaluate
-from online_da3 import Config as DepthConfig, OnlineDepth, keyframe_from_vio, log_result as log_depth_result
 
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_CALIBRATION = Path('/data/graco/aerial-calibration-20251121T084428Z-1-001/aerial-calibration')
@@ -231,17 +230,11 @@ def load_truth(bag, output):
     return truth
 
 
-def viewer_blueprint(camera_mode, online_loop=False, online_depth=False):
+def viewer_blueprint(camera_mode, online_loop=False):
     camera_views = [rrb.Spatial2DView(origin='stereo/cam0', name='Left camera + feature tracks')]
     if camera_mode == 'stereo':
         camera_views.append(rrb.Spatial2DView(origin='stereo/cam1', name='Right camera + feature tracks'))
     loop_views = [rrb.TimeSeriesView(origin='metrics/loop', name='Loop closure')] if online_loop else []
-    depth_views = [rrb.Vertical(
-        rrb.Spatial2DView(origin='da3/depth', name='DA3 depth (WIP, metres)'),
-        rrb.Spatial2DView(origin='da3/input', name='DA3 last keyframe'),
-        rrb.TextDocumentView(origin='da3/status', name='DA3 sequence and alignment'),
-        rrb.TimeSeriesView(origin='metrics/da3', name='DA3 coverage and alignment'),
-        row_shares=[3, 2, 1, 1])] if online_depth else []
     return rrb.Blueprint(
         rrb.Horizontal(
             rrb.Spatial3DView(origin='world', name='VIO, active landmarks, and reference'),
@@ -251,8 +244,7 @@ def viewer_blueprint(camera_mode, online_loop=False, online_depth=False):
                 rrb.TimeSeriesView(origin='metrics/timing', name='VIO processing (ms)'),
                 *loop_views,
                 row_shares=[3] * len(camera_views) + [1, 1] + [1] * len(loop_views)),
-            *depth_views,
-            column_shares=([2, 1, 1] if online_depth else [1, 1]) if camera_mode == 'mono' else ([2, 1, 1] if online_depth else [2, 1])),
+            column_shares=[1, 1] if camera_mode == 'mono' else [2, 1]),
         rrb.TimePanel(state='expanded', timeline='elapsed', play_state='Following'))
 
 
@@ -262,15 +254,12 @@ def init_rerun(args, calibration):
     if args.rerun_connect:
         sinks.append(rr.GrpcSink(args.rerun_connect))
     rr.set_sinks(*sinks)
-    rr.send_blueprint(viewer_blueprint(args.camera_mode, bool(args.online_loop_config), bool(args.da3_config)))
+    rr.send_blueprint(viewer_blueprint(args.camera_mode, bool(args.online_loop_config)))
     rr.log('world', rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
     rr.log('notes', rr.TextDocument(
         f'Blue: sensor-only visloc/Basalt {args.camera_mode} VIO. Orange: active landmarks. '
         + ('Green: loop-corrected trajectory. Magenta: verified loop edges. '
            if args.online_loop_config else '') +
-        ('Gray-textured dense points: WIP five-keyframe DA3, conditioned on VIO camera poses/intrinsics '
-         'and converted to metres using the configured scale source (see DA3 status). Depth uses raw VIO coordinates. '
-         if args.da3_config else '') +
         'Gray: GRACO ground truth transformed to match the first VIO body pose, '
         'for display only. Final evaluation uses full-run rigid SE(3) alignment. '
         'Images are resized and undistorted using the selected rig calibration. '
@@ -399,7 +388,6 @@ def replay(args):
     config = json.loads(args.config.read_text())
     (args.output / 'basalt_config.json').write_text(json.dumps(config, indent=2) + '\n')
     bag = Bag(args.bag)
-    depth_worker = None
     try:
         frames = bag.stereo_index()
         imu, imu_stamps = load_imu(bag)
@@ -417,9 +405,6 @@ def replay(args):
                 or (len(frames) > 1 and imu_stamps[0] > frames[1][0])):
             raise ValueError('IMU does not cover the requested camera interval')
         init_rerun(args, calibration)
-        if args.da3_config:
-            depth_worker = OnlineDepth(DepthConfig.from_path(args.da3_config), args.output / 'da3')
-        depth_keyframe_index = 0
         width, height = calibration['resolution'][0]
         print(f'Replaying {len(frames)}/{requested} camera frames, {len(imu)} IMU samples, {width}x{height}; estimator={args.camera_mode}', flush=True)
         # The stream wire format has two fixed-size image buffers. In mono
@@ -449,13 +434,6 @@ def replay(args):
                     end = int(np.searchsorted(imu_stamps, stamp, side='right'))
                     if 'feature_tracks' not in result:
                         raise RuntimeError('Rebuild basalt_stream_vio to enable feature-track overlays')
-                    if depth_worker:
-                        if 'is_keyframe' not in result:
-                            raise RuntimeError('Rebuild basalt_stream_vio to expose actual VIO keyframes')
-                        if result['is_keyframe']:
-                            depth_worker.submit(keyframe_from_vio(
-                                result, images[0], calibration, depth_keyframe_index, depth_worker.config))
-                            depth_keyframe_index += 1
                     feature_overlay.update(result['feature_tracks'])
                     imu_index = end
                     p = np.array(result['position'])
@@ -498,10 +476,6 @@ def replay(args):
                         feature_overlay.log(i, (width, height), (preview.shape[1], preview.shape[0]))
                         rr.log(f'metrics/tracks/cam{i}', rr.Scalars(result['observations'][i]))
                     rr.log('metrics/timing/process_ms', rr.Scalars(result['process_ms']))
-                    if depth_worker:
-                        for depth_event in depth_worker.poll():
-                            log_depth_result(depth_event, frames[0][0], depth_worker.config.cloud_stride)
-                        rr.set_time('elapsed', duration=elapsed)
                     if truth:
                         j = int(np.searchsorted(truth_stamps, stamp))
                         nearest = min((k for k in (j - 1, j) if 0 <= k < len(truth)),
@@ -551,12 +525,6 @@ def replay(args):
             'recording': str(args.output / 'playback.rrd'),
             'visualization_alignment': 'reference transformed to first estimated body pose, no scale correction',
         }
-        if depth_worker:
-            summary['da3'] = depth_worker.finish()
-            summary['wall_seconds'] = time.monotonic() - started
-            for depth_event in depth_worker.poll():
-                log_depth_result(depth_event, frames[0][0], depth_worker.config.cloud_stride)
-            rr.set_time('elapsed', duration=(frames[-1][0]-frames[0][0])/1e9)
         if truth and len(estimates) >= 3:
             evaluation = evaluate(truth, estimates, 10_000_000)
             (args.output / 'evaluation.json').write_text(json.dumps(evaluation, indent=2) + '\n')
@@ -583,8 +551,6 @@ def replay(args):
         (args.output / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
         print(json.dumps(summary, indent=2), flush=True)
     finally:
-        if depth_worker and depth_worker.thread.is_alive():
-            depth_worker.abort()
         bag.connection.close()
         rr.disconnect()
 
@@ -610,7 +576,6 @@ def main():
     parser.add_argument('--config', type=Path, default=REPO / 'configs/graco/aerial_vio.json')
     parser.add_argument('--binary', type=Path, default=REPO / 'target/release/examples/basalt_stream_vio')
     parser.add_argument('--online-loop-config', type=Path, help='JIST/XFeat/LighterGlue TensorRT engine bundle config')
-    parser.add_argument('--da3-config', type=Path, help='WIP pose-conditioned five-keyframe DA3 TensorRT depth; gate inference on new FOV coverage; select pose-only or landmark depth scale in the config')
     parser.add_argument('--imu-startup', choices=['stationary', 'legacy', 'stationary-gravity', 'stationary-motion'], default='stationary',
                         help='Default: stationary gyro-only initialization; legacy explicitly bypasses the startup gate')
     parser.add_argument('--imu-noise-scale', type=float, default=1.0,

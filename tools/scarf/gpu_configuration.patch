@@ -1,0 +1,38 @@
+diff --git a/scarf_slam/backends/depthanything.py b/scarf_slam/backends/depthanything.py
+index 9ca0a36..d709495 100644
+--- a/scarf_slam/backends/depthanything.py
++++ b/scarf_slam/backends/depthanything.py
+@@ -138,11 +138,13 @@ def do_processing(app, ts_sub, in_poses_dict, ph_views_per_batch, use_extrinsics
+             intrinsics=intrinsics_array,
+             align_to_input_ext_scale=True,
+             ref_view_strategy="saddle_balanced",
++            process_res=int(app.config.get("depth_process_res", 504)),
+         )
+     else:
+         predictions = app.model.inference(
+             image=image_data_lst,
+             intrinsics=intrinsics_array,
++            process_res=int(app.config.get("depth_process_res", 504)),
+         )
+         raise NotImplementedError(
+             "Requires additional implementation to align the predicted depth scale "
+diff --git a/scarf_slam/mapping_app.py b/scarf_slam/mapping_app.py
+index 8fa0747..626a395 100644
+--- a/scarf_slam/mapping_app.py
++++ b/scarf_slam/mapping_app.py
+@@ -1787,7 +1787,14 @@ class ScaRFSLAM():
+         # --- load model ---
+         if self.model_name == "da":
+             from depth_anything_3.api import DepthAnything3
+-            self.model = DepthAnything3.from_pretrained("depth-anything/DA3NESTED-GIANT-LARGE").to(device=self.device)
++            model_id = self.config.get("depth_model_id", "depth-anything/DA3NESTED-GIANT-LARGE")
++            dtype_name = self.config.get("depth_model_dtype", "float32")
++            dtypes = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
++            if dtype_name not in dtypes:
++                raise ValueError(f"Unsupported depth_model_dtype: {dtype_name}")
++            self.model = DepthAnything3.from_pretrained(model_id).to(
++                device=self.device, dtype=dtypes[dtype_name]
++            )
+             if self.config.get("torch_compile", False):
+                 # Compile only when requested; warmup batches are slower.
+                 compile_mode = self.config.get("torch_compile_mode", "default")

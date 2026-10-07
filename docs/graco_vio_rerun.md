@@ -15,10 +15,8 @@ TensorRT inference, see [online loop closure](online_vio_loop_tensorrt.md).
 Add `--online-loop-config target/loop_models/loop_config.json` after building
 the model bundle. The default global similarity threshold is 0.8.
 
-The **DA3 depth/dense-map path is WIP**. For pose-conditioned five-keyframe
-TensorRT depth, pose-only metric scaling, confidence/reprojection filtering
-and FOV novelty scheduling, see [online DA3 depth (WIP)](online_da3_depth.md).
-Enable the experiment with `--da3-config configs/graco/da3_five_view.json`.
+Dense reconstruction uses the offline [ScaRF-SLAM adapter](scarf_dense_mapping.md).
+The former online DA3 experiment has been removed.
 
 From the repository root, install/build and run:
 

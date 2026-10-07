@@ -1,0 +1,3 @@
+[submodule "third_party/ScaRF-SLAM"]
+	path = third_party/ScaRF-SLAM
+	url = https://github.com/ori-drs/ScaRF-SLAM.git

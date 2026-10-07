@@ -49,6 +49,11 @@ control); the native diagnostic completes all 17 stages **20.41×** faster with
 
 The [native Rust ROS2 pipeline](ros2/README.md) runs f64 Basalt VIO with stationary gyro-only startup per robot, SB-SLAM-style ten-keyframe sequence construction and 5×5 JIST frame refinement, XFeat/LighterGlue verification, and a centralized [GTSAM global BA backend with horizontal GPS](docs/global_bundle_adjustment.md). Joint BA is the default; visual BA and pose-graph optimization remain available. Robot and backend nodes use `rclrs` directly. ROS dependencies live in a separate workspace. See the [current VIO validation](ros2/F64_DEFAULT_VALIDATION.md) and [initial multi-robot validation](ros2/VALIDATION.md) for measured results and limitations.
 
+Dense reconstruction uses the [offline ScaRF-SLAM adapter](docs/scarf_dense_mapping.md)
+with calibrated RGB and completed visloc body trajectories. Its pinned source
+lives in `third_party/ScaRF-SLAM`; the Python/GPU environment is optional and
+separate from the Rust build.
+
 ## SfM and SLAM benchmarks
 
 visloc-rs registers **9,996/10,008 cameras (99.88%)** across every ETH3D

@@ -2,7 +2,7 @@
 
 The `robot` and `backend` executables are **Rust ROS2 nodes using rclrs directly**. They call the Basalt, TensorRT, and native GTSAM crates directly. GTSAM global BA with horizontal GPS is the default centralized backend, with PGO as an alternative. The ROS nodes have no C++ wrapper; the solver uses the existing GTSAM C ABI. Python scripts only publish dataset sensors, launch processes, evaluate results, and visualize them.
 
-The ROS-free algorithm crate is `pipelines/multi-robot`. The existing single-robot loop mode remains available unchanged. DA3 is an optional WIP display worker; distributed optimization, hybrid tracking, and joint estimator landmark optimization are excluded.
+The ROS-free algorithm crate is `pipelines/multi-robot`. The existing single-robot loop mode remains available unchanged. Dense reconstruction is a separate offline ScaRF-SLAM stage; distributed optimization and hybrid tracking are excluded.
 
 ```mermaid
 flowchart LR
@@ -257,16 +257,13 @@ Use `--min-observations`, `--min-parallax-deg`, `--reprojection-px`,
 config's `visualization_enabled` to false to disable its display writer for
 parity measurements. Neither the writer nor viewer changes Basalt inputs/state.
 
-For WIP dense mapping, add `--da3-config configs/graco/da3_five_view.json` to
-the mission launcher or live recorder. DA3 uses five actual VIO keyframes and
-the same robust landmark filtering before its coverage gate. The supplied
-profile uses pose-only depth scale, strict confidence/reprojection filtering,
-and camera-local clouds that follow PGO. See [DA3 depth](../docs/online_da3_depth.md)
-for queue diagnostics, input conventions, archives and current limitations.
+Dense reconstruction runs after replay using [ScaRF-SLAM](../docs/scarf_dense_mapping.md).
+The former DA3 worker and `--da3-config` recorder option have been removed.
 
-This is a visualization refinement; the backend still optimizes poses, and the
-refined display points are not fed to VIO or loop verification. Single-view and
-weak-parallax landmarks are hidden by default to prioritize stable geometry.
+Sparse display refinement is used with the PGO backend; global BA displays its
+jointly optimized landmarks. Refined display points are not fed to VIO or loop
+verification. Single-view and weak-parallax landmarks are hidden by default to
+prioritize stable geometry.
 The optional offline viewer uses the final graph and exports `.landmarks.csv`
 and `.landmarks.json` beside its RRD for inspection:
 

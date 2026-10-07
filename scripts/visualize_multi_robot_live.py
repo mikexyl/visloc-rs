@@ -53,7 +53,6 @@ class MissionFollower:
         self.graph_stat = None
         self.read_packets = 0
         self.camera_frames = []
-        self.depth_packets = []
         self.camera_calibration = {}
         self.latest_sensor_ns = self.mission.get('epoch_ns', 0)
 
@@ -67,7 +66,6 @@ class MissionFollower:
         """Read a bounded batch of complete live records, including session restarts."""
         received = 0
         self.camera_frames = []
-        self.depth_packets = []
         for robot in self.mission['robots']:
             root = self.root / 'robots' / robot['robot']
             for directory in [root, *sorted(root.glob('session-*'))]:
@@ -90,7 +88,6 @@ class MissionFollower:
                     for packet in self.tails.setdefault(journal, JsonTail(journal)).poll():
                         self._raw(packet['pose'])
                         self.map.ingest(packet['feature'], packet['pose'])
-                        self.depth_packets.append(packet)
                         received += 1
                 else:
                     # Compatibility with existing binaries: selected JIST frames
@@ -152,7 +149,7 @@ def display_landmarks(graph, display_map):
 
 
 class MissionPublisher:
-    def __init__(self, rr, mission, depth_stride=None):
+    def __init__(self, rr, mission):
         self.rr = rr
         palette = [[60,160,255], [255,140,50], [90,220,130], [210,100,240]]
         self.colors = {r['robot']: palette[i % len(palette)] for i, r in enumerate(mission['robots'])}
@@ -160,11 +157,6 @@ class MissionPublisher:
         self.cameras = CameraPublisher(rr, mission.get('epoch_ns', 0))
         self.components = set()
         self.camera_paths = ()
-        self.depth = None
-        self.depth_events = []
-        if depth_stride is not None:
-            from online_mission_depth import DensePublisher
-            self.depth = DensePublisher(rr, depth_stride)
         self.gps_revision = -1
 
     def publish(self, follower, elapsed):
@@ -198,9 +190,6 @@ class MissionPublisher:
             follow, images = self.cameras.views()
             rr.send_blueprint(rrb.Blueprint(rrb.Vertical(rrb.Horizontal(*views),
                 *([rrb.Horizontal(*follow, *images)] if follow else []),
-                *([rrb.Horizontal(*[rrb.Spatial2DView(origin=f'da3/{robot}/depth',
-                     name=f'{robot}: DA3 depth (WIP)') for robot in self.colors]),
-                   rrb.TextDocumentView(origin='da3/status', name='DA3 quality')] if self.depth else []),
                 rrb.TextDocumentView(origin='status', name='Live map')),
                 rrb.TimePanel(timeline='sensor' if camera_paths else 'live', play_state='Following'),
                 collapse_panels=True))
@@ -260,11 +249,6 @@ class MissionPublisher:
                     rr.log(path+'/'+group, rr.Points3D(cloud[group], colors=color, radii=.12))
                 rr.log(path+'/residuals', rr.LineStrips3D(cloud['residuals'], colors=[255,180,40]))
         self.landmarks.publish(points)
-        if self.depth:
-            self.depth.publish(self.depth_events, follower.graph)
-            self.depth_events = []
-            audit['depth_windows'] = len(self.depth.windows)
-            audit['depth_points'] = self.depth.points
         audit['camera_frames'] = self.cameras.image_frames
         audit['camera_images'] = self.cameras.image_count
         rr.log('status', rr.TextDocument(
@@ -292,7 +276,6 @@ def main():
     p.add_argument('--min-parallax-deg', type=float, default=1)
     p.add_argument('--reprojection-px', type=float, default=3)
     p.add_argument('--exit-when-finished', action='store_true')
-    p.add_argument('--da3-config', type=Path, help='Opt-in WIP DA3 using filtered VIO landmarks')
     args = p.parse_args()
     follower = MissionFollower(args.mission, **{k: getattr(args, k) for k in (
         'max_tracks', 'max_views', 'min_observations', 'min_parallax_deg', 'reprojection_px')})
@@ -306,15 +289,7 @@ def main():
     if args.connect:
         sinks.append(rr.GrpcSink(args.connect))
     rr.set_sinks(*sinks)
-    depth = None
-    if args.da3_config:
-        from online_da3 import Config
-        from online_mission_depth import MissionDepth
-        config = Config.from_path(args.da3_config)
-        if (follower.root / 'da3').exists():
-            p.error('DA3 output already exists; use a fresh mission directory')
-        depth = MissionDepth(config, follower.root / 'da3', follower.map.settings)
-    publisher = MissionPublisher(rr, follower.mission, depth.config.cloud_stride if depth else None)
+    publisher = MissionPublisher(rr, follower.mission)
     stopped = False
     def stop(*_):
         nonlocal stopped
@@ -327,19 +302,10 @@ def main():
         with output.with_suffix('.map.jsonl').open('w') as log:
             while True:
                 received = follower.poll()
-                if depth:
-                    depth.ingest(follower.depth_packets, follower.camera_frames)
-                    publisher.depth_events.extend(depth.poll())
                 publisher.cameras.publish(follower.camera_frames, follower.graph, time.monotonic() - start)
                 follower.map.refine_pending(seconds=.1, max_tracks=64)
                 idle = idle + 1 if not received else 0
                 finished = args.exit_when_finished and idle >= 2 and follower.finished()
-                if depth and (stopped or finished):
-                    summary = depth.finish()
-                    summary['complete'] = bool(finished and not stopped)
-                    depth.output.mkdir(parents=True, exist_ok=True)
-                    (depth.output / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
-                    publisher.depth_events.extend(depth.poll())
                 now = time.monotonic()
                 if now - last_publish >= 1 or stopped or finished:
                     audit = publisher.publish(follower, now - start)
@@ -350,8 +316,6 @@ def main():
                     break
                 time.sleep(.02)
     finally:
-        if depth and not depth.closed:
-            depth.abort()
         rr.get_global_data_recording().flush()
         rr.disconnect()
 

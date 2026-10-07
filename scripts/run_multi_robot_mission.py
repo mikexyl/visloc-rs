@@ -17,10 +17,7 @@ def main():
     p.add_argument('--profile-replay', action='store_true', help='Save Python replay timing to replay_profile.pstats')
     p.add_argument('--rerun-connect', help='Stream the online map to an existing Rerun gRPC endpoint')
     p.add_argument('--no-online-viewer', action='store_true', help='Disable the independent online display process')
-    p.add_argument('--da3-config', type=Path, help='Enable WIP dense mapping in the online recorder')
     args = p.parse_args()
-    if args.da3_config and args.no_online_viewer:
-        p.error('--da3-config requires the online recorder')
     mission = json.loads(args.mission.read_text())
     root = args.mission.resolve().parent
     env = dict(os.environ, ROS_DOMAIN_ID=str(args.domain_id), ROS_LOCALHOST_ONLY='1')
@@ -35,8 +32,6 @@ def main():
                        str(args.mission.resolve()), '--exit-when-finished']
             if args.rerun_connect:
                 command += ['--connect', args.rerun_connect]
-            if args.da3_config:
-                command += ['--da3-config', str(args.da3_config.resolve())]
             viewer = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT)
         for binary, key, config, name in [('backend', 'VISLOC_BACKEND_CONFIG', mission['backend_config'], 'backend')] + [
                 ('robot', 'VISLOC_ROBOT_CONFIG', r['config'], r['robot']) for r in mission['robots']]:
