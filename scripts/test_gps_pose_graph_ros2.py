@@ -46,7 +46,7 @@ def main():
     rclpy.init();node=GpsFixture();process=None
     with tempfile.TemporaryDirectory(prefix='visloc-gps-ros2-') as d:
         root=Path(d);config=root/'config.json';out=root/'backend'
-        config.write_text(json.dumps({'peers':['alpha'],'output':str(out),'pgo':{'gps':{'enabled':True,'origin':{'latitude':0.,'longitude':0.,'altitude':0.},'lever_arms_m':{'alpha':[0.,0.,0.]}}}}))
+        config.write_text(json.dumps({'peers':['alpha'],'output':str(out),'pgo':{'mode':'pose_graph','gps':{'enabled':True,'origin':{'latitude':0.,'longitude':0.,'altitude':0.},'lever_arms_m':{'alpha':[0.,0.,0.]}}}}))
         log=(root/'backend.log').open('w');env=dict(os.environ,VISLOC_BACKEND_CONFIG=str(config));binary=Path(os.environ.get('VISLOC_ROS_INSTALL',REPO/'.runtime/ros2_install'))/'visloc_ros/lib/visloc_ros/backend'
         def launch():return subprocess.Popen([str(binary),'--ros-args','-p','use_sim_time:=true'],env=env,stdout=log,stderr=subprocess.STDOUT)
         def checkpoint():

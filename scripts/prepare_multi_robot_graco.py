@@ -17,6 +17,7 @@ def main():
     p.add_argument('--max-frames', type=int)
     p.add_argument('--imu-startup', choices=['stationary', 'legacy', 'stationary-gravity', 'stationary-motion'], default='stationary')
     p.add_argument('--rate', type=float, default=.25)
+    p.add_argument('--backend', choices=['pose_graph', 'global_bundle_adjustment'], default='global_bundle_adjustment')
     p.add_argument('--fixed-last-frame', action='store_true')
     p.add_argument('--loop-config', type=Path, default=REPO / '.runtime/multi_robot_models/loop_config.json')
     p.add_argument('--min-similarity', type=float, help='Override JIST global cosine threshold for robots and backend (default: loop config, otherwise 0.8)')
@@ -56,7 +57,8 @@ def main():
                   'vio_config': str(REPO / 'configs/graco/aerial_vio.json'),
                   'loop_config': str(output / 'loop_config.json'),
                   'output': str(output / 'robots' / robot), 'reliable_sensors': True,
-                  'fixed_last_frame': args.fixed_last_frame,
+                  'fixed_last_frame': args.fixed_last_frame, 'gps': {'enabled': False},
+                  'bundle_adjustment_enabled': args.backend == 'global_bundle_adjustment',
                   'preprocess': {'raw_width': raw_sizes[0][0], 'raw_height': raw_sizes[0][1],
                     'intrinsics': [calibration['intrinsics'][0]['intrinsics'][v] for v in ('fx', 'fy', 'cx', 'cy')],
                     'distortion': stereo['cam0']['distortion_coeffs']}}
@@ -72,7 +74,7 @@ def main():
             'original_last_ns': frames[-1][0], 'offset_ns': mission['epoch_ns'] - frames[0][0],
             'truth': str(calibration_dir / 'ground_truth.csv')})
     backend = {'peers': peers, 'output': str(output / 'backend'),
-               'pgo': {'min_loop_similarity': similarity}}
+               'pgo': {'gps': {'enabled': False}, 'mode': args.backend, 'min_loop_similarity': similarity}}
     (output / 'backend.json').write_text(json.dumps(backend, indent=2) + '\n')
     mission['backend_config'] = str(output / 'backend.json')
     (output / 'mission.json').write_text(json.dumps(mission, indent=2) + '\n')

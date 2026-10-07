@@ -50,6 +50,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("backend/config.json"))?)?;
     raw.config = serde_json::from_value(config["pgo"].clone())?;
+    // This tool compares pose graphs and does not load bundle observations.
+    raw.config.mode = visloc_multi_robot::BackendMode::PoseGraph;
     for line in std::fs::read_to_string(root.join("backend/graph.jsonl"))?.lines() {
         let event: serde_json::Value = serde_json::from_str(line)?;
         if let Some(record) = event.get("keyframe") {

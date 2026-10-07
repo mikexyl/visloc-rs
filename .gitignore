@@ -1,7 +1,6 @@
 /target/
 /.runtime/
-/results/graco/
-/results/ucy/
+/results/
 /ros2/.cargo/
 /ros2/visloc_ros/.cargo/
 /ros2/log/

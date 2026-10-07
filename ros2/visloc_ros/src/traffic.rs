@@ -104,3 +104,23 @@ payload!(
     v,
     v.session.len() + v.fixes.iter().map(Payload::bytes).sum::<usize>() + 26
 );
+
+payload!(s::GetBundleHistory_Request, v, {
+    let _ = v;
+    8
+});
+payload!(
+    m::BundleFrame,
+    v,
+    v.key.bytes()
+        + 8
+        + v.views
+            .iter()
+            .map(|view| 96 + view.observations.len() * (8 + 16 + 1 + 24))
+            .sum::<usize>()
+);
+payload!(
+    s::GetBundleHistory_Response,
+    v,
+    v.session.len() + 10 + v.frames.iter().map(Payload::bytes).sum::<usize>()
+);

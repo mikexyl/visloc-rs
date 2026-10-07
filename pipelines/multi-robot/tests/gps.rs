@@ -35,6 +35,7 @@ fn fix(id: u64, x: f64, y: f64) -> GpsRecord {
 }
 fn backend() -> Backend {
     let mut b = Backend::default();
+    b.config.mode = BackendMode::PoseGraph;
     b.config.gps.enabled = true;
     b.config.gps.origin = Some(GpsDatum::from_lla([0., 0., 0.]));
     b.config
@@ -101,29 +102,12 @@ fn gps_without_loops_releases_horizontal_gauge_and_preserves_height_gravity() {
     );
 }
 #[test]
-fn gps_requires_explicit_opt_in_in_backend_configuration() {
-    assert!(!GpsConfig::default().enabled);
-    for value in [
-        serde_json::json!({}),
-        serde_json::json!({"gps": {}}),
-        serde_json::json!({"gps": {"max_hdop": 0.8}}),
-        serde_json::json!({"gps": {"enabled": false}}),
-    ] {
-        let config: backend::BackendConfig = serde_json::from_value(value).unwrap();
-        assert!(!config.gps.enabled);
-        let mut b = Backend::default();
-        b.config = config;
-        assert!(!b.insert_gps(fix(0, 0., 0.)).unwrap());
-        assert_eq!(b.input_revision, 0);
-        assert!(b.gps_datum.is_none());
-    }
-    let config: backend::BackendConfig =
-        serde_json::from_value(serde_json::json!({"gps": {"enabled": true}})).unwrap();
-    assert!(config.gps.enabled);
-}
-#[test]
 fn gps_disabled_is_exact_and_duplicates_are_idempotent() {
-    let mut off = Backend::default();
+    let mut off = backend();
+    off.config = serde_json::from_value(serde_json::json!({
+        "mode": "pose_graph", "gps": {"enabled": false}
+    }))
+    .unwrap();
     off.insert_keyframe(record(0, 0.)).unwrap();
     let revision = off.input_revision;
     assert!(!off.insert_gps(fix(0, 10., 20.)).unwrap());

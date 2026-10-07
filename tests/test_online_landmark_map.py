@@ -10,7 +10,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from online_landmark_map import OnlineLandmarkMap, RerunLandmarkPublisher
-from visualize_multi_robot_live import JsonTail, MissionFollower
+from visualize_multi_robot_live import JsonTail, MissionFollower, display_landmarks
 from test_landmark_visualization import identity, scene
 
 
@@ -25,6 +25,18 @@ def drain(display):
 
 
 class OnlineMapTests(unittest.TestCase):
+    def test_joint_ba_snapshot_uses_optimized_points_without_display_refinement(self):
+        graph = dict(backend_mode='global_bundle_adjustment', landmarks=[dict(
+            key=dict(robot='a', session='s', id=42), component=dict(robot='a', session='s', id=0),
+            position=[1., 2., 3.], observations=7)])
+        points, audit = display_landmarks(graph, OnlineLandmarkMap())
+        self.assertEqual(points[0]['position'], [1., 2., 3.])
+        self.assertEqual(points[0]['inliers'], 7)
+        self.assertFalse(points[0]['refinement_pending'])
+        self.assertEqual(audit['source'], 'gtsam_global_ba')
+        self.assertEqual(audit['pending_tracks'], 0)
+
+
     def test_map_appears_before_any_graph_exists_and_only_with_received_views(self):
         features, poses, truth = scene(4)
         display = OnlineLandmarkMap()
@@ -178,6 +190,14 @@ class OnlineMapTests(unittest.TestCase):
             self.assertFalse(follower.finished())
             follower.graph['revision'] = 2
             self.assertTrue(follower.finished())
+            # A BA revision owns display points and must not wait for redundant
+            # fixed-pose triangulation of the same tracks to finish.
+            follower.map.dirty[('a', 'first', 0)] = None
+            graph = dict(revision=3, poses=list(poses.values()), loops=[], components=1,
+                         backend_mode='global_bundle_adjustment', landmarks=[])
+            (root / 'backend/graph_snapshot.json').write_text(json.dumps(graph))
+            follower.poll()
+            self.assertFalse(follower.map.dirty)
             # Atomic replacement/truncation starts a fresh journal read.
             path.write_text('{}\n')
             self.assertEqual(follower.tails[path].poll(), [{}])

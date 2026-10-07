@@ -10,6 +10,8 @@ use visloc_gtsam::PoseGraph;
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BackendConfig {
+    pub mode: BackendMode,
+    pub bundle_adjustment: BundleConfig,
     pub min_loop_similarity: f32,
     pub odometry_translation_sigma: f64,
     pub odometry_rotation_sigma: f64,
@@ -20,6 +22,8 @@ pub struct BackendConfig {
 impl Default for BackendConfig {
     fn default() -> Self {
         Self {
+            mode: BackendMode::GlobalBundleAdjustment,
+            bundle_adjustment: BundleConfig::default(),
             min_loop_similarity: 0.8,
             odometry_translation_sigma: 0.15,
             odometry_rotation_sigma: 0.03,
@@ -32,6 +36,7 @@ impl Default for BackendConfig {
 
 impl BackendConfig {
     pub fn validate(&self) -> Result<()> {
+        self.bundle_adjustment.validate()?;
         if !(0.0..=1.0).contains(&self.min_loop_similarity) {
             return Err(Error("invalid loop similarity threshold".into()));
         }
@@ -51,6 +56,7 @@ impl BackendConfig {
 
 #[derive(Clone, Default)]
 pub struct Backend {
+    pub bundle_frames: BTreeMap<Key, BundleFrame>,
     pub records: BTreeMap<Key, KeyframeRecord>,
     pub loops: BTreeMap<Pair, LoopConstraint>,
     pub input_revision: u64,
@@ -60,6 +66,28 @@ pub struct Backend {
     pub config: BackendConfig,
 }
 impl Backend {
+    pub fn insert_bundle_frame(&mut self, frame: BundleFrame) -> Result<bool> {
+        frame.validate()?;
+        if self.config.mode != BackendMode::GlobalBundleAdjustment {
+            return Ok(false);
+        }
+        if self
+            .records
+            .get(&frame.key)
+            .is_some_and(|r| r.timestamp_ns != frame.timestamp_ns)
+        {
+            return Err(Error("BA/keyframe timestamp mismatch".into()));
+        }
+        if let Some(old) = self.bundle_frames.get(&frame.key) {
+            if serde_json::to_vec(old).unwrap() != serde_json::to_vec(&frame).unwrap() {
+                return Err(Error("conflicting BA retransmission".into()));
+            }
+            return Ok(false);
+        }
+        self.bundle_frames.insert(frame.key.clone(), frame);
+        self.input_revision += 1;
+        Ok(true)
+    }
     pub fn insert_gps(&mut self, record: GpsRecord) -> Result<bool> {
         self.config.gps.validate()?;
         record.validate()?;
@@ -87,6 +115,13 @@ impl Backend {
     pub fn insert_keyframe(&mut self, record: KeyframeRecord) -> Result<bool> {
         record.key.validate()?;
         record.body_to_odom.se3()?;
+        if self
+            .bundle_frames
+            .get(&record.key)
+            .is_some_and(|f| f.timestamp_ns != record.timestamp_ns)
+        {
+            return Err(Error("BA/keyframe timestamp mismatch".into()));
+        }
         if let Some(previous) = &record.previous {
             if !previous.same_session(&record.key) || previous.id >= record.key.id {
                 return Err(Error("invalid odometry predecessor".into()));
@@ -188,6 +223,7 @@ impl Backend {
         }
         let mut seen = BTreeSet::new();
         let mut result = GraphSnapshot {
+            backend_mode: self.config.mode,
             revision: previous.revision + 1,
             input_revision: self.input_revision,
             loops: self.loops.values().cloned().collect(),
@@ -347,7 +383,31 @@ impl Backend {
                     has_loop |= *is_loop;
                 }
             }
-            if (has_loop || !graph.gps_factors.is_empty()) && poses.len() > 1 {
+            if self.config.mode == BackendMode::GlobalBundleAdjustment {
+                let mut problem = crate::bundle::assemble(
+                    &self.config.bundle_adjustment,
+                    &self.bundle_frames,
+                    &poses,
+                    &self.ids,
+                    previous,
+                )?;
+                let report = graph
+                    .optimize_bundle(&mut problem.points, &problem.projections)
+                    .map_err(|e| Error(e.to_string()))?;
+                result.initial_cost += report.initial_cost;
+                result.final_cost += report.final_cost;
+                result.optimizer_reports.push(report);
+                for (id, point) in problem.points {
+                    let (key, observations) = &problem.identities[&id];
+                    result.landmarks.push(OptimizedLandmark {
+                        key: key.clone(),
+                        component: root.clone(),
+                        position: point.into(),
+                        observations: *observations,
+                    });
+                }
+                result.bundle_diagnostics.push(problem.diagnostics);
+            } else if (has_loop || !graph.gps_factors.is_empty()) && poses.len() > 1 {
                 let report = graph.optimize().map_err(|e| Error(e.to_string()))?;
                 result.initial_cost += report.initial_cost;
                 result.final_cost += report.final_cost;

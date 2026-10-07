@@ -242,6 +242,12 @@ impl Wire for c::GraphSnapshot {
             initial_cost: self.initial_cost,
             final_cost: self.final_cost,
             solve_ms: self.solve_ms,
+            backend_mode: match self.backend_mode {
+                c::BackendMode::PoseGraph => "pose_graph",
+                c::BackendMode::GlobalBundleAdjustment => "global_bundle_adjustment",
+            }
+            .into(),
+            landmarks: self.landmarks.iter().map(Wire::wire).collect(),
         }
     }
     fn from_wire(m: m::GraphSnapshot) -> Self {
@@ -262,6 +268,17 @@ impl Wire for c::GraphSnapshot {
             initial_cost: m.initial_cost,
             final_cost: m.final_cost,
             solve_ms: m.solve_ms,
+            backend_mode: if m.backend_mode == "global_bundle_adjustment" {
+                c::BackendMode::GlobalBundleAdjustment
+            } else {
+                c::BackendMode::PoseGraph
+            },
+            landmarks: m
+                .landmarks
+                .into_iter()
+                .map(c::OptimizedLandmark::from_wire)
+                .collect(),
+            bundle_diagnostics: Default::default(),
             gps: Default::default(),
             // Detailed optimizer diagnostics are persisted in backend journals.
             optimizer_reports: Default::default(),
@@ -344,5 +361,130 @@ impl Wire for c::GpsRecord {
             hdop: m.has_hdop.then_some(m.hdop),
             covariance_enu: m.has_covariance.then_some(m.covariance_enu),
         }
+    }
+}
+
+impl Wire for c::BundleFrame {
+    type Msg = m::BundleFrame;
+    fn wire(&self) -> Self::Msg {
+        m::BundleFrame {
+            key: self.key.wire(),
+            timestamp_ns: self.timestamp_ns,
+            views: self
+                .views
+                .iter()
+                .map(|v| m::CameraObservations {
+                    camera: v.camera.wire(),
+                    observations: v
+                        .observations
+                        .iter()
+                        .map(|o| m::LandmarkObservation {
+                            track_id: o.track_id,
+                            pixel: o.pixel,
+                            has_landmark: o.point_camera.is_some(),
+                            point_camera: o.point_camera.unwrap_or([0.; 3]),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+    fn from_wire(m: Self::Msg) -> Self {
+        Self {
+            key: c::Key::from_wire(m.key),
+            timestamp_ns: m.timestamp_ns,
+            views: m
+                .views
+                .into_iter()
+                .map(|v| c::CameraObservations {
+                    camera: c::CameraModel::from_wire(v.camera),
+                    observations: v
+                        .observations
+                        .into_iter()
+                        .map(|o| c::LandmarkObservation {
+                            track_id: o.track_id,
+                            pixel: o.pixel,
+                            point_camera: o.has_landmark.then_some(o.point_camera),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+impl Wire for c::OptimizedLandmark {
+    type Msg = m::OptimizedLandmark;
+    fn wire(&self) -> Self::Msg {
+        m::OptimizedLandmark {
+            key: self.key.wire(),
+            component: self.component.wire(),
+            position: self.position,
+            observations: self.observations as u32,
+        }
+    }
+    fn from_wire(m: Self::Msg) -> Self {
+        Self {
+            key: c::Key::from_wire(m.key),
+            component: c::Key::from_wire(m.component),
+            position: m.position,
+            observations: m.observations as usize,
+        }
+    }
+}
+
+#[cfg(test)]
+mod bundle_tests {
+    use super::*;
+    #[test]
+    fn complete_stereo_observation_and_graph_roundtrip() {
+        let frame = c::BundleFrame {
+            key: c::Key::new("a", "s", 7),
+            timestamp_ns: 1_790_502_544_606_403_113,
+            views: (0..2)
+                .map(|i| c::CameraObservations {
+                    camera: c::CameraModel {
+                        width: 640,
+                        height: 480,
+                        intrinsics: [400., 410., 320., 240.],
+                        camera_to_body: c::Transform {
+                            translation: [i as f64 * 0.095095, 0., 0.],
+                            ..Default::default()
+                        },
+                    },
+                    observations: vec![
+                        c::LandmarkObservation {
+                            track_id: 12,
+                            pixel: [120.25, 140.75],
+                            point_camera: Some([1., 2., 4.]),
+                        },
+                        c::LandmarkObservation {
+                            track_id: 13,
+                            pixel: [123., 134.],
+                            point_camera: None,
+                        },
+                    ],
+                })
+                .collect(),
+        };
+        assert_eq!(
+            serde_json::to_value(&frame).unwrap(),
+            serde_json::to_value(c::BundleFrame::from_wire(frame.wire())).unwrap()
+        );
+        let graph = c::GraphSnapshot {
+            backend_mode: c::BackendMode::GlobalBundleAdjustment,
+            landmarks: vec![c::OptimizedLandmark {
+                key: c::Key::new("a", "s", 12),
+                component: c::Key::new("a", "s", 0),
+                position: [1., 2., 3.],
+                observations: 4,
+            }],
+            ..Default::default()
+        };
+        let restored = c::GraphSnapshot::from_wire(graph.wire());
+        assert_eq!(restored.backend_mode, graph.backend_mode);
+        assert_eq!(
+            serde_json::to_value(restored.landmarks).unwrap(),
+            serde_json::to_value(graph.landmarks).unwrap()
+        );
     }
 }

@@ -122,7 +122,7 @@ pub struct GpsConfig {
 impl Default for GpsConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             origin: None,
             lever_arms_m: BTreeMap::new(),
             lever_sigma_m: 0.02,

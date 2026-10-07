@@ -49,6 +49,14 @@ pub struct GpsDiagnostic {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OptimizerReport {
+    #[serde(default)]
+    pub landmarks: usize,
+    #[serde(default)]
+    pub reprojection_factors: usize,
+    #[serde(default)]
+    pub reprojection_rmse_before_px: Option<f64>,
+    #[serde(default)]
+    pub reprojection_rmse_after_px: Option<f64>,
     pub solver: String,
     pub version: String,
     pub iterations: usize,
@@ -58,6 +66,18 @@ pub struct OptimizerReport {
     pub relative_factors: usize,
     pub gps_factors: usize,
 }
+/// A measured pixel in a calibrated camera attached rigidly to a body pose.
+#[derive(Clone, Debug)]
+pub struct ProjectionFactor {
+    pub pose: u64,
+    pub landmark: u64,
+    pub camera_to_body: SE3,
+    pub intrinsics: [f64; 4],
+    pub pixel: [f64; 2],
+    pub sigma: f64,
+    pub huber: f64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct PoseGraph {
     /// Body-to-map poses (never the old solver's inverse-pose convention).
@@ -93,9 +113,24 @@ impl PoseGraph {
             information,
         });
     }
-    /// On failure, neither poses nor diagnostics are changed. There is no
-    /// optimizer selector, fallback, subprocess, or Rust optimization code.
+    /// On failure, poses and diagnostics are unchanged. Optimization is native GTSAM.
     pub fn optimize(&mut self) -> Result<OptimizerReport> {
+        self.optimize_internal(None, &[])
+    }
+    /// Joint full-graph visual BA with metric between factors and fixed calibration.
+    /// Landmarks are eliminated before poses. All outputs commit atomically.
+    pub fn optimize_bundle(
+        &mut self,
+        landmarks: &mut BTreeMap<u64, Vector3<f64>>,
+        projections: &[ProjectionFactor],
+    ) -> Result<OptimizerReport> {
+        self.optimize_internal(Some(landmarks), projections)
+    }
+    fn optimize_internal(
+        &mut self,
+        landmarks: Option<&mut BTreeMap<u64, Vector3<f64>>>,
+        projections: &[ProjectionFactor],
+    ) -> Result<OptimizerReport> {
         let anchor = self.anchor.ok_or_else(|| Error("missing anchor".into()))?;
         let poses: Vec<_> = self
             .poses
@@ -133,6 +168,33 @@ impl PoseGraph {
                 }
             })
             .collect();
+        let points: Vec<_> = landmarks
+            .as_ref()
+            .map(|m| {
+                m.iter()
+                    .map(|(&id, p)| FfiLandmark {
+                        id,
+                        position: (*p).into(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let measurements: Vec<_> = projections
+            .iter()
+            .map(|p| FfiProjection {
+                pose: p.pose,
+                landmark: p.landmark,
+                camera_to_body: FfiPose::from_pose(0, &p.camera_to_body),
+                intrinsics: p.intrinsics,
+                pixel: p.pixel,
+                sigma: p.sigma,
+                huber: p.huber,
+            })
+            .collect();
+        let mut point_output = points.clone();
+        let rmse_before = landmarks
+            .as_ref()
+            .and_then(|m| projection_rmse(&self.poses, m, projections));
         let mut output = poses.clone();
         let mut diagnostics = vec![FfiGpsDiagnostic::default(); gps.len()];
         let mut report = FfiReport::default();
@@ -140,21 +202,44 @@ impl PoseGraph {
         // SAFETY: POD layouts match bridge.h, all input/output buffers remain
         // owned and live for this synchronous call, and C++ catches exceptions.
         let status = unsafe {
-            visloc_gtsam_solve(
-                poses.as_ptr(),
-                poses.len(),
-                edges.as_ptr(),
-                edges.len(),
-                gps.as_ptr(),
-                gps.len(),
-                anchor,
-                self.horizontal_anchor as u32,
-                output.as_mut_ptr(),
-                diagnostics.as_mut_ptr(),
-                &mut report,
-                error.as_mut_ptr(),
-                error.len(),
-            )
+            if landmarks.is_some() {
+                visloc_gtsam_solve_bundle(
+                    poses.as_ptr(),
+                    poses.len(),
+                    edges.as_ptr(),
+                    edges.len(),
+                    gps.as_ptr(),
+                    gps.len(),
+                    anchor,
+                    self.horizontal_anchor as u32,
+                    points.as_ptr(),
+                    points.len(),
+                    measurements.as_ptr(),
+                    measurements.len(),
+                    output.as_mut_ptr(),
+                    point_output.as_mut_ptr(),
+                    diagnostics.as_mut_ptr(),
+                    &mut report,
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+            } else {
+                visloc_gtsam_solve(
+                    poses.as_ptr(),
+                    poses.len(),
+                    edges.as_ptr(),
+                    edges.len(),
+                    gps.as_ptr(),
+                    gps.len(),
+                    anchor,
+                    self.horizontal_anchor as u32,
+                    output.as_mut_ptr(),
+                    diagnostics.as_mut_ptr(),
+                    &mut report,
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+            }
         };
         if status != 0 {
             // C++ always null-terminates this pre-zeroed error buffer.
@@ -177,7 +262,8 @@ impl PoseGraph {
             if p.id != input.id {
                 return Err(Error("output pose identity mismatch".into()));
             }
-            candidate.insert(p.id, p.pose()?);
+            let pose = p.pose()?;
+            candidate.insert(p.id, pose);
         }
         let before = self
             .poses
@@ -224,10 +310,31 @@ impl PoseGraph {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let mut candidate_points = BTreeMap::new();
+        for (input, point) in points.iter().zip(point_output) {
+            if input.id != point.id || !point.position.iter().all(|x| x.is_finite()) {
+                return Err(Error("invalid optimized landmark".into()));
+            }
+            candidate_points.insert(point.id, Vector3::from(point.position));
+        }
+        let rmse_after = projection_rmse(&candidate, &candidate_points, projections);
+        let is_bundle = landmarks.is_some();
+        if let Some(landmarks) = landmarks {
+            *landmarks = candidate_points;
+        }
         self.poses = candidate;
         self.gps_diagnostics = diagnostics;
         Ok(OptimizerReport {
-            solver: "gtsam_cpp".into(),
+            solver: if is_bundle {
+                "gtsam_global_ba"
+            } else {
+                "gtsam_cpp"
+            }
+            .into(),
+            landmarks: points.len(),
+            reprojection_factors: projections.len(),
+            reprojection_rmse_before_px: rmse_before,
+            reprojection_rmse_after_px: rmse_after,
             version: "4.3.0".into(),
             iterations: report.iterations as usize,
             initial_cost: report.initial_cost,
@@ -322,6 +429,66 @@ extern "C" {
         anchor: u64,
         horizontal_anchor: u32,
         output: *mut FfiPose,
+        gps_output: *mut FfiGpsDiagnostic,
+        report: *mut FfiReport,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> i32;
+}
+
+fn projection_rmse(
+    poses: &BTreeMap<u64, SE3>,
+    points: &BTreeMap<u64, Vector3<f64>>,
+    factors: &[ProjectionFactor],
+) -> Option<f64> {
+    if factors.is_empty() {
+        return None;
+    }
+    let mut cost = 0.;
+    for f in factors {
+        let camera = poses.get(&f.pose)?.compose(&f.camera_to_body).inverse();
+        let p = camera.rotation * points.get(&f.landmark)? + camera.translation;
+        if p.z <= 0. {
+            return None;
+        }
+        let [fx, fy, cx, cy] = f.intrinsics;
+        cost +=
+            (fx * p.x / p.z + cx - f.pixel[0]).powi(2) + (fy * p.y / p.z + cy - f.pixel[1]).powi(2);
+    }
+    Some((cost / factors.len() as f64).sqrt())
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FfiLandmark {
+    id: u64,
+    position: [f64; 3],
+}
+#[repr(C)]
+struct FfiProjection {
+    pose: u64,
+    landmark: u64,
+    camera_to_body: FfiPose,
+    intrinsics: [f64; 4],
+    pixel: [f64; 2],
+    sigma: f64,
+    huber: f64,
+}
+extern "C" {
+    fn visloc_gtsam_solve_bundle(
+        poses: *const FfiPose,
+        pose_count: usize,
+        edges: *const FfiBetween,
+        edge_count: usize,
+        gps: *const FfiGps,
+        gps_count: usize,
+        anchor: u64,
+        horizontal_anchor: u32,
+        landmarks: *const FfiLandmark,
+        landmark_count: usize,
+        projections: *const FfiProjection,
+        projection_count: usize,
+        output: *mut FfiPose,
+        landmark_output: *mut FfiLandmark,
         gps_output: *mut FfiGpsDiagnostic,
         report: *mut FfiReport,
         error: *mut c_char,

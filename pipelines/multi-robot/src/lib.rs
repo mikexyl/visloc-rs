@@ -1,6 +1,11 @@
 //! Transport-independent SB-SLAM sequence refinement. No ROS, ground truth, or
 //! corrected pose ever enters the local VIO estimator.
 pub mod backend;
+pub mod bundle;
+pub use bundle::{
+    BackendMode, BundleConfig, BundleDiagnostics, BundleFrame, CameraObservations,
+    LandmarkObservation, OptimizedLandmark,
+};
 pub mod geometry;
 #[cfg(feature = "native")]
 pub mod native;

@@ -1,6 +1,7 @@
-#include "factors.h"
+#include "ba_factors.h"
 #include <iostream>
 #include <tuple>
+#include <limits>
 
 using namespace visloc_gtsam;
 void require(bool yes, const char *message) {
@@ -23,17 +24,17 @@ VgGps fix(Key from, Key to, double alpha) {
   return out;
 }
 void check_derivatives(const NoiseModelFactor &factor, const Root &root,
-                       const Values &values) {
+                       const Values &values, Key point = std::numeric_limits<Key>::max()) {
   std::vector<Matrix> h(factor.keys().size());
   factor.unwhitenedError(values, &h);
   for (size_t i = 0; i < factor.keys().size(); ++i) {
     Key k = factor.keys()[i];
-    int n = k == root.key ? 3 : 6;
+    int n = (k == root.key || k == point) ? 3 : 6;
     Matrix numeric(h[i].rows(), n);
     for (int j = 0; j < n; ++j) {
       Values plus(values), minus(values);
       double eps = 1e-6;
-      if (k == root.key) {
+      if (k == root.key || k == point) {
         Vector3 d = Vector3::Zero();
         d[j] = eps;
         plus.update(k, Vector3(values.at<Vector3>(k) + d));
@@ -137,6 +138,25 @@ int main() {
     }
     require(rejected, "GPS Up information accepted");
     ++checks;
+    for (bool horizontal : {false, true}) {
+      Root gauge = root;
+      gauge.horizontal = horizontal;
+      for (Key body : {Key(0), Key(1)}) {
+        Values trial(values);
+        trial.insert(100, Point3(1., 2., 9.));
+        VgProjection projection{};
+        projection.pose = body;
+        projection.landmark = 100;
+        projection.camera_to_body = wire(0, Pose3(Rot3::Ypr(.1, -.02, .03), Point3(.1, -.03, .02)));
+        projection.intrinsics[0] = 400.; projection.intrinsics[1] = 420.;
+        projection.intrinsics[2] = 320.; projection.intrinsics[3] = 240.;
+        projection.pixel[0] = 110.; projection.pixel[1] = 230.;
+        projection.sigma = 1.5; projection.huber = 3.;
+        BodyProjection factor(gauge, projection, 100);
+        check_derivatives(factor, gauge, trial, 100);
+        ++checks;
+      }
+    }
     char error[256]{};
     VgReport report{};
     require(visloc_gtsam_solve(nullptr, 0, nullptr, 0, nullptr, 0, 0, 0,

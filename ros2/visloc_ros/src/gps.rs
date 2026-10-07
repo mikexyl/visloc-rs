@@ -15,13 +15,22 @@ use std::{
 use visloc_msgs::{msg as m, srv as s};
 use visloc_multi_robot::{GpsRecord, Key};
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct InputConfig {
     pub enabled: bool,
     /// Replay sends normalized, UTC-stamped records. Live input uses NavSatFix.
     pub normalized_input: bool,
     pub fix_topic: Option<String>,
+}
+impl Default for InputConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            normalized_input: false,
+            fix_topic: None,
+        }
+    }
 }
 enum Input {
     Record(GpsRecord),

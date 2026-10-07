@@ -1,8 +1,8 @@
 # Experimental horizontal GPS pose graph
 
-GPS is disabled by default. GPS is added to the centralized SE(3) pose graph only. Basalt, image/IMU calibration, initialization, tracking, and raw odometry are unchanged. No code from the abandoned tightly coupled GNSS estimator is imported. Neither node opens a GPS serial device. Ordinary profiles retain GPS-disabled operation and now use GTSAM for loop optimization.
+GPS is enabled by default in the centralized [joint global BA backend](global_bundle_adjustment.md#gps-factors-in-joint-ba). SE(3) pose-graph optimization remains available with `pgo.mode="pose_graph"`. Both `pgo.gps.enabled` and the robot adapter's `gps.enabled` default to `true`; explicit `false` disables them. Missing or rejected GPS leaves visual optimization available. New RealSense missions prepare normalized receiver records by default; use `--no-gps` to disable them. GRACO missions have no receiver stream and explicitly disable GPS.
 
-Both the backend's `pgo.gps.enabled` and the robot adapter's `gps.enabled` default to `false`, including when the GPS section is omitted or contains only other settings. Set both to `true` explicitly to run a GPS experiment. Ordinary mission generation leaves them disabled; the GPS experiment preparation script creates separately named GPS-off and GPS-on profiles.
+Basalt, image/IMU calibration, initialization, tracking, and raw odometry are unchanged. No code from the abandoned tightly coupled GNSS estimator is imported. Neither node opens a GPS serial device.
 
 The [native GTSAM C++ wrapper](gtsam_pose_graph.md) is now the sole optimizer for the centralized backend and the single-robot loop worker. The custom Rust optimizer path, experimental Rust GPS factors and Python worker have been removed. There is no optimizer selector or fallback.
 
@@ -48,13 +48,18 @@ Use the September 27 stereo cache with f64 Basalt, stationary gyro-only initiali
 bash scripts/build_gtsam_native.sh
 CARGO_NET_OFFLINE=true bash scripts/build_multi_robot_ros2.sh
 cargo build --offline --release -p visloc-multi-robot --examples
-.runtime/graco-venv/bin/python scripts/prepare_gps_pose_graph.py SOURCE_MISSION NEW_RESULT --rate .25
+.runtime/graco-venv/bin/python scripts/prepare_gps_pose_graph.py SOURCE_MISSION NEW_RESULT --backend pose_graph --rate .25
 # Source scripts/source_multi_robot_ros2.bash before either native ROS replay.
 .runtime/graco-venv/bin/python scripts/run_multi_robot_mission.py NEW_RESULT/gps_off/mission.json --domain-id 222
 .runtime/graco-venv/bin/python scripts/run_multi_robot_mission.py NEW_RESULT/gps_on/mission.json --domain-id 223
 python3 scripts/run_gps_pose_graph_ablation.py NEW_RESULT
 .runtime/evo-venv/bin/python scripts/evaluate_gps_pose_graph.py NEW_RESULT PPK_GROUND_TRUTH.csv
 ```
+
+The preparation script defaults to GPS-off/on joint BA profiles with keyframe
+observation transport enabled. Pass `--backend pose_graph` for the
+pose-graph comparison above. The six-way `run_gps_pose_graph_ablation.py`
+comparison remains a pose-graph experiment; use the paired ROS missions for BA.
 
 All six backend comparisons share frozen VIO keyframes and verified loops: raw, loops, horizontal GPS with Huber/switchable, loops plus horizontal GPS with Huber/switchable. Evaluation uses external evo, common valid timestamps, 20 ms association, rigid alignment, no scale or time-offset fitting, and the same nominal antenna compensation. Final graph corrected full trajectories and final keyframes are reported separately. PPK supplies positions only, so short-interval displacement-vector error is reported instead of inventing reference orientations for SE(3) RPE. Retain the earlier uncompensated result for continuity. PPK coverage is incomplete and shares rover observations with the GPS input; neither aligned ATE nor the reference supports independent global-accuracy claims.
 

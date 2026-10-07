@@ -112,6 +112,8 @@ class MissionFollower:
         except FileNotFoundError:
             pass
         self.map.update_graph(self.graph)
+        if self.graph.get("backend_mode") == "global_bundle_adjustment":
+            self.map.dirty.clear()  # Jointly optimized points own the BA display.
         self.read_packets += received
         return received
 
@@ -127,6 +129,23 @@ class MissionFollower:
         # marker becomes visible. Do not exit with the penultimate graph.
         return (self.graph['revision'] >= marker['revision']
                 and not self.backlog() and not self.map.dirty)
+
+
+def display_landmarks(graph, display_map):
+    """A joint BA snapshot owns its points; do not triangulate them again for display."""
+    points, audit = display_map.snapshot()
+    if graph.get('backend_mode') == 'global_bundle_adjustment':
+        points = [dict(robot=p['key']['robot'], session=p['key']['session'],
+                       track_id=p['key']['id'], component=identity(p['component']),
+                       position=p['position'], inliers=p['observations'],
+                       reprojection_px=float('nan'), refinement_pending=False)
+                  for p in graph.get('landmarks', [])]
+        audit.update(displayed_landmarks=len(points), pending_tracks=0,
+                     observations_retained=sum(p['inliers'] for p in points),
+                     source='gtsam_global_ba')
+    else:
+        audit['source'] = 'fixed_pose_display_refinement'
+    return points, audit
 
 
 class MissionPublisher:
@@ -148,7 +167,7 @@ class MissionPublisher:
             import numpy as np
             rr.set_time('sensor', duration=np.timedelta64(
                 follower.latest_sensor_ns - follower.mission.get('epoch_ns', 0), 'ns'))
-        points, audit = follower.map.snapshot()
+        points, audit = display_landmarks(follower.graph, follower.map)
         poses = {identity(p['key']): p for p in follower.graph['poses']}
         for key, raw in follower.raw.items():
             poses.setdefault(key, dict(key=raw['key'], timestamp_ns=raw['timestamp_ns'],
@@ -240,7 +259,7 @@ class MissionPublisher:
             f"retained factors: {sum(d['reason']=='active' for d in follower.graph.get('gps', {}).get('diagnostics', []))}; "
             f"within tolerance: {sum(d.get('within_tolerance', False) for d in follower.graph.get('gps', {}).get('diagnostics', []))}. "
             "GPS markers projected to trajectory height.\n"
-            'Online point refinement with current poses held fixed. No feedback to VIO.'))
+            f"Landmark source: {audit['source']}. No feedback to VIO."))
         for key in ('displayed_landmarks', 'pending_tracks', 'observations_retained'):
             rr.log('metrics/map/' + key, rr.Scalars(audit[key]))
         return audit

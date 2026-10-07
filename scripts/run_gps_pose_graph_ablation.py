@@ -12,7 +12,7 @@ def run(root,config_path,binary):
     output=root/'frozen';output.mkdir(exist_ok=False)
     config=json.loads(config_path.read_text());commands=[]
     for name in ['raw','loops','gps_huber','gps_switchable','loops_gps_huber','loops_gps_switchable']:
-        effective=json.loads(json.dumps(config));effective['gps']['enabled']='gps' in name
+        effective=json.loads(json.dumps(config));effective['mode']='pose_graph';effective['gps']['enabled']='gps' in name
         effective['gps']['robust_mode']='huber' if 'huber' in name else 'switchable'
         path=output/f'{name}_config.json';path.write_text(json.dumps(effective,indent=2)+'\n')
         command=[str(binary),str(source),str(root/'gps_records.jsonl'),str(path),str(robot['offset_ns']),str('loops' in name).lower(),str(output/name)]

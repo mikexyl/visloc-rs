@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare GPS-only graph experiments without changing the VIO sensor cache.
+"""Prepare GPS-off/on backend experiments without changing the VIO sensor cache.
 
 NMEA measurement UTC is reconstructed from RMC dates and matching GGA epochs.
 No PPK reference or trajectory is read here.
@@ -48,7 +48,7 @@ def normalize(bag, robot):
     fixes, gga, rmc = [], [], collections.defaultdict(list)
     with AnyReader([bag.resolve()], default_typestore=get_typestore(Stores.ROS2_HUMBLE)) as reader:
         connections = [c for c in reader.connections if c.topic in ('/gps/fix', '/gps/nmea')]
-        for connection, receipt, raw in reader.messages(connections=connections):
+        for connection, receipt, raw in (reader.messages(connections=connections) if connections else []):
             message = reader.deserialize(raw, connection.msgtype)
             if connection.topic == '/gps/fix':
                 fixes.append((receipt, message))
@@ -108,7 +108,7 @@ def normalize(bag, robot):
         raise ValueError('GPS measurement times are not strictly increasing')
     audit = dict(records=len(records),qualities=dict(collections.Counter(r['quality'] for r in records)),
                  unknown_covariance=sum(r['covariance_enu'] is None for r in records),
-                 receipt_minus_measurement_ms=dict(zip(['min','median','p95','max'],np.quantile(latencies,[0,.5,.95,1]).tolist())),
+                 receipt_minus_measurement_ms=dict(zip(['min','median','p95','max'],np.quantile(latencies,[0,.5,.95,1]).tolist() if latencies else [])),
                  time_policy='RMC date + matching GGA UTC epoch; no fitted offset; camera calibration remains in immutable cache')
     return records, pairing, audit
 
@@ -133,7 +133,45 @@ def lever_arm(calibration):
                             provenance='Nominal D455f rear mount / CH7604A casing geometry; measured unrectified optical-to-IMU transform; phase centre not calibrated')
 
 
-def prepare(source_mission, output, rate, frames=None):
+def backend_gps_config(robot, arm):
+    """The validated South-ece GPS BA quality/robustness settings."""
+    return dict(enabled=True, lever_arms_m={robot: arm}, lever_sigma_m=.02,
+                unknown_horizontal_sigma_m=5., max_hdop=1., require_hdop=True,
+                max_reported_horizontal_sigma_m=5., residual_deadband_sigma=1.,
+                robust_mode='switchable', switch_lambda=9., huber_delta=3.)
+
+
+def prepare_inputs(bag, robot, calibration, output, enabled=True, arm_override=None):
+    """Prepare receiver measurements only; absent GPS leaves visual BA available.
+
+    The nominal lever is specific to the calibrated South-ece rig. Other rigs
+    must supply a measured IMU-frame arm; silently assuming zero is not valid.
+    """
+    if not enabled:
+        return dict(enabled=False), dict(enabled=False), None
+    records, mapping, audit = normalize(bag, robot)
+    if records:
+        if arm_override is None:
+            arm, mount = lever_arm(calibration)
+        else:
+            arm = list(arm_override)
+            if len(arm) != 3 or not all(np.isfinite(arm)):
+                raise ValueError('GPS lever arm must contain three finite IMU-frame metres')
+            mount = dict(imu_lever_m=arm, sigma_m=.02, nominal=False,
+                         provenance='Explicit --gps-lever-arm in IMU/body frame')
+        (output/'gps_calibration.json').write_text(json.dumps(mount, indent=2)+'\n')
+    audit['enabled'] = bool(records)
+    audit['status'] = 'receiver_records_available' if records else 'no_receiver_records_visual_only'
+    (output/'gps_input_audit.json').write_text(json.dumps(audit, indent=2)+'\n')
+    (output/'gps_timestamp_mapping.json').write_text(json.dumps(mapping, indent=2)+'\n')
+    if not records:
+        return dict(enabled=False), dict(enabled=False), None
+    path = output/'gps_records.jsonl'
+    path.write_text(''.join(json.dumps(r, allow_nan=False)+'\n' for r in records))
+    return dict(enabled=True, normalized_input=True), backend_gps_config(robot, arm), str(path)
+
+
+def prepare(source_mission, output, rate, frames=None, backend_mode=None):
     if output.exists():
         raise FileExistsError(f'Refusing to overwrite {output}')
     source = json.loads(source_mission.read_text())
@@ -141,32 +179,37 @@ def prepare(source_mission, output, rate, frames=None):
         raise ValueError('South-ece preparation expects one robot')
     robot = source['robots'][0]
     original_config = json.loads(Path(robot['config']).read_text())
-    arm, calibration = lever_arm(Path(original_config['calibration']))
-    records, mapping, audit = normalize(Path(robot['bag']), robot['robot'])
+    original_backend = json.loads(Path(source['backend_config']).read_text())
+    mode = backend_mode or 'global_bundle_adjustment'
+    if mode not in ('pose_graph', 'global_bundle_adjustment'):
+        raise ValueError(f'Unsupported backend mode: {mode}')
     output.mkdir(parents=True)
-    (output/'gps_records.jsonl').write_text(''.join(json.dumps(r,allow_nan=False)+'\n' for r in records))
-    (output/'gps_timestamp_mapping.json').write_text(json.dumps(mapping,indent=2)+'\n')
-    (output/'gps_input_audit.json').write_text(json.dumps(audit,indent=2)+'\n')
-    (output/'gps_calibration.json').write_text(json.dumps(calibration,indent=2)+'\n')
-    gps=dict(enabled=True,lever_arms_m={robot['robot']:arm},lever_sigma_m=.02,
-             unknown_horizontal_sigma_m=5.,max_hdop=1.,require_hdop=True,max_reported_horizontal_sigma_m=5.,residual_deadband_sigma=1.,robust_mode='switchable',switch_lambda=9.,huber_delta=3.)
-    (output/'gps_backend_config.json').write_text(json.dumps(dict(gps=gps),indent=2)+'\n')
-    for name, enabled in [('gps_off',False),('gps_on',True)]:
+    gps_input, gps, gps_records = prepare_inputs(
+        Path(robot['bag']), robot['robot'], Path(original_config['calibration']), output)
+    (output/'gps_backend_config.json').write_text(json.dumps(dict(mode=mode, gps=gps),indent=2)+'\n')
+    for name, requested in [('gps_off',False),('gps_on',True)]:
+        enabled = requested and gps_input['enabled']
         run=output/name;run.mkdir()
-        config=dict(original_config,output=str(run/'robots'/robot['robot']),gps=dict(enabled=enabled,normalized_input=True))
+        config=dict(original_config,output=str(run/'robots'/robot['robot']),
+                    bundle_adjustment_enabled=mode == 'global_bundle_adjustment',
+                    gps=dict(gps_input,enabled=enabled))
         (run/'robot.json').write_text(json.dumps(config,indent=2)+'\n')
-        backend=json.loads(Path(source['backend_config']).read_text())
-        backend.update(output=str(run/'backend'));backend.setdefault('pgo',{})['gps']=dict(gps,enabled=enabled)
+        backend=dict(original_backend, output=str(run/'backend'),
+                     pgo=dict(original_backend.get('pgo', {}), mode=mode, gps=dict(gps,enabled=enabled)))
         (run/'backend.json').write_text(json.dumps(backend,indent=2)+'\n')
         run_robot=dict(robot,config=str(run/'robot.json'))
         if frames:run_robot['frames']=min(frames,robot['frames'])
-        if enabled:run_robot['gps_records']=str(output/'gps_records.jsonl')
+        run_robot.pop('gps_records', None)
+        if enabled:run_robot['gps_records']=gps_records
         mission=dict(source,rate=rate,backend_config=str(run/'backend.json'),robots=[run_robot])
         (run/'mission.json').write_text(json.dumps(mission,indent=2)+'\n')
     (output/'source_mission.json').write_text(json.dumps(source,indent=2)+'\n')
-    print(json.dumps(audit,indent=2))
+    print((output/'gps_input_audit.json').read_text())
 
 if __name__=='__main__':
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('source_mission',type=Path);p.add_argument('output',type=Path)
-    p.add_argument('--rate',type=float,default=.25);p.add_argument('--frames',type=int);a=p.parse_args()
-    prepare(a.source_mission.resolve(),a.output.resolve(),a.rate,a.frames)
+    p.add_argument('--rate',type=float,default=.25);p.add_argument('--frames',type=int)
+    p.add_argument('--backend', choices=['pose_graph','global_bundle_adjustment'],
+                   default='global_bundle_adjustment', help='Backend for both profiles (default: global_bundle_adjustment)')
+    a=p.parse_args()
+    prepare(a.source_mission.resolve(),a.output.resolve(),a.rate,a.frames,a.backend)

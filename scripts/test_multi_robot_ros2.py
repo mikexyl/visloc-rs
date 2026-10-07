@@ -74,7 +74,7 @@ def main():
     rclpy.init();node=Fixture();process=None;log=None
     with tempfile.TemporaryDirectory(prefix='visloc-ros2-test-') as directory:
         root=Path(directory);config=root/'config.json'
-        config.write_text(json.dumps({'peers':['alpha','beta'],'output':str(root/'backend')}))
+        config.write_text(json.dumps({'peers':['alpha','beta'],'output':str(root/'backend'),'pgo':{'mode':'pose_graph','gps':{'enabled':False}}}))
         env=dict(os.environ,VISLOC_BACKEND_CONFIG=str(config));log=(root/'backend.log').open('w')
         def launch():
             return subprocess.Popen([str(Path(os.environ.get('VISLOC_ROS_INSTALL',REPO/'.runtime/ros2_install'))/'visloc_ros/lib/visloc_ros/backend'),'--ros-args','-p','use_sim_time:=true'],env=env,stdout=log,stderr=subprocess.STDOUT)

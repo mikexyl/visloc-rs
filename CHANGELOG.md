@@ -4,6 +4,17 @@ All notable changes to `visloc-rs` will be documented here.
 
 ## Unreleased
 
+- Default the centralized Rust ROS2 backend to native GTSAM global BA with
+  horizontal GPS, joint body poses/shared landmarks, full stereo observations,
+  restart recovery, and batched optimized landmarks in Rerun. Preserve explicit
+  GPS-off and PGO options; missing/rejected GPS leaves visual BA available.
+  South-ece frozen matched-keyframe ATE improves from 0.583 m to 0.544 m.
+- Remove the slower fixed-pose landmark pre-refinement path, the unused GPS-only
+  revision replay utility, and redundant configuration/serialization tests.
+  Share GPS input preparation across mission generators, ignore generated test
+  artifacts, and document current defaults, measured scope, and the missed
+  endpoint loop. See `docs/global_bundle_adjustment.md`.
+
 - Add an online ROS2 Rerun recorder with bounded landmark refinement, persistent
   landmark identities, and calibrated stereo camera entities with synchronized
   images and camera-follow views. Display processing follows pose-graph updates

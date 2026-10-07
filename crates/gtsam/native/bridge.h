@@ -28,6 +28,15 @@ typedef struct {
   double initial_cost, final_cost, solve_ms;
   uint64_t iterations;
 } VgReport;
+typedef struct {
+  uint64_t id;
+  double position[3];
+} VgLandmark;
+typedef struct {
+  uint64_t pose, landmark;
+  VgPose camera_to_body;
+  double intrinsics[4], pixel[2], sigma, huber;
+} VgProjection;
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,6 +45,15 @@ int visloc_gtsam_solve(const VgPose *poses, size_t pose_count,
                        const VgBetween *edges, size_t edge_count,
                        const VgGps *gps, size_t gps_count, uint64_t anchor,
                        uint32_t horizontal_anchor, VgPose *output,
+                       VgGpsDiagnostic *gps_output, VgReport *report,
+                       char *error, size_t error_capacity);
+int visloc_gtsam_solve_bundle(const VgPose *poses, size_t pose_count,
+                       const VgBetween *edges, size_t edge_count,
+                       const VgGps *gps, size_t gps_count, uint64_t anchor,
+                       uint32_t horizontal_anchor,
+                       const VgLandmark *landmarks, size_t landmark_count,
+                       const VgProjection *projections, size_t projection_count,
+                       VgPose *output, VgLandmark *landmark_output,
                        VgGpsDiagnostic *gps_output, VgReport *report,
                        char *error, size_t error_capacity);
 #ifdef __cplusplus

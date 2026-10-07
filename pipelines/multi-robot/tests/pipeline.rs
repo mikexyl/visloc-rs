@@ -158,10 +158,12 @@ fn configurable_similarity_retrieves_and_accepts_new_candidates() {
 
     let mut constraint = edge(key("a", 0), key("b", 0), t(-3., 0., 0.));
     constraint.similarity = 0.7;
-    assert!(Backend::default().insert_loop(constraint.clone()).is_err());
+    assert!(pose_graph_backend()
+        .insert_loop(constraint.clone())
+        .is_err());
     let config: BackendConfig =
         serde_json::from_value(serde_json::json!({"min_loop_similarity":0.7})).unwrap();
-    let mut backend = Backend::default();
+    let mut backend = pose_graph_backend();
     backend.config = config;
     let mut below = constraint.clone();
     below.similarity = 0.699;
@@ -198,7 +200,7 @@ fn invalid_similarity_configuration_is_rejected() {
 
 #[test]
 fn identity_dedup_and_conflicting_retransmissions() {
-    let mut b = Backend::default();
+    let mut b = pose_graph_backend();
     assert!(b.insert_keyframe(record("a", 0, 0.)).unwrap());
     assert!(!b.insert_keyframe(record("a", 0, 0.)).unwrap());
     assert!(b.insert_keyframe(record("b", 0, 0.)).unwrap());
@@ -207,7 +209,7 @@ fn identity_dedup_and_conflicting_retransmissions() {
 }
 #[test]
 fn disconnected_components_remain_independent_until_measured_bridge() {
-    let mut b = Backend::default();
+    let mut b = pose_graph_backend();
     for r in ["a", "b"] {
         for i in 0..4 {
             b.insert_keyframe(record(r, i, i as f64)).unwrap();
@@ -233,7 +235,7 @@ fn disconnected_components_remain_independent_until_measured_bridge() {
 }
 #[test]
 fn out_of_order_constraints_wait_for_real_endpoints() {
-    let mut b = Backend::default();
+    let mut b = pose_graph_backend();
     b.insert_loop(edge(key("a", 0), key("b", 0), t(-3., 0., 0.)))
         .unwrap();
     assert_eq!(b.solve(&GraphSnapshot::default()).unwrap().poses.len(), 0);
@@ -245,7 +247,7 @@ fn out_of_order_constraints_wait_for_real_endpoints() {
 }
 #[test]
 fn no_loop_graph_preserves_raw_vio() {
-    let mut b = Backend::default();
+    let mut b = pose_graph_backend();
     for i in (0..20).rev() {
         b.insert_keyframe(record("a", i, i as f64 * 0.31)).unwrap();
     }
@@ -382,7 +384,7 @@ fn restarted_sessions_do_not_collide_or_apply_temporal_exclusions() {
     let mut retrieval = Retrieval::default();
     retrieval.insert(old).unwrap();
     assert_eq!(retrieval.candidates(&new, 0.8).0.len(), 1);
-    let mut backend = Backend::default();
+    let mut backend = pose_graph_backend();
     backend.insert_keyframe(record("a", 0, 0.)).unwrap();
     let mut r = record("a", 0, 2.);
     r.key.session = "restarted".into();
@@ -412,4 +414,11 @@ fn bidirectional_verification_chooses_the_stronger_direction() {
         .unwrap()
         .compose(&expected.inverse());
     assert!(error.translation.norm() < 1e-4 && error.rotation.angle() < 1e-4);
+}
+
+fn pose_graph_backend() -> Backend {
+    let mut b = Backend::default();
+    b.config.mode = visloc_multi_robot::BackendMode::PoseGraph;
+    b.config.gps.enabled = false;
+    b
 }

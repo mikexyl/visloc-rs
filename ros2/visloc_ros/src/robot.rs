@@ -46,6 +46,9 @@ pub struct RobotConfig {
     /// Best-effort keyframe display journal; never changes estimator inputs.
     #[serde(default = "enabled")]
     pub visualization_enabled: bool,
+    /// Export all actual VIO keyframe observations for the default global BA backend.
+    #[serde(default = "enabled")]
+    pub bundle_adjustment_enabled: bool,
     #[serde(default = "default_capacity")]
     pub max_keyframes: usize,
     #[serde(default)]
@@ -87,23 +90,16 @@ mod config_tests {
     }
 
     #[test]
-    fn gps_input_requires_explicit_opt_in() {
+    fn gps_and_bundle_observations_default_on_with_explicit_opt_out() {
         let config: RobotConfig = serde_json::from_value(required_config()).unwrap();
-        assert!(!config.gps.enabled);
-        for gps in [
-            serde_json::json!({}),
-            serde_json::json!({"fix_topic": "/gps/fix"}),
-            serde_json::json!({"enabled": false}),
-        ] {
-            let mut value = required_config();
-            value["gps"] = gps;
-            let config: RobotConfig = serde_json::from_value(value).unwrap();
-            assert!(!config.gps.enabled);
-        }
-        let mut value = required_config();
-        value["gps"] = serde_json::json!({"enabled": true});
-        let config: RobotConfig = serde_json::from_value(value).unwrap();
         assert!(config.gps.enabled);
+        assert!(config.bundle_adjustment_enabled);
+        let mut value = required_config();
+        value["gps"] = serde_json::json!({"enabled": false});
+        value["bundle_adjustment_enabled"] = serde_json::json!(false);
+        let config: RobotConfig = serde_json::from_value(value).unwrap();
+        assert!(!config.gps.enabled);
+        assert!(!config.bundle_adjustment_enabled);
     }
 
     #[test]
@@ -137,6 +133,7 @@ pub enum Event {
         process_ms: f64,
     },
     Keyframe(c::KeyframeRecord),
+    BundleFrame(c::BundleFrame),
     Sequence(c::Sequence, f64),
     Loop(c::LoopConstraint),
     Verified(c::Pair, c::Verification, f64, f64),
@@ -157,6 +154,7 @@ pub struct History {
     pub loops: Vec<c::LoopConstraint>,
     pub descriptors: BTreeMap<c::Key, c::FrameDescriptors>,
     pub features: BTreeMap<c::Key, c::FeatureFrame>,
+    pub bundle_frames: Vec<c::BundleFrame>,
 }
 impl History {
     pub fn page(&self, r: s::GetHistory_Request) -> s::GetHistory_Response {
@@ -548,6 +546,19 @@ pub fn run(mut config: RobotConfig) -> AnyResult<()> {
     }
     let restored =
         crate::archive::restore(&root, &owner.robot, &owner.session, config.max_keyframes)?;
+    if config.bundle_adjustment_enabled {
+        let observed: std::collections::BTreeSet<_> =
+            restored.bundle_frames.iter().map(|f| &f.key).collect();
+        if restored
+            .keyframes
+            .iter()
+            .any(|r| !observed.contains(&r.key))
+        {
+            return Err(
+                "BA archive has keyframes without observations; use a new output directory".into(),
+            );
+        }
+    }
     let archived_keyframes = restored.keyframes.len();
     if root.exists() {
         config.output = root.join(format!("session-{}", owner.session));
@@ -744,6 +755,23 @@ pub fn run(mut config: RobotConfig) -> AnyResult<()> {
         },
     )?;
     let tx = input_tx;
+    let h = history.clone();
+    let bundle_enabled = config.bundle_adjustment_enabled;
+    let bundle_service = node.create_service::<s::GetBundleHistory, _>(
+        format!("/{}/slam/bundle_history", config.robot).as_str(),
+        move |r: s::GetBundleHistory_Request| {
+            let h = h.lock().unwrap();
+            let start = (r.cursor as usize).min(h.bundle_frames.len());
+            let end = (start + 16).min(h.bundle_frames.len());
+            s::GetBundleHistory_Response {
+                enabled: bundle_enabled,
+                session: h.session.clone(),
+                frames: h.bundle_frames[start..end].iter().map(Wire::wire).collect(),
+                cursor: end as u64,
+                more: end < h.bundle_frames.len(),
+            }
+        },
+    )?;
     let finish_service = node.create_service::<s::Finish, _>(
         format!("/{}/slam/finish", config.robot).as_str(),
         move |r: s::Finish_Request| s::Finish_Response {
@@ -839,6 +867,25 @@ pub fn run(mut config: RobotConfig) -> AnyResult<()> {
     )?;
     let mut log = std::fs::File::create(config.output.join("events.jsonl"))?;
     let mut keyframe_log = std::fs::File::create(config.output.join("keyframes.jsonl"))?;
+    let bundle_publisher = if config.bundle_adjustment_enabled {
+        Some(
+            node.create_publisher::<m::BundleFrame>(
+                format!("/{}/slam/bundle_frames", config.robot)
+                    .as_str()
+                    .reliable()
+                    .keep_last(64),
+            )?,
+        )
+    } else {
+        None
+    };
+    let mut bundle_log = if config.bundle_adjustment_enabled {
+        Some(std::fs::File::create(
+            config.output.join("bundle_frames.jsonl"),
+        )?)
+    } else {
+        None
+    };
     let mut loop_log = std::fs::File::create(config.output.join("loops.jsonl"))?;
     let robot = config.robot.clone();
     let output = config.output.clone();
@@ -853,6 +900,13 @@ pub fn run(mut config: RobotConfig) -> AnyResult<()> {
                         writeln!(log,"{}",serde_json::json!({"event":"vio","frame_id":frame_id,"timestamp_ns":timestamp_ns,"process_ms":process_ms}))?;
                     },
                     Event::Keyframe(record)=> {writeln!(keyframe_log,"{}",serde_json::to_string(&record)?)?;history.lock().unwrap().keyframes.push(record.clone());keyframes.publish(record.wire())?;},
+                    Event::BundleFrame(frame)=> {
+                        if let (Some(log), Some(publisher)) = (&mut bundle_log, &bundle_publisher) {
+                            writeln!(log,"{}",serde_json::to_string(&frame)?)?;
+                            history.lock().unwrap().bundle_frames.push(frame.clone());
+                            publisher.publish(frame.wire())?;
+                        }
+                    },
                     Event::Sequence(sequence,encoding_ms)=> {status.lock().unwrap().sequences+=1;sequences.publish(sequence.wire())?;writeln!(log,"{}",serde_json::json!({"event":"sequence_encoding","sequence":sequence.key,"encoding_ms":encoding_ms}))?;if comm_tx.try_send(Comm::Sequence(sequence)).is_err() {crate::traffic::dropped(crate::traffic::Queue::Communication);}},
                     Event::Loop(edge)=> {writeln!(loop_log,"{}",serde_json::to_string(&edge)?)?;history.lock().unwrap().loops.push(edge.clone());status.lock().unwrap().loops+=1;loops.publish(edge.wire())?;writeln!(log,"{}",serde_json::json!({"event":"accepted_loop","constraint":edge}))?;},
                     Event::Verified(pair,v,matching_geometry_ms,exchange_through_verification_ms)=> {pending.fetch_sub(1,Ordering::SeqCst);writeln!(log,"{}",serde_json::json!({"event":"verification","pair":pair,"diagnostic":v,"matching_geometry_ms":matching_geometry_ms,"exchange_through_verification_ms":exchange_through_verification_ms}))?;},
@@ -875,6 +929,7 @@ pub fn run(mut config: RobotConfig) -> AnyResult<()> {
         history_service,
         sequence_service,
         feature_service,
+        bundle_service,
         finish_service,
         announcement_sub,
         proposal_sub,

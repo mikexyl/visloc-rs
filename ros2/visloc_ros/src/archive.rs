@@ -54,6 +54,13 @@ pub fn restore(root: &Path, robot: &str, session: &str, capacity: usize) -> AnyR
         history.keyframes.extend(lines::<c::KeyframeRecord>(
             &directory.join("keyframes.jsonl"),
         )?);
+        for frame in lines::<c::BundleFrame>(&directory.join("bundle_frames.jsonl"))? {
+            frame.validate()?;
+            if frame.key.robot != robot {
+                return Err("BA archive robot mismatch".into());
+            }
+            history.bundle_frames.push(frame);
+        }
         history
             .loops
             .extend(lines::<c::LoopConstraint>(&directory.join("loops.jsonl"))?);
@@ -133,6 +140,19 @@ mod tests {
                 )
                 .unwrap();
             }
+            let mut bundle = std::fs::File::create(directory.join("bundle_frames.jsonl")).unwrap();
+            writeln!(
+                bundle,
+                "{}",
+                serde_json::to_string(&c::BundleFrame {
+                    key: key(0),
+                    timestamp_ns: 0,
+                    views: vec![]
+                })
+                .unwrap()
+            )
+            .unwrap();
+            write!(bundle, "{{\"key\":").unwrap();
             // Simulate interruption while writing the next journal record.
             write!(log, "{{\"key\":").unwrap();
             let descriptor = {
@@ -188,6 +208,11 @@ mod tests {
         assert!(restored.attempted_pairs.contains(&pair));
         assert_eq!(restored.session, "third");
         assert_eq!(restored.keyframes.len(), 20);
+        assert_eq!(restored.bundle_frames.len(), 2);
+        assert_ne!(
+            restored.bundle_frames[0].key.session,
+            restored.bundle_frames[1].key.session
+        );
         assert_eq!(restored.sequences.len(), 2);
         assert_eq!(restored.descriptors.len(), 2);
         assert_eq!(restored.features.len(), 10);

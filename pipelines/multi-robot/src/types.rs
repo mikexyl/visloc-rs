@@ -272,6 +272,12 @@ pub struct OptimizedPose {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GraphSnapshot {
+    #[serde(default = "legacy_backend_mode")]
+    pub backend_mode: crate::BackendMode,
+    #[serde(default)]
+    pub landmarks: Vec<crate::OptimizedLandmark>,
+    #[serde(default)]
+    pub bundle_diagnostics: Vec<crate::BundleDiagnostics>,
     pub revision: u64,
     pub input_revision: u64,
     pub poses: Vec<OptimizedPose>,
@@ -284,4 +290,9 @@ pub struct GraphSnapshot {
     pub optimizer_reports: Vec<visloc_gtsam::OptimizerReport>,
     #[serde(default)]
     pub gps: crate::gps::GpsSnapshot,
+}
+
+// Snapshots predating backend selection were produced by PGO.
+fn legacy_backend_mode() -> crate::BackendMode {
+    crate::BackendMode::PoseGraph
 }

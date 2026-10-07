@@ -15,6 +15,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
     let mut backend = Backend::default();
     backend.config = serde_json::from_slice::<BackendConfig>(&std::fs::read(&args[3])?)?;
+    // This tool compares pose graphs and does not load bundle observations.
+    backend.config.mode = visloc_multi_robot::BackendMode::PoseGraph;
     let offset: i64 = args[4].parse()?;
     let keep_loops: bool = args[5].parse()?;
     let output = PathBuf::from(&args[6]);

@@ -330,6 +330,25 @@ pub fn run(
         .visualization_enabled
         .then(|| crate::visualization::Writer::new(&config.output))
         .transpose()?;
+    let bundle_cameras = if config.bundle_adjustment_enabled {
+        (0..if stereo { 2 } else { 1 })
+            .map(|i| {
+                let cam = &calibration.cameras[i];
+                if cam.xi != 0. || cam.alpha != 0. {
+                    return Err("global BA requires rectified pinhole observations".into());
+                }
+                let (width, height) = calibration.resolutions[i];
+                Ok(visloc_multi_robot::CameraModel {
+                    width,
+                    height,
+                    intrinsics: [cam.fx, cam.fy, cam.cx, cam.cy],
+                    camera_to_body: Transform::from(calibration.camera_to_imu(i as _).unwrap()),
+                })
+            })
+            .collect::<AnyResult<Vec<_>>>()?
+    } else {
+        vec![]
+    };
     let camera_display = if config.visualization_enabled {
         let cameras = (0..if stereo { 2 } else { 1 })
             .map(|i| {
@@ -542,6 +561,43 @@ pub fn run(
                     kf_id += 1;
                     events.send(Event::Keyframe(record.clone()))?;
                     let map = adapter.estimator.map_points();
+                    if config.bundle_adjustment_enabled {
+                        if record.key.id as usize >= config.max_keyframes {
+                            return Err("configured BA keyframe capacity reached".into());
+                        }
+                        let views = bundle_cameras
+                            .iter()
+                            .enumerate()
+                            .map(|(i, camera)| {
+                                let inverse = pose
+                                    .compose(&camera.camera_to_body.se3().unwrap())
+                                    .inverse();
+                                visloc_multi_robot::CameraObservations {
+                                    camera: camera.clone(),
+                                    observations: result
+                                        .tracks
+                                        .observations
+                                        .iter()
+                                        .filter(|o| o.camera_id as usize == i)
+                                        .map(|o| visloc_multi_robot::LandmarkObservation {
+                                            track_id: o.track_id,
+                                            pixel: o.pixel.into(),
+                                            point_camera: map.get(&o.track_id).map(|p| {
+                                                (inverse.rotation * p + inverse.translation).into()
+                                            }),
+                                        })
+                                        .collect(),
+                                }
+                            })
+                            .collect();
+                        let frame = visloc_multi_robot::BundleFrame {
+                            key: record.key.clone(),
+                            timestamp_ns: t,
+                            views,
+                        };
+                        frame.validate()?;
+                        events.send(Event::BundleFrame(frame))?;
+                    }
                     let frame = Frame {
                         id: frame_id,
                         keyframe_index: record.key.id,

@@ -3,9 +3,9 @@
 GTSAM C++ is the **sole pose-graph optimizer** for the centralized multi-robot
 backend and the single-robot JIST loop worker. The custom optimizer path,
 experimental Rust GPS solver additions and Python process adapter were removed.
-There is no optimizer selector or fallback. ROS2 nodes remain native Rust
+GTSAM is also the solver for the default [global BA backend](global_bundle_adjustment.md); backend mode selects BA or PGO, not another solver library. ROS2 nodes remain native Rust
 `rclrs`; VIO, calibration, initialization, IMU processing and raw odometry are
-unchanged. GPS remains disabled in ordinary profiles.
+unchanged. The centralized backend defaults to GPS BA; the single-robot loop worker retains PGO.
 
 `crates/gtsam` provides a safe Rust snapshot API around a small C++ wrapper. Rust
 owns the pose/factor arrays and passes fixed-layout POD buffers through a

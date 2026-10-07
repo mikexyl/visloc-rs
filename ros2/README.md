@@ -1,8 +1,8 @@
 # Native Rust multi-robot visual-inertial SLAM
 
-The `robot` and `backend` executables are **Rust ROS2 nodes using rclrs directly**. They call the existing Basalt, TensorRT, and sparse SE(3) pose-graph crates. There is no new C++ ROS node, wrapper, or application C ABI. Python scripts only publish dataset sensors, launch processes, evaluate results, and visualize them.
+The `robot` and `backend` executables are **Rust ROS2 nodes using rclrs directly**. They call the Basalt, TensorRT, and native GTSAM crates directly. GTSAM global BA with horizontal GPS is the default centralized backend, with PGO as an alternative. The ROS nodes have no C++ wrapper; the solver uses the existing GTSAM C ABI. Python scripts only publish dataset sensors, launch processes, evaluate results, and visualize them.
 
-The ROS-free algorithm crate is `pipelines/multi-robot`. The existing single-robot loop mode remains available unchanged. DA3, distributed optimization, hybrid tracking, and joint landmark optimization are excluded.
+The ROS-free algorithm crate is `pipelines/multi-robot`. The existing single-robot loop mode remains available unchanged. DA3 is an optional WIP display worker; distributed optimization, hybrid tracking, and joint estimator landmark optimization are excluded.
 
 ```mermaid
 flowchart LR
@@ -257,6 +257,13 @@ Use `--min-observations`, `--min-parallax-deg`, `--reprojection-px`,
 config's `visualization_enabled` to false to disable its display writer for
 parity measurements. Neither the writer nor viewer changes Basalt inputs/state.
 
+For WIP dense mapping, add `--da3-config configs/graco/da3_five_view.json` to
+the mission launcher or live recorder. DA3 uses five actual VIO keyframes and
+the same robust landmark filtering before its coverage gate. The supplied
+profile uses pose-only depth scale, strict confidence/reprojection filtering,
+and camera-local clouds that follow PGO. See [DA3 depth](../docs/online_da3_depth.md)
+for queue diagnostics, input conventions, archives and current limitations.
+
 This is a visualization refinement; the backend still optimizes poses, and the
 refined display points are not fed to VIO or loop verification. Single-view and
 weak-parallax landmarks are hidden by default to prioritize stable geometry.
@@ -303,7 +310,10 @@ recordings. It uses the D455 calibration, left IR only at 640×480, f64 stationa
 gyro-only initialization, 0.75 IMU noise/bias multipliers, and JIST threshold 0.8.
 Separate acceleration samples are interpolated onto gyro timestamps; original
 integer timestamps and lossless compressed images are retained in a replay cache.
-Recorded GPS is retained separately and excluded from SLAM. Run the generated `mission.json`
+Recorded receiver GPS is normalized from GGA/RMC UTC and included in the default
+GTSAM global BA backend with its calibrated nominal antenna lever arm. Use
+`--no-gps` for visual BA; missing GPS also leaves visual BA available. PPK is never
+an estimator input. Run the generated `mission.json`
 through `scripts/run_multi_robot_mission.py`; visualization uses the same cached
 images. The default nominal playback rate is 1×, configurable with `--rate`.
 Use `--camera-mode stereo` to cache both IR streams and replay only exact-stamp
@@ -340,3 +350,12 @@ reports 0.781 m raw and 0.787 m loop-corrected translation RMSE, with rigid
 alignment and no scale fitting. It covers 656 matched reference epochs;
 reference gaps, strict quality flags, and the uncompensated antenna offset are
 documented. This offline evaluation does not feed GNSS into SLAM.
+
+## Default global bundle adjustment with GPS
+
+Both mission preparation scripts default to `global_bundle_adjustment`, sending
+full calibrated keyframe observations through Rust ROS2. RealSense missions
+enable receiver GPS by default; GRACO uses visual BA because it has no receiver
+stream. `--backend pose_graph` selects the alternative PGO backend. Robot BA
+observations and GPS ingestion are enabled by default, while explicit overrides
+remain supported. See [configuration, scope, and validation](../docs/global_bundle_adjustment.md).

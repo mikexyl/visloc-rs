@@ -6,3 +6,5 @@ uint32 components
 float64 initial_cost
 float64 final_cost
 float64 solve_ms
+string backend_mode
+OptimizedLandmark[] landmarks

@@ -63,7 +63,7 @@ class Replay(Node):
             stream['gps_index'] = 0
             stream['gps'] = []
             stream['gps_pub'] = None
-            if robot_config.get('gps', {}).get('enabled', False):
+            if robot_config.get('gps', {}).get('enabled', True) and robot.get('gps_records'):
                 stream['gps'] = [record for line in Path(robot['gps_records']).read_text().splitlines()
                                  if (record := json.loads(line))['timestamp_ns'] <= frames[-1][0]]
                 stream['gps_pub'] = self.create_publisher(GpsFix, f'/{name}/gps/normalized', reliable)

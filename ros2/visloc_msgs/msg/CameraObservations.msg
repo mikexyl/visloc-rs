@@ -1,0 +1,2 @@
+Camera camera
+LandmarkObservation[] observations

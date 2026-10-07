@@ -27,6 +27,7 @@ pub struct Config {
 enum Update {
     Keyframe(c::KeyframeRecord),
     Loop(c::LoopConstraint),
+    BundleFrame(c::BundleFrame),
     Gps(c::GpsRecord),
     Finish,
 }
@@ -79,6 +80,12 @@ pub fn run(config: Config) -> AnyResult<()> {
                     .unwrap()
                     .insert_gps(serde_json::from_value(r.clone())?)?;
             }
+            if let Some(r) = v.get("bundle_frame") {
+                state
+                    .lock()
+                    .unwrap()
+                    .insert_bundle_frame(serde_json::from_value(r.clone())?)?;
+            }
             if let Some(r) = v.get("loop") {
                 state
                     .lock()
@@ -108,6 +115,7 @@ pub fn run(config: Config) -> AnyResult<()> {
         })?;
     let mut subscriptions = Vec::new();
     let mut status_subscriptions = Vec::new();
+    let mut bundle_subscriptions = Vec::new();
     let active_sessions = Arc::new(Mutex::new(BTreeMap::<String, String>::new()));
     for robot in &config.peers {
         let active = active_sessions.clone();
@@ -125,6 +133,25 @@ pub fn run(config: Config) -> AnyResult<()> {
                 },
             )?,
         );
+        if config.pgo.mode == c::BackendMode::GlobalBundleAdjustment {
+            let tx = tx.clone();
+            bundle_subscriptions.push(
+                node.create_subscription(
+                    format!("/{robot}/slam/bundle_frames")
+                        .as_str()
+                        .reliable()
+                        .keep_last(64),
+                    move |r: m::BundleFrame| {
+                        if let Err(e) =
+                            tx.try_send(Update::BundleFrame(c::BundleFrame::from_wire(r)))
+                        {
+                            crate::traffic::dropped(crate::traffic::Queue::Graph);
+                            eprintln!("BA graph queue (history will recover): {e}");
+                        }
+                    },
+                )?,
+            );
+        }
         let tx = tx.clone();
         subscriptions.push(
             node.create_subscription(
@@ -193,6 +220,12 @@ pub fn run(config: Config) -> AnyResult<()> {
                     let mut gps_peers: Vec<(Client<s::GetGpsHistory>, u64, String)> = if config.pgo.gps.enabled {
                         config.peers.iter().map(|r| Ok((node.create_client(format!("/{r}/slam/gps_history").as_str())?, 0, String::new()))).collect::<AnyResult<_>>()?
                     } else { Vec::new() };
+                    let mut bundle_peers: Vec<(Client<s::GetBundleHistory>, u64, String)> =
+                        if config.pgo.mode == c::BackendMode::GlobalBundleAdjustment {
+                            config.peers.iter().map(|r| Ok((node.create_client(
+                                format!("/{r}/slam/bundle_history").as_str())?, 0, String::new())))
+                                .collect::<AnyResult<_>>()?
+                        } else { Vec::new() };
                     loop {
                         for peer in &mut peers {
                             if !peer.history.service_is_ready()? {
@@ -226,11 +259,29 @@ pub fn run(config: Config) -> AnyResult<()> {
                                 Err(e) => eprintln!("GPS history retries exhausted: {e}"),
                             }
                         }
+                        for (client, cursor, session) in &mut bundle_peers {
+                            if !client.service_is_ready()? { continue; }
+                            match crate::robot::request(&node, client, s::GetBundleHistory_Request { cursor: *cursor }) {
+                                Ok(mut page) => {
+                                    if !page.enabled { return Err("global BA requires bundle_adjustment_enabled on every robot".into()); }
+                                    if *session != page.session {
+                                        match crate::robot::request(&node, client, s::GetBundleHistory_Request { cursor: 0 }) {
+                                            Ok(first) => { *session = first.session.clone(); page = first; },
+                                            Err(e) => { eprintln!("BA history session reset failed: {e}"); continue; }
+                                        }
+                                    }
+                                    for record in page.frames { tx.send(Update::BundleFrame(c::BundleFrame::from_wire(record)))?; }
+                                    *cursor = page.cursor;
+                                },
+                                Err(e) => eprintln!("BA history retries exhausted: {e}"),
+                            }
+                        }
                         std::thread::sleep(Duration::from_millis(250));
                     }
                 })();
                 if let Err(e) = result {
                     eprintln!("graph history failed: {e}");
+                    let _ = std::fs::write(config.output.join("backend_error.txt"), e.to_string());
                 }
             })?;
     }
@@ -333,6 +384,7 @@ pub fn run(config: Config) -> AnyResult<()> {
     let _keep = (
         subscriptions,
         gps_subscriptions,
+        bundle_subscriptions,
         status_subscriptions,
         loop_sub,
         finish,
@@ -387,6 +439,11 @@ fn optimize(
                         writeln!(journal, "{}", serde_json::json!({"keyframe":r}))?;
                     }
                 }
+                Update::BundleFrame(r) => {
+                    if state.insert_bundle_frame(r.clone())? {
+                        writeln!(journal, "{}", serde_json::json!({"bundle_frame":r}))?;
+                    }
+                }
                 Update::Loop(r) => {
                     if state.insert_loop(r.clone())? {
                         writeln!(journal, "{}", serde_json::json!({"loop":r}))?;
@@ -413,7 +470,17 @@ fn optimize(
         }
         let dirty =
             state.lock().unwrap().input_revision != previous.input_revision || publish_recovered;
-        if (force || last_solve.elapsed() >= Duration::from_secs(1)) && (dirty || force) {
+        let complete = {
+            let graph = state.lock().unwrap();
+            config.pgo.mode != c::BackendMode::GlobalBundleAdjustment
+                || graph
+                    .records
+                    .keys()
+                    .all(|k| graph.bundle_frames.contains_key(k))
+        };
+        if ((force && complete) || last_solve.elapsed() >= Duration::from_secs(1))
+            && (dirty || (force && complete))
+        {
             let graph = state.lock().unwrap().clone();
             match graph.solve(&previous) {
                 Ok(snapshot) => {
@@ -430,7 +497,7 @@ fn optimize(
                     writeln!(
                         revisions,
                         "{}",
-                        serde_json::json!({"revision":snapshot.revision,"input_revision":snapshot.input_revision,"keyframes":snapshot.poses.len(),"loops":snapshot.loops.len(),"components":snapshot.components,"initial_cost":snapshot.initial_cost,"final_cost":snapshot.final_cost,"solve_ms":snapshot.solve_ms,"optimizer_reports":snapshot.optimizer_reports})
+                        serde_json::json!({"revision":snapshot.revision,"input_revision":snapshot.input_revision,"keyframes":snapshot.poses.len(),"loops":snapshot.loops.len(),"components":snapshot.components,"initial_cost":snapshot.initial_cost,"final_cost":snapshot.final_cost,"solve_ms":snapshot.solve_ms,"optimizer_reports":snapshot.optimizer_reports,"backend_mode":snapshot.backend_mode,"landmarks":snapshot.landmarks.len(),"bundle_diagnostics":snapshot.bundle_diagnostics})
                     )?;
                     for robot in &config.peers {
                         let mut out = std::fs::File::create(
@@ -449,31 +516,41 @@ fn optimize(
                     solutions.send(snapshot.clone())?;
                     previous = snapshot;
                     publish_recovered = false;
-                    if force {
+                    if force && complete {
                         atomic_json(
                             &config.output.join("communication.json"),
                             &crate::traffic::snapshot(),
                         )?;
+                        if config.pgo.mode == c::BackendMode::GlobalBundleAdjustment
+                            && previous.landmarks.is_empty()
+                        {
+                            return Err("global BA finished without any admitted landmarks".into());
+                        }
                         atomic_json(
                             &config.output.join("finished.json"),
                             &serde_json::json!({"revision":previous.revision,"input_revision":previous.input_revision}),
                         )?;
                     }
+                    if complete {
+                        force = false;
+                    }
                 }
                 Err(e) => {
-                    eprintln!("PGO rejected: {e}");
+                    eprintln!("Backend solution rejected: {e}");
                     writeln!(
                         revisions,
                         "{}",
                         serde_json::json!({"event":"rejected_solution","input_revision":graph.input_revision,"error":e.to_string()})
                     )?;
                     std::fs::write(config.output.join("optimizer_error.txt"), e.to_string())?;
+                    if complete {
+                        force = false;
+                    }
                 }
             }
             journal.flush()?;
             revisions.flush()?;
             last_solve = Instant::now();
-            force = false;
         }
     }
 }

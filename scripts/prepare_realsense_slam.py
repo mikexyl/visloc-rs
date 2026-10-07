@@ -2,7 +2,7 @@
 """Prepare a recorded RealSense ROS2 MCAP bag for our sequence-refinement SLAM.
 
 Left IR (or exact-timestamp stereo pairs) and synchronized IMU enter the estimator.
-GPS is exported separately for evaluation; original compressed images and
+Receiver GPS feeds the default global BA backend; PPK is never read. Original compressed images and
 integer sensor timestamps are preserved in the read-only replay cache.
 """
 import argparse
@@ -21,6 +21,7 @@ import yaml
 
 from realsense.calibration import prepare
 from realsense.sync import interpolate_imu
+from prepare_gps_pose_graph import prepare_inputs as prepare_gps_inputs
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'tools/browser_viewer'))
@@ -61,6 +62,11 @@ def main():
     p.add_argument('--calibration-dir', type=Path, default=REPO / 'configs/realsense/d455_1')
     p.add_argument('--loop-config', type=Path, default=REPO / '.runtime/multi_robot_models/loop_config.json')
     p.add_argument('--rate', type=float, default=1.)
+    p.add_argument('--backend', choices=['pose_graph', 'global_bundle_adjustment'], default='global_bundle_adjustment')
+    p.add_argument('--gps', action=argparse.BooleanOptionalAction, default=True,
+                   help='Use recorded receiver GPS in the backend when available (default: on)')
+    p.add_argument('--gps-lever-arm', type=float, nargs=3, metavar=('X', 'Y', 'Z'),
+                   help='Antenna lever arm in IMU/body metres; default: calibrated South-ece mount')
     p.add_argument('--camera-mode', choices=['mono', 'stereo'], default='mono')
     p.add_argument('--trim-imu-boundaries', action='store_true',
                    help='Exclude boundary images outside synchronized IMU coverage; preserve them in the cache and report exclusions')
@@ -189,8 +195,8 @@ def main():
         raise ValueError('Synchronized IMU does not cover the complete recorded image interval')
     with (output / 'gps_fixes.jsonl').open('w') as f:
         for row in fixes:
-            # Missing NavSatFix values are represented by null, never supplied
-            # to the sensor replay or interpreted as a zero-valued position.
+            # Preserve missing values in the raw audit. The normalized backend
+            # stream separately rejects invalid positions; null never means zero.
             row = {k: (None if isinstance(v, float) and not np.isfinite(v) else v) for k, v in row.items()}
             f.write(json.dumps(row, allow_nan=False) + '\n')
     with (output / 'gps_gga.jsonl').open('w') as f:
@@ -216,9 +222,13 @@ def main():
     shutil.copy2(REPO / 'configs/graco/aerial_vio.json', output / 'vio_config.json')
     chain = yaml.safe_load((args.calibration_dir / 'camchain-imucam.yaml').read_text())
     robot = 'ucy01'
-    robot_config = dict(robot=robot, peers=[robot], calibration=str(calibration_dir / 'basalt_calibration.json'),
+    gps_input, gps_backend, gps_records = prepare_gps_inputs(
+        args.bag, robot, calibration_dir / 'basalt_calibration.json', output,
+        enabled=args.gps, arm_override=args.gps_lever_arm)
+    robot_config = dict(gps=gps_input, robot=robot, peers=[robot], calibration=str(calibration_dir / 'basalt_calibration.json'),
                         vio_config=str(output / 'vio_config.json'), loop_config=str(output / 'loop_config.json'),
                         output=str(output / 'robots' / robot), reliable_sensors=True, loop_enabled=True,
+                        bundle_adjustment_enabled=args.backend == 'global_bundle_adjustment',
                         camera_mode=args.camera_mode, fixed_last_frame=False, preprocess=dict(raw_width=640, raw_height=480,
                             intrinsics=chain['cam0']['intrinsics'], distortion=chain['cam0']['distortion_coeffs']))
     if args.camera_mode == 'stereo':
@@ -226,13 +236,15 @@ def main():
             intrinsics=chain['cam1']['intrinsics'], distortion=chain['cam1']['distortion_coeffs'])
     (output / f'{robot}.json').write_text(json.dumps(robot_config, indent=2) + '\n')
     (output / 'backend.json').write_text(json.dumps(dict(peers=[robot], output=str(output / 'backend'),
-                                                       pgo=dict(min_loop_similarity=.8)), indent=2) + '\n')
+                                                       pgo=dict(mode=args.backend, min_loop_similarity=.8, gps=gps_backend)), indent=2) + '\n')
     mission = dict(rate=args.rate, epoch_ns=10**9, backend_config=str(output / 'backend.json'),
                    robots=[dict(robot=robot, bag=str(args.bag.resolve()), input_format='realsense_cache',
                                 sensor_cache=str(cache), config=str(output / f'{robot}.json'), frames=len(camera_times),
                                 camera_mode=args.camera_mode,
                                 original_first_ns=camera_times[0], original_last_ns=camera_times[-1],
                                 offset_ns=10**9-camera_times[0])])
+    if gps_records is not None:
+        mission['robots'][0]['gps_records'] = gps_records
     (output / 'mission.json').write_text(json.dumps(mission, indent=2) + '\n')
     print(json.dumps({k: v for k, v in audit.items() if k != 'metadata'}, indent=2))
     print(output / 'mission.json')

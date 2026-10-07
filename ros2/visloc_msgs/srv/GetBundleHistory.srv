@@ -1,0 +1,7 @@
+uint64 cursor
+---
+bool enabled
+string session
+BundleFrame[] frames
+uint64 cursor
+bool more
