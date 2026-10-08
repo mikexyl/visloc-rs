@@ -408,6 +408,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         corrected.flush()?;
         corrected_tum.flush()?;
     }
+    let timing = adapter.timing_breakdown_with_estimator();
+    if timing.enabled() {
+        timing.write_json(out.join("timing_breakdown.json"))?;
+    }
     fs::write(
         out.join("summary.json"),
         json!({"frames_processed":frame_id,"sensor_only":true,

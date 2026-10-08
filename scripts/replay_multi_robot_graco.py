@@ -184,7 +184,7 @@ class Replay(Node):
                     raise RuntimeError('Robot refused finish request')
         timing_log.close()
         self.spin_until(lambda: all(s.finished for s in self.status.values()), 180, 'loop workers draining')
-        # Let history recovery deliver the final graph tail before the final solve.
+        # Let history recovery deliver the final graph tail before final publication.
         expected = sum(s.keyframes for s in self.status.values())
         expected_loops = sum(s.loops for s in self.status.values())
         self.spin_until(lambda: self.latest_graph is not None and len(self.latest_graph.poses) == expected and len(self.latest_graph.loops) == expected_loops, 180, 'complete centralized graph')
@@ -213,14 +213,14 @@ class Replay(Node):
                             60, 'complete GPS graph records')
         previous_revision = self.latest_graph.revision
         future = self.backend_finish.call_async(Finish.Request(last_image_timestamp_ns=0))
-        self.spin_until(future.done, 15, 'backend final solve request')
+        self.spin_until(future.done, 15, 'backend drain request')
         if not future.result().accepted:
-            raise RuntimeError('Backend refused final solve')
+            raise RuntimeError('Backend refused drain')
         def final_graph_received():
-            # Finish acknowledges queueing, not completion. An ordinary solve
+            # Finish acknowledges queueing, not completion. An ordinary update
             # already in flight can also advance the revision. The supervised
             # local backend's atomic completion record identifies the actual
-            # final solve; still require its snapshot to arrive through DDS.
+            # final publication; still require its snapshot to arrive through DDS.
             if not self.backend_finished.exists():
                 return False
             finished = json.loads(self.backend_finished.read_text())
@@ -229,7 +229,7 @@ class Replay(Node):
                     and len(self.latest_graph.poses) == expected
                     and len(self.latest_graph.loops) == expected_loops)
         self.spin_until(final_graph_received,
-                        180, 'final optimized graph publication')
+                        180, 'final graph publication')
         summary = {'wall_seconds': time.monotonic()-started, 'robots': {}, 'topic_cdr_bytes': self.bytes,
                    'final_graph_revision': self.latest_graph.revision,
                    'final_graph_input_revision': self.latest_graph.input_revision,

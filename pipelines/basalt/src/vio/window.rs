@@ -30,6 +30,7 @@ use crate::imu::{
     whitened_preintegration_factor, whitened_preintegration_factor_upstream_f32_fej_mode,
     BiasRandomWalkNoise, ImuNoiseModel, ImuPreintegratedDelta,
 };
+use crate::parallel::map_ordered;
 use crate::timing::TimingStart;
 use crate::{BasaltNavState, TrackId};
 use crate::{TimingBreakdown, TimingBucket};
@@ -51,6 +52,9 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 use visloc_core::geometry::SE3;
+
+#[path = "f64_cost.rs"]
+mod f64_cost;
 
 pub const NAV_STATE_DOF: usize = 15;
 /// A retained keyframe pose has the six Basalt pose tangent coordinates
@@ -3102,7 +3106,7 @@ fn upstream_f32_apply_nav_delta(
 /// expose topology through `base()` but own/borrow all mutable trial values;
 /// this keeps factor order and the `LmProblem` API unchanged while allowing a
 /// clean trial to avoid cloning the whole window.
-trait WindowValueView {
+trait WindowValueView: Sync {
     fn base(&self) -> &WindowProblem;
     fn chart(&self) -> &DVector<f64>;
     fn block_nav(&self, index: usize) -> Option<BasaltNavState>;
@@ -4287,38 +4291,34 @@ impl WindowProblem {
         state: &DVector<f64>,
         state_step: &DVector<f64>,
     ) -> Vec<Option<Vector3<f64>>> {
-        let mut steps = Vec::with_capacity(self.landmarks.len());
-        for landmark_index in 0..self.landmarks.len() {
-            let Some(factor) = self.visual_factor(state, landmark_index) else {
-                steps.push(None);
-                continue;
-            };
-            let step = if self.scalar_mode == ScalarMode::UpstreamF32 {
-                back_substitute_landmark_upstream_f32_with_track(
-                    &factor,
-                    state_step,
-                    1e-10,
-                    Some(self.landmarks[landmark_index].track_id),
-                )
-            } else {
-                let reduced =
-                    reduce_landmark_factors(std::slice::from_ref(&factor), state.len(), 1e-10);
-                reduced
-                    .back_substitution
-                    .first()
-                    .and_then(|data| back_substitute_landmark(data, state_step, 1e-10))
-            };
-            let Some(step) = step else {
-                steps.push(None);
-                continue;
-            };
-            if step.len() == 3 && step.iter().all(|value| value.is_finite()) {
-                steps.push(Some(Vector3::new(step[0], step[1], step[2])));
-            } else {
-                steps.push(None);
-            }
-        }
-        steps
+        map_ordered(
+            0..self.landmarks.len(),
+            self.parallel_landmarks(),
+            |landmark_index| {
+                let factor = self.visual_factor(state, landmark_index)?;
+                let step = if self.scalar_mode == ScalarMode::UpstreamF32 {
+                    back_substitute_landmark_upstream_f32_with_track(
+                        &factor,
+                        state_step,
+                        1e-10,
+                        Some(self.landmarks[landmark_index].track_id),
+                    )
+                } else {
+                    let reduced =
+                        reduce_landmark_factors(std::slice::from_ref(&factor), state.len(), 1e-10);
+                    reduced
+                        .back_substitution
+                        .first()
+                        .and_then(|data| back_substitute_landmark(data, state_step, 1e-10))
+                };
+                let step = step?;
+                if step.len() == 3 && step.iter().all(|value| value.is_finite()) {
+                    Some(Vector3::new(step[0], step[1], step[2]))
+                } else {
+                    None
+                }
+            },
+        )
     }
 
     fn apply_landmark_steps(&mut self, steps: &[Option<Vector3<f64>>]) {
@@ -6487,6 +6487,9 @@ impl WindowTrialView<'_, '_> {
                 prior,
             );
         }
+        if !diagnostic_env_active() {
+            return self.cost_f64();
+        }
         checked_lm_linearization_cost(&self.linearize()?)
     }
 }
@@ -6500,14 +6503,24 @@ fn checked_lm_linearization_cost(linearization: &LmLinearization) -> Result<f64,
 }
 
 impl WindowProblem {
+    fn parallel_landmarks(&self) -> bool {
+        // The retained f32 oracle and thread-local diagnostic captures keep
+        // their original execution context. Production estimation is f64.
+        self.scalar_mode == ScalarMode::ExtendedF64 && !diagnostic_env_active()
+    }
+
     fn linearize_view<V: WindowValueView>(&self, values: &V) -> Result<LmLinearization, LmFailure> {
         let layout = self.layout();
         let mut factors = self.prior_factors_view(values);
-        for landmark_index in 0..self.landmarks.len() {
-            if let Some(factor) = self.visual_factor_view(values, landmark_index) {
-                factors.push(factor);
-            }
-        }
+        factors.extend(
+            map_ordered(
+                0..self.landmarks.len(),
+                self.parallel_landmarks(),
+                |landmark_index| self.visual_factor_view(values, landmark_index),
+            )
+            .into_iter()
+            .flatten(),
+        );
         for link in self.imu_links.iter().cloned() {
             if let Some(factor) = self.imu_factor_view(values, link.clone()) {
                 factors.push(factor);
@@ -6687,29 +6700,37 @@ impl LmProblem for WindowProblem {
         }
         let layout = self.layout();
         let mut factors = self.prior_factors(state);
-        for landmark_index in 0..self.landmarks.len() {
-            if let Some(factor) = self.visual_factor(state, landmark_index) {
-                // The clean UpstreamF32 reducer may retain one compact Q1/R
-                // payload per visual block.  Carry identity explicitly so
-                // that future trial recovery is mapped by landmark rather
-                // than inferred from factor order; callers without this
-                // optional metadata remain on the legacy path.
-                factors.push(
-                    factor
-                        .with_landmark_metadata(
-                            landmark_index,
-                            self.landmarks[landmark_index].track_id,
-                        )
-                        .with_visual_observation_ids(
-                            self.landmarks[landmark_index]
-                                .observations
-                                .iter()
-                                .map(|observation| (observation.state_index, observation.camera_id))
-                                .collect(),
-                        ),
-                );
-            }
-        }
+        factors.extend(
+            map_ordered(
+                0..self.landmarks.len(),
+                self.parallel_landmarks(),
+                |landmark_index| {
+                    self.visual_factor(state, landmark_index).map(|factor| {
+                        // The clean UpstreamF32 reducer may retain one compact Q1/R
+                        // payload per visual block.  Carry identity explicitly so
+                        // that future trial recovery is mapped by landmark rather
+                        // than inferred from factor order; callers without this
+                        // optional metadata remain on the legacy path.
+                        factor
+                            .with_landmark_metadata(
+                                landmark_index,
+                                self.landmarks[landmark_index].track_id,
+                            )
+                            .with_visual_observation_ids(
+                                self.landmarks[landmark_index]
+                                    .observations
+                                    .iter()
+                                    .map(|observation| {
+                                        (observation.state_index, observation.camera_id)
+                                    })
+                                    .collect(),
+                            )
+                    })
+                },
+            )
+            .into_iter()
+            .flatten(),
+        );
         for link in self.imu_links.iter().cloned() {
             if let Some(factor) = self.imu_factor(state, link.clone()) {
                 factors.push(factor);
@@ -6771,6 +6792,9 @@ impl LmProblem for WindowProblem {
     }
 
     fn cost(&self, state: &DVector<f64>) -> Result<f64, LmFailure> {
+        if self.scalar_mode == ScalarMode::ExtendedF64 && !diagnostic_env_active() {
+            return self.cost_f64(state);
+        }
         let linearization = self.linearize(state)?;
         // Upstream computeError evaluates the complete objective. Landmark
         // increments are recovered before trial_cost below, so there is no
@@ -6888,7 +6912,7 @@ impl LmProblem for WindowProblem {
         // Diagnostic/probe runs intentionally retain the owned clone and the
         // historical token path.  The clean preparation is one-shot, so it
         // must be dropped before delegating rather than accidentally reused.
-        if diagnostic_env_active() || self.scalar_mode != ScalarMode::UpstreamF32 {
+        if diagnostic_env_active() {
             drop(preparation);
             return self.trial_cost_timed_with_token(state, step, trial, timing);
         }
@@ -10775,6 +10799,72 @@ mod tests {
         let trial = problem.apply_step(&state, &step);
         let landmark_steps = problem.landmark_steps(&state, &step);
         (problem, state, step, trial, landmark_steps)
+    }
+
+    #[test]
+    fn f64_residual_only_cost_matches_full_linearization_for_base_and_trial() {
+        for pinhole in [false, true] {
+            for prior_kind in 0..3 {
+                let (mut problem, _, step, _, _) = visual_trial_fixture();
+                problem.scalar_mode = ScalarMode::ExtendedF64;
+                if pinhole {
+                    problem.camera.xi = 0.0;
+                    problem.camera.alpha = 0.0;
+                }
+                problem.cameras = vec![problem.camera; 2];
+                problem.cameras[1].fx += 13.0;
+                problem.t_imu_cam = vec![SE3::identity(), SE3::new(
+                    UnitQuaternion::from_scaled_axis(Vector3::new(0.01, -0.02, 0.03)),
+                    Vector3::new(0.095, 0.01, 0.0),
+                )];
+                let template = problem.landmarks[0].clone();
+                problem.landmarks = (0..35).map(|index| {
+                    let mut landmark = template.clone();
+                    landmark.track_id += index;
+                    landmark.inverse_distance = if index % 7 == 0 { 0.0 } else { 0.3 + index as f64 * 0.02 };
+                    // Same-camera identity, stereo, robust outliers, and an
+                    // out-of-window observation that contributes a zero row.
+                    landmark.observations.extend([
+                        WindowObservation { state_index: 0, camera_id: 0, pixel: Point2::new(330.0, 231.0) },
+                        WindowObservation { state_index: 0, camera_id: 1, pixel: Point2::new(310.0 + index as f64, 242.0) },
+                        WindowObservation { state_index: 99, camera_id: 0, pixel: Point2::new(0.0, 0.0) },
+                    ]);
+                    landmark
+                }).collect();
+                for index in 0..2 {
+                    let mut delta = ImuPreintegratedDelta::identity(Vector3::zeros(), Vector3::zeros());
+                    delta.delta_time = 0.03;
+                    // Exercise both the zero-covariance fallback and a coupled
+                    // positive-definite covariance with bias/velocity updates.
+                    if index == 1 {
+                        let a = nalgebra::SMatrix::<f64, 9, 9>::from_fn(|r, c| {
+                            if r == c { 1.0 } else { (r + c) as f64 * 0.003 }
+                        });
+                        delta.covariance = a * a.transpose();
+                    }
+                    problem.imu_links.push(WindowImuLink { from_index: index, to_index: index + 1, delta });
+                }
+                let state = problem.initial_state();
+                if prior_kind == 1 {
+                    problem.anchor_point = Some(state.rows(0, NAV_STATE_DOF).into_owned());
+                } else if prior_kind == 2 {
+                    problem.prior = Some(WindowPrior {
+                        frame_ids: vec![0],
+                        block_kinds: vec![WindowBlockKind::State],
+                        jacobian: DMatrix::identity(NAV_STATE_DOF, NAV_STATE_DOF),
+                        rhs: DVector::from_element(NAV_STATE_DOF, -0.13),
+                        fej_point: DVector::zeros(NAV_STATE_DOF),
+                    });
+                }
+                assert_eq!(problem.cost_f64(&state).unwrap().to_bits(), problem.linearize(&state).unwrap().cost.to_bits());
+                let mut step = step.clone();
+                step[21] = 0.01;
+                step[27] = -0.015;
+                let trial = problem.apply_step(&state, &step);
+                let view = WindowTrialView::from_step(&problem, &state, &step, &trial);
+                assert_eq!(view.cost_f64().unwrap().to_bits(), view.linearize().unwrap().cost.to_bits());
+            }
+        }
     }
 
     #[test]

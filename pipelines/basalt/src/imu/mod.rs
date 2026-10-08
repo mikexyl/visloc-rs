@@ -8,6 +8,8 @@ pub(crate) use factors::eigen_ldlt_solve_f32;
 pub(crate) use factors::trial_bias_cost_f32;
 pub(crate) use factors::trial_imu_quadratic_stages_f32;
 pub(crate) use factors::trial_preintegration_residual_f32;
+pub(crate) use factors::whitened_preintegration_residual;
+pub(crate) use factors::whitened_bias_random_walk_residual;
 pub use factors::{
     diagnostic_whiten_imu_raw_f32, imu_row_products_f32, preintegration_f32_expression_trace,
     preintegration_f32_rotation_producer_trace, preintegration_f32_stages,

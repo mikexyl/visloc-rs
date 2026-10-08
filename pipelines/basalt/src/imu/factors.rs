@@ -91,6 +91,23 @@ pub struct WhitenedBiasWalkFactor {
     pub residual: DVector<f64>,
 }
 
+/// Whiten the bias-corrected residual without constructing state Jacobians.
+pub(crate) fn whitened_preintegration_residual(
+    from: &BasaltNavState,
+    to: &BasaltNavState,
+    delta: &ImuPreintegratedDelta,
+    gravity_world: Vector3<f64>,
+) -> Result<DVector<f64>, ImuFactorError> {
+    if !delta.delta_time.is_finite() || delta.delta_time <= 0.0 {
+        return Err(ImuFactorError::InvalidDelta);
+    }
+    let value = sqrt_information(&delta.covariance)? * residual(from, to, delta, gravity_world);
+    if !value.iter().all(|x| x.is_finite()) {
+        return Err(ImuFactorError::InvalidCovariance);
+    }
+    Ok(DVector::from_iterator(9, value.iter().copied()))
+}
+
 /// Build a covariance- and bias-corrected preintegration factor.
 pub fn whitened_preintegration_factor(
     from: &BasaltNavState,
@@ -1405,19 +1422,36 @@ pub fn whitened_bias_random_walk_factor(
     let gyro_weight = noise.gyro_density / dt.sqrt();
     let accel_weight = noise.accel_density / dt.sqrt();
     let mut jacobian = DMatrix::zeros(6, 2 * NAV_STATE_DOF);
-    let mut residual = DVector::zeros(6);
+    let residual = whitened_bias_random_walk_residual(from, to, dt, noise)?;
     for axis in 0..3 {
         jacobian[(axis, 9 + axis)] = gyro_weight;
         jacobian[(axis, NAV_STATE_DOF + 9 + axis)] = -gyro_weight;
-        residual[axis] = (from.gyro_bias_rad_s[axis] - to.gyro_bias_rad_s[axis]) * gyro_weight;
         jacobian[(axis + 3, 12 + axis)] = accel_weight;
         jacobian[(axis + 3, NAV_STATE_DOF + 12 + axis)] = -accel_weight;
-        residual[axis + 3] = (from.accel_bias_m_s2[axis] - to.accel_bias_m_s2[axis]) * accel_weight;
     }
     Ok(WhitenedBiasWalkFactor {
         state_jacobian: jacobian,
         residual,
     })
+}
+
+pub(crate) fn whitened_bias_random_walk_residual(
+    from: &BasaltNavState,
+    to: &BasaltNavState,
+    dt: f64,
+    noise: BiasRandomWalkNoise,
+) -> Result<DVector<f64>, ImuFactorError> {
+    if !dt.is_finite() || dt <= 0.0 || !noise.is_valid() {
+        return Err(ImuFactorError::InvalidDelta);
+    }
+    let gyro_weight = noise.gyro_density / dt.sqrt();
+    let accel_weight = noise.accel_density / dt.sqrt();
+    let mut residual = DVector::zeros(6);
+    for axis in 0..3 {
+        residual[axis] = (from.gyro_bias_rad_s[axis] - to.gyro_bias_rad_s[axis]) * gyro_weight;
+        residual[axis + 3] = (from.accel_bias_m_s2[axis] - to.accel_bias_m_s2[axis]) * accel_weight;
+    }
+    Ok(residual)
 }
 
 /// Build the bias random-walk rows at Basalt's active `Scalar=float`

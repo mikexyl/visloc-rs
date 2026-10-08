@@ -183,7 +183,7 @@ def prepare_inputs(args):
     return report
 
 
-def run_mapper(args):
+def stage_mapper(args, extra_patches=()):
     source = ROOT / 'third_party/ScaRF-SLAM'
     revision = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
     if revision != SCARF_REVISION or subprocess.check_output(['git', '-C', str(source), 'status', '--porcelain']):
@@ -198,9 +198,8 @@ def run_mapper(args):
     subprocess.run(['tar', '-x', '-C', str(run_source)], input=archive, check=True)
     patch = ROOT / 'tools/scarf/gpu_configuration.patch'
     subprocess.run(['patch', '--batch', '--forward', '-p1', '-i', str(patch)], cwd=run_source, check=True)
-    command = [sys.executable, str(run_source / 'run_mapping.py'), '--slam_folder', str(args.output / 'mapping'),
-               '--image_folder', str(args.output / 'images'), '--poses', str(args.output / 'trajectory_rgb.txt'),
-               '--config', str(args.output / 'config.yaml')]
+    for extra in extra_patches:
+        subprocess.run(['patch', '--batch', '--forward', '-p1', '-i', str(extra)], cwd=run_source, check=True)
     env = dict(os.environ, OMP_NUM_THREADS='2', OPENBLAS_NUM_THREADS='2', PYTHONUNBUFFERED='1', MPLBACKEND='Agg')
     env.pop('PYTHONPATH', None)
     model_hashes = {p.name: sha256(p) for p in sorted(args.model.iterdir())
@@ -211,11 +210,22 @@ def run_mapper(args):
     if da3_revision != DA3_REVISION or subprocess.check_output(['git', '-C', str(da3_root), 'status', '--porcelain']):
         raise ValueError('DA3 must be installed editable from the clean pinned source; see tools/scarf/setup.sh')
     manifest = dict(scarf_revision=revision, da3_revision=da3_revision, gpu_patch_sha256=sha256(patch),
-                    model_hashes=model_hashes, command=command, python=sys.version,
+                    model_hashes=model_hashes, python=sys.version,
+                    extra_patches={p.name: sha256(p) for p in extra_patches},
                     environment={k: env[k] for k in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MPLBACKEND')})
     save_json(args.output / 'run.json', manifest)
     packages = sorted(f'{d.metadata["Name"]}=={d.version}' for d in importlib.metadata.distributions())
     (args.output / 'packages.txt').write_text('\n'.join(packages) + '\n')
+    return run_source, env, manifest
+
+
+def run_mapper(args):
+    run_source, env, manifest = stage_mapper(args)
+    command = [sys.executable, str(run_source / 'run_mapping.py'), '--slam_folder', str(args.output / 'mapping'),
+               '--image_folder', str(args.output / 'images'), '--poses', str(args.output / 'trajectory_rgb.txt'),
+               '--config', str(args.output / 'config.yaml')]
+    manifest['command'] = command
+    save_json(args.output / 'run.json', manifest)
     started = time.monotonic()
     with (args.output / 'mapping.log').open('w') as log:
         process = subprocess.run(command, cwd=run_source, env=env, stdout=log, stderr=subprocess.STDOUT)
@@ -232,7 +242,9 @@ def summarize(args, inputs, run):
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
-    clouds = list((args.output / 'mapping/recon/visloc').glob('pts_global*.pcd'))
+    config = yaml.safe_load((args.output / 'config.yaml').read_text())
+    folder = config['trajectory'] + ('_slam' if config.get('use_slam') else '')
+    clouds = list((args.output / 'mapping/recon' / folder).glob('pts_global*.pcd'))
     if len(clouds) != 1:
         raise ValueError(f'Expected one final ScaRF cloud, got {len(clouds)}; inspect mapping.log')
     path = clouds[0]

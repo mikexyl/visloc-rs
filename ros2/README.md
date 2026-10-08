@@ -2,7 +2,7 @@
 
 The `robot` and `backend` executables are **Rust ROS2 nodes using rclrs directly**. They call the Basalt, TensorRT, and native GTSAM crates directly. GTSAM global BA with horizontal GPS is the default centralized backend, with PGO as an alternative. The ROS nodes have no C++ wrapper; the solver uses the existing GTSAM C ABI. Python scripts only publish dataset sensors, launch processes, evaluate results, and visualize them.
 
-The ROS-free algorithm crate is `pipelines/multi-robot`. The existing single-robot loop mode remains available unchanged. Dense reconstruction is a separate offline ScaRF-SLAM stage; distributed optimization and hybrid tracking are excluded.
+The ROS-free algorithm crate is `pipelines/multi-robot`. The existing single-robot loop mode remains available unchanged. Dense reconstruction runs in a separate ScaRF-SLAM process, offline or following live GPS-BA revisions; distributed optimization and hybrid tracking are excluded.
 
 ```mermaid
 flowchart LR
@@ -88,7 +88,7 @@ above remains a separate, optional final-result playback.
 
 Replay mission directories must be new. A robot restarted with its existing config creates a new session subdirectory, restores its durable keyframe/loop records and sparse-feature archives, and continues serving earlier sessions. `active_session.json` identifies the current output directory. The keyframe capacity includes archived sessions. Use `--robots 5 7 --max-frames 400` for the two-robot smoke test. Defaults are **left camera only**, f64 Basalt with stationary gyro-only initialization, the existing aerial calibration, 800-pixel width, and 0.75 noise/bias multipliers. Right images and ground truth never enter the estimator. The source bags remain unchanged.
 
-Each first camera timestamp maps to a shared playback epoch; integer camera/IMU intervals remain exact. `mission.json` records every original-to-replay timestamp offset. One `/clock` accompanies playback. The first frame can initialize from the first IMU sample at/after its timestamp; an empty first integration interval is allowed, while later empty intervals are errors. The nominal rate is 0.25x with bounded backpressure, so overload slows replay. Robots receive concurrent batches, with at most one unacknowledged camera frame per robot. The final solve waits for VIO, loop workers, and graph history to drain.
+Each first camera timestamp maps to a shared playback epoch; integer camera/IMU intervals remain exact. `mission.json` records every original-to-replay timestamp offset. One `/clock` accompanies playback. The first frame can initialize from the first IMU sample at/after its timestamp; an empty first integration interval is allowed, while later empty intervals are errors. The nominal rate is 0.25x with bounded backpressure, so overload slows replay. Robots receive concurrent batches, with at most one unacknowledged camera frame per robot. Final publication waits for VIO, loop workers, and graph history to drain. BA solves only if a new loop is pending.
 
 The validation summary reports both nominal and effective playback rate. The
 replay keeps its executor attached and writes per-batch publication,
@@ -178,7 +178,7 @@ Composite IDs are `(robot, session, local_id)`; every estimator start generates 
 
 Edges store **T_to_from**, transforming points from the source body to the destination body. Information matrices are row-major, with tangent ordering **translation, then rotation**. Sequential measurements always derive from raw VIO poses. Stable internal solver IDs map composite identities.
 
-The central backend reuses visloc's sparse SE(3) LM with Huber delta 3, 20 iterations, and no more than one solve per second while dirty. Disconnected components solve separately with one anchor each. A verified bridge initializes the joining alignment and removes the redundant anchor. Only finite solutions whose robust objective does not increase are published. Failure retains the last published solution. The graph journal supports restart and peer history recovers its missing tail.
+The pose-graph alternative uses sparse SE(3) LM with Huber delta 3, 20 iterations, and no more than one solve per second while dirty. The default global BA path solves only when a new accepted loop is ready; ordinary keyframe/GPS updates publish poses carrying the previous correction, and final drain does not force BA. Solved loop identities persist across restarts. Disconnected components solve separately with one anchor each. A verified bridge initializes the joining alignment and removes the redundant anchor. Only finite solutions whose robust objective does not increase are published. Failure retains the last published solution. The graph journal supports restart and peer history recovers its missing tail.
 
 Defaults are odometry 0.15 m / 0.03 rad and loop 0.20 m / 0.04 rad. These are **tuning parameters, not measured covariances**. Configure them in backend `pgo` fields `odometry_translation_sigma`, `odometry_rotation_sigma`, `loop_translation_sigma`, and `loop_rotation_sigma`.
 
@@ -257,7 +257,10 @@ Use `--min-observations`, `--min-parallax-deg`, `--reprojection-px`,
 config's `visualization_enabled` to false to disable its display writer for
 parity measurements. Neither the writer nor viewer changes Basalt inputs/state.
 
-Dense reconstruction runs after replay using [ScaRF-SLAM](../docs/scarf_dense_mapping.md).
+Dense reconstruction uses [ScaRF-SLAM](../docs/scarf_dense_mapping.md), either
+offline or alongside replay with loop-triggered GPS global BA and ScaRF map
+optimization. Between accepted loops, VIO and new dense submap construction
+continue; no periodic or final whole-map solve is forced.
 The former DA3 worker and `--da3-config` recorder option have been removed.
 
 Sparse display refinement is used with the PGO backend; global BA displays its

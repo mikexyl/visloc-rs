@@ -31,6 +31,7 @@ pub mod imu;
 pub mod initialization;
 pub mod startup;
 pub mod mapper;
+mod parallel;
 pub mod patch;
 pub mod pattern;
 pub mod provenance;

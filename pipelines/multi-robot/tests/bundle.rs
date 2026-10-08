@@ -54,6 +54,97 @@ fn populate(b: &mut Backend, robot: &str, session: &str) {
     }
 }
 #[test]
+fn online_ba_only_solves_new_ready_loops_and_carries_corrections_after_restart() {
+    let mut b = Backend::default();
+    populate(&mut b, "a", "one");
+    let raw = b.update(&GraphSnapshot::default()).unwrap();
+    assert_eq!(raw.optimization_revision, 0);
+    assert!(raw.optimizer_reports.is_empty());
+    let edge = LoopConstraint {
+        pair: Pair::new(Key::new("a", "one", 0), Key::new("b", "one", 0)),
+        from: Key::new("a", "one", 0),
+        to: Key::new("b", "one", 0),
+        to_from: transform(-5., 0.),
+        information: matrix_values(&information(0.2, 0.04)),
+        similarity: 0.9,
+        verification: Verification {
+            pnp_inliers: 30,
+            ..Default::default()
+        },
+    };
+    b.insert_loop(edge.clone()).unwrap();
+    let pending = b.update(&raw).unwrap();
+    assert!(pending.optimized_loops.is_empty()); // Endpoint has not arrived.
+    populate(&mut b, "b", "one");
+    let missing = b.bundle_frames.remove(&Key::new("b", "one", 3)).unwrap();
+    let pending = b.update(&pending).unwrap();
+    assert_eq!(pending.components, 2);
+    assert!(pending.optimizer_reports.is_empty()); // Wait for BA observations too.
+    b.insert_bundle_frame(missing).unwrap();
+    let solved = b.update(&pending).unwrap();
+    assert_eq!(solved.components, 1);
+    assert!(!solved.optimizer_reports.is_empty());
+    assert_eq!(solved.optimized_loops.len(), 1);
+    assert_eq!(solved.optimization_revision, solved.revision);
+    assert!(!b.insert_loop(edge).unwrap());
+    let restored: GraphSnapshot =
+        serde_json::from_slice(&serde_json::to_vec(&solved).unwrap()).unwrap();
+    let last = restored
+        .poses
+        .iter()
+        .find(|p| p.key == Key::new("b", "one", 3))
+        .unwrap();
+    b.insert_keyframe(KeyframeRecord {
+        key: Key::new("b", "one", 4),
+        timestamp_ns: 4,
+        body_to_odom: transform(1.6, 0.024),
+        previous: Some(last.key.clone()),
+    })
+    .unwrap();
+    b.insert_gps(GpsRecord {
+        key: Key::new("b", "one", 0),
+        timestamp_ns: 4,
+        receipt_timestamp_ns: 4,
+        time_source: "sensor".into(),
+        lla: Some([0., 0., 0.]),
+        status: 0,
+        quality: Some(2),
+        hdop: Some(0.5),
+        covariance_enu: None,
+    })
+    .unwrap();
+    let carried = b.update(&restored).unwrap();
+    assert_eq!(carried.optimization_revision, solved.optimization_revision);
+    assert!(carried.optimizer_reports.is_empty());
+    assert_eq!(carried.solve_ms, 0.);
+    assert_eq!(carried.components, 1);
+    assert_eq!(
+        carried.gps.diagnostics.last().unwrap().reason,
+        "awaiting_loop_optimization"
+    );
+    for old in &restored.poses {
+        let new = carried.poses.iter().find(|p| p.key == old.key).unwrap();
+        assert_eq!(
+            serde_json::to_vec(old).unwrap(),
+            serde_json::to_vec(new).unwrap()
+        );
+    }
+    let added = carried
+        .poses
+        .iter()
+        .find(|p| p.key == Key::new("b", "one", 4))
+        .unwrap();
+    assert_eq!(
+        added.map_from_odom.translation,
+        last.map_from_odom.translation
+    );
+    // A drain/publication is the same update path, with no unconditional solve.
+    assert_eq!(
+        b.update(&carried).unwrap().optimization_revision,
+        solved.optimization_revision
+    );
+}
+#[test]
 fn global_ba_scopes_tracks_and_reanchors_joining_components() {
     let mut b = Backend::default();
     populate(&mut b, "a", "one");

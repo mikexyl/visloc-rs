@@ -5,6 +5,7 @@
 //! numeric core and has no dependency on the repository bundle optimizer.
 use crate::camera::DoubleSphereCamera;
 use crate::imu::{eigen_ldlt_solve_f32, ImuPreintegratedDelta};
+use crate::parallel::map_ordered;
 use crate::timing::{TimingBreakdown, TimingBucket};
 use crate::vio::landmarks::{sophus_so3_inverse, sophus_so3_product, InverseDistanceLandmark};
 use crate::vio::scalar::ScalarMode;
@@ -25,6 +26,9 @@ use std::{
     },
 };
 use visloc_core::geometry::SE3;
+
+#[path = "f64_reuse.rs"]
+mod f64_reuse;
 
 /// Upstream AOM navigation block: pose6, velocity3, gyro-bias3, accel-bias3.
 pub const AOM_NAV_DOF: usize = 15;
@@ -514,10 +518,10 @@ fn skew3(value: Vector3<f64>) -> Matrix3<f64> {
     )
 }
 
-fn project_double_sphere_with_jacobian(
+fn double_sphere_projection_terms(
     camera: &DoubleSphereCamera,
     point: Vector3<f64>,
-) -> Option<(Vector2<f64>, Matrix2x3<f64>)> {
+) -> Option<(f64, f64, f64, f64)> {
     if !point.iter().all(|value| value.is_finite()) {
         return None;
     }
@@ -534,6 +538,14 @@ fn project_double_sphere_with_jacobian(
     if !denominator.is_finite() || denominator <= 1e-12 {
         return None;
     }
+    Some((d1, zeta, d2, denominator))
+}
+
+fn project_double_sphere_with_jacobian(
+    camera: &DoubleSphereCamera,
+    point: Vector3<f64>,
+) -> Option<(Vector2<f64>, Matrix2x3<f64>)> {
+    let (d1, zeta, d2, denominator) = double_sphere_projection_terms(camera, point)?;
 
     let d_zeta = Vector3::new(
         camera.xi * point.x / d1,
@@ -559,6 +571,46 @@ fn project_double_sphere_with_jacobian(
         ),
         jacobian,
     ))
+}
+
+/// Cost-only f64 visual evaluation, using exactly the linearizer's projection,
+/// identity-camera branch and robust objective without constructing Jacobians.
+pub(crate) fn anchored_visual_cost_f64(
+    camera: &DoubleSphereCamera,
+    anchor_pose: &SE3,
+    anchor_extrinsic: &SE3,
+    target_pose: &SE3,
+    target_extrinsic: &SE3,
+    landmark: &InverseDistanceLandmark,
+    observation: Point2<f64>,
+    same_time_cam_id: bool,
+    config: FactorConfig,
+) -> Option<f64> {
+    if !config.observation_stddev.is_finite() || config.observation_stddev <= 0.0 {
+        return None;
+    }
+    let relative = if same_time_cam_id {
+        SE3::identity()
+    } else {
+        target_extrinsic.inverse()
+            .compose(&target_pose.inverse().compose(anchor_pose))
+            .compose(anchor_extrinsic)
+    };
+    let point = relative.rotation.transform_vector(&landmark.direction.bearing())
+        + relative.translation * landmark.inverse_distance;
+    let (_, _, _, denominator) = double_sphere_projection_terms(camera, point)?;
+    let predicted = Vector2::new(
+        camera.fx * point.x / denominator + camera.cx,
+        camera.fy * point.y / denominator + camera.cy,
+    );
+    let raw = predicted - observation.coords;
+    let squared = raw.norm_squared();
+    let weight = if config.huber_delta > 0.0 && squared > config.huber_delta * config.huber_delta {
+        config.huber_delta / squared.sqrt()
+    } else {
+        1.0
+    };
+    Some(robust_objective_from_raw(squared, weight, config.observation_stddev))
 }
 
 /// A minimal float-owned pose used by the upstream compatibility path.  The
@@ -2739,9 +2791,16 @@ pub(crate) fn solve_lm_with_timing<P: LmProblem>(
                 Ok(None)
             }
         })?;
+        let mut prepared_f64 = None;
         let reduced_f64 = if scalar_mode == ScalarMode::ExtendedF64 {
             Some(timing.measure(TimingBucket::LmLandmarkReduction, || {
-                reduce_landmark_factors(&lin.factors, state.len(), 1e-10)
+                if crate::vio::window::diagnostic_env_active() {
+                    reduce_landmark_factors(&lin.factors, state.len(), 1e-10)
+                } else {
+                    let (reduced, prepared) = f64_reuse::reduce(&lin.factors, state.len(), 1e-10);
+                    prepared_f64 = Some(prepared);
+                    reduced
+                }
             }))
         } else {
             None
@@ -2841,6 +2900,8 @@ pub(crate) fn solve_lm_with_timing<P: LmProblem>(
         let model_decrease = timing.measure(TimingBucket::LmModelDecrease, || {
             if scalar_mode == ScalarMode::UpstreamF32 {
                 model_cost_decrease_f32(&lin.factors, &step, 1e-10)
+            } else if let Some(prepared) = &prepared_f64 {
+                prepared.model_decrease(&lin.factors, &step)
             } else {
                 model_cost_decrease(&lin.factors, &step, 1e-10)
             }
@@ -2866,7 +2927,14 @@ pub(crate) fn solve_lm_with_timing<P: LmProblem>(
         let trial = timing.measure(TimingBucket::LmCompactApplyStep, || {
             problem.apply_step(&state, &step)
         });
-        let actual = problem.trial_cost_timed(&state, &step, &trial, timing)?;
+        let (actual, trial_token) = if let Some(prepared) = &prepared_f64 {
+            let preparation = timing.measure(TimingBucket::LmCompactBackSubstitution, || {
+                prepared.trial_preparation(&lin.factors, &state, &step)
+            });
+            problem.trial_cost_timed_with_preparation(&state, &step, &trial, preparation, timing)?
+        } else {
+            (problem.trial_cost_timed(&state, &step, &trial, timing)?, LmTrialToken::default())
+        };
         if !actual.is_finite() {
             return Err(LmFailure::NonFinite);
         }
@@ -2926,7 +2994,7 @@ pub(crate) fn solve_lm_with_timing<P: LmProblem>(
             });
         let (decision, after) = if actual < cost && relative_decrease > 0.0 {
             timing.measure(TimingBucket::LmAccept, || {
-                problem.accept_step(&state, &step)
+                problem.accept_step_with_token(&state, &step, trial_token)
             })?;
             timing.measure(TimingBucket::LmDecisionStateBookkeeping, || {
                 state = trial.clone();
@@ -4920,17 +4988,31 @@ pub fn reduce_landmark_factors(
     let mut h = DMatrix::zeros(state_dof, state_dof);
     let mut b = DVector::zeros(state_dof);
     let mut back = Vec::with_capacity(factors.len());
-    for f in factors {
-        assert_eq!(f.state_jacobian.ncols(), state_dof);
-        let (j, r, rank) = landmark_nullspace_projection(f, tolerance);
-        h += j.transpose() * &j;
-        b += j.transpose() * &r;
-        back.push(LandmarkBackSubstitution {
-            state_jacobian: f.state_jacobian.clone(),
-            landmark_jacobian: f.landmark_jacobian.clone(),
-            residual: f.residual.clone(),
-            rank,
+    // Bound temporary normal matrices independently of the landmark count.
+    // QR and matrix products are independent; merge in the original order
+    // so worker scheduling cannot change floating-point sums or LM decisions.
+    let parallel = !crate::vio::window::diagnostic_env_active();
+    for batch in factors.chunks(32) {
+        let contributions = map_ordered(0..batch.len(), parallel, |index| {
+            let f = &batch[index];
+            assert_eq!(f.state_jacobian.ncols(), state_dof);
+            let (j, r, rank) = landmark_nullspace_projection(f, tolerance);
+            (
+                j.transpose() * &j,
+                j.transpose() * &r,
+                LandmarkBackSubstitution {
+                    state_jacobian: f.state_jacobian.clone(),
+                    landmark_jacobian: f.landmark_jacobian.clone(),
+                    residual: f.residual.clone(),
+                    rank,
+                },
+            )
         });
+        for (factor_h, factor_b, factor_back) in contributions {
+            h += factor_h;
+            b += factor_b;
+            back.push(factor_back);
+        }
     }
     ReducedNormalSystem {
         h,
@@ -9977,6 +10059,68 @@ fn upstream_trial_transform_stages_f32(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn f64_parallel_reduction_preserves_order_and_landmark_recovery() {
+        // Cross batch boundaries with mixed visual/plain and rank-deficient
+        // factors. Compare against the original serial assembly, including
+        // the back-substitution identity of every landmark.
+        let dof = 45;
+        for count in [0, 7, 33, 97] {
+            let factors: Vec<_> = (0..count)
+                .map(|index| {
+                    let rows = 4 + index % 11;
+                    let cols = if index % 7 == 0 { 0 } else { 3 };
+                    WhitenedFactorRowStack::new(
+                        DMatrix::from_fn(rows, dof, |r, c| {
+                            ((index * 19 + r * 7 + c * 13) as f64 * 0.13).sin()
+                        }),
+                        DMatrix::from_fn(rows, cols, |r, c| {
+                            if index % 13 == 0 {
+                                0.0
+                            } else {
+                                ((r * 5 + c * 3 + index) as f64 * 0.17).cos()
+                            }
+                        }),
+                        DVector::from_fn(rows, |r, _| (index + r) as f64 * 0.01 - 0.2),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let actual = reduce_landmark_factors(&factors, dof, 1e-10);
+            let mut expected_h = DMatrix::zeros(dof, dof);
+            let mut expected_b = DVector::zeros(dof);
+            assert_eq!(actual.back_substitution.len(), factors.len());
+            let step = DVector::from_element(dof, 0.03);
+            for (factor, back) in factors.iter().zip(&actual.back_substitution) {
+                let (j, r, rank) = landmark_nullspace_projection(factor, 1e-10);
+                expected_h += j.transpose() * &j;
+                expected_b += j.transpose() * &r;
+                let expected_back = LandmarkBackSubstitution {
+                    state_jacobian: factor.state_jacobian.clone(),
+                    landmark_jacobian: factor.landmark_jacobian.clone(),
+                    residual: factor.residual.clone(),
+                    rank,
+                };
+                assert_eq!(back.rank, rank);
+                assert_eq!(back.state_jacobian, expected_back.state_jacobian);
+                assert_eq!(back.landmark_jacobian, expected_back.landmark_jacobian);
+                assert_eq!(back.residual, expected_back.residual);
+                assert_eq!(
+                    back_substitute_landmark(back, &step, 1e-10),
+                    back_substitute_landmark(&expected_back, &step, 1e-10)
+                );
+            }
+            for (a, b) in actual
+                .h
+                .iter()
+                .chain(actual.b.iter())
+                .zip(expected_h.iter().chain(expected_b.iter()))
+            {
+                assert_eq!(a.to_bits(), b.to_bits());
+            }
+        }
+    }
+
     #[test]
     #[ignore = "requires M11_VISUAL_CAPTURE_ROOT pinned frame17 capture"]
     fn frame17_visual_packet_tail_native_full_matrix() {

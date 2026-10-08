@@ -1,6 +1,7 @@
 use crate::{Error, Result};
 use nalgebra::{Matrix6, Quaternion, UnitQuaternion, Vector3};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use visloc_core::{geometry::SE3, types::Camera};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -280,6 +281,12 @@ pub struct GraphSnapshot {
     pub bundle_diagnostics: Vec<crate::BundleDiagnostics>,
     pub revision: u64,
     pub input_revision: u64,
+    /// Last revision that ran the optimizer (ordinary publications also advance revision).
+    #[serde(default)]
+    pub optimization_revision: u64,
+    /// Canonical loop pairs actually included in a successful solve.
+    #[serde(default)]
+    pub optimized_loops: BTreeSet<Pair>,
     pub poses: Vec<OptimizedPose>,
     pub loops: Vec<LoopConstraint>,
     pub components: usize,

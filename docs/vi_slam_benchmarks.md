@@ -119,6 +119,11 @@ keyframe for removal, which is what feeds the offline mapper.</sub></p>
 
 ## Run it
 
+The current f64 solver uses a bounded Rayon pool for landmark work. See
+[Basalt CPU parallelism](basalt_parallelism.md) for worker limits, deterministic
+accumulation, and the serial comparison setting. Historical measurements below
+describe their recorded builds.
+
 Build with AVX2/FMA and the LM-workspace-reuse optimization used for the
 measurements above:
 

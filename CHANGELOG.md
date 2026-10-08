@@ -4,6 +4,20 @@ All notable changes to `visloc-rs` will be documented here.
 
 ## Unreleased
 
+- Avoid repeated f64 Basalt work with residual-only visual/IMU/bias objective
+  evaluation and per-linearization landmark QR reuse for model evaluation,
+  recovery, and accepted-step updates. Preserve the numerical operation order.
+
+- Parallelize f64 Basalt landmark work with a bounded Rayon pool and ordered
+  normal-matrix accumulation. Default to at most four workers; retain a serial
+  comparison with `VISLOC_BASALT_THREADS=1`. See `docs/basalt_parallelism.md`.
+
+- Run online global BA and ScaRF map optimization only for newly accepted loops.
+  Accumulate GPS and observations between loops, carry forward the last pose
+  correction, and persist solved loop identities to avoid duplicate solves.
+  Remove live ScaRF periodic/insertion/final map solves; retain depth inference,
+  within-batch frame scale fitting, and fusion as new submaps arrive.
+
 - Default the centralized Rust ROS2 backend to native GTSAM global BA with
   horizontal GPS, joint body poses/shared landmarks, full stereo observations,
   restart recovery, and batched optimized landmarks in Rerun. Preserve explicit
@@ -16,7 +30,8 @@ All notable changes to `visloc-rs` will be documented here.
   endpoint loop. See `docs/global_bundle_adjustment.md`.
 
 - Replace the experimental dense mapping workers with a pinned ScaRF-SLAM
-  source checkout and offline RGB/visloc pose adapter. Remove the old DA3
+  source checkout, offline RGB/visloc adapter, and online GPS-BA revision
+  following during ROS2 replay. Remove the old DA3
   alignment/filtering code, TensorRT depth tools, recorder hooks, and tests.
 
 - Add an online ROS2 Rerun recorder with bounded landmark refinement, persistent

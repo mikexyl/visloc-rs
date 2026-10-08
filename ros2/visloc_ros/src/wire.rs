@@ -280,6 +280,9 @@ impl Wire for c::GraphSnapshot {
                 .collect(),
             bundle_diagnostics: Default::default(),
             gps: Default::default(),
+            // Solve scheduling and diagnostics are persisted in the local snapshot.
+            optimization_revision: Default::default(),
+            optimized_loops: Default::default(),
             // Detailed optimizer diagnostics are persisted in backend journals.
             optimizer_reports: Default::default(),
         }

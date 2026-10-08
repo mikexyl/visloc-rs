@@ -482,7 +482,7 @@ fn optimize(
             && (dirty || (force && complete))
         {
             let graph = state.lock().unwrap().clone();
-            match graph.solve(&previous) {
+            match graph.update(&previous) {
                 Ok(snapshot) => {
                     atomic_json(&snapshot_path, &snapshot)?;
                     if config.pgo.gps.enabled {
@@ -497,7 +497,7 @@ fn optimize(
                     writeln!(
                         revisions,
                         "{}",
-                        serde_json::json!({"revision":snapshot.revision,"input_revision":snapshot.input_revision,"keyframes":snapshot.poses.len(),"loops":snapshot.loops.len(),"components":snapshot.components,"initial_cost":snapshot.initial_cost,"final_cost":snapshot.final_cost,"solve_ms":snapshot.solve_ms,"optimizer_reports":snapshot.optimizer_reports,"backend_mode":snapshot.backend_mode,"landmarks":snapshot.landmarks.len(),"bundle_diagnostics":snapshot.bundle_diagnostics})
+                        serde_json::json!({"event":if snapshot.optimization_revision == snapshot.revision {"optimization"} else {"graph_update"},"optimization_revision":snapshot.optimization_revision,"optimized_loops":snapshot.optimized_loops.len(),"revision":snapshot.revision,"input_revision":snapshot.input_revision,"keyframes":snapshot.poses.len(),"loops":snapshot.loops.len(),"components":snapshot.components,"initial_cost":snapshot.initial_cost,"final_cost":snapshot.final_cost,"solve_ms":snapshot.solve_ms,"optimizer_reports":snapshot.optimizer_reports,"backend_mode":snapshot.backend_mode,"landmarks":snapshot.landmarks.len(),"bundle_diagnostics":snapshot.bundle_diagnostics})
                     )?;
                     for robot in &config.peers {
                         let mut out = std::fs::File::create(
@@ -522,13 +522,14 @@ fn optimize(
                             &crate::traffic::snapshot(),
                         )?;
                         if config.pgo.mode == c::BackendMode::GlobalBundleAdjustment
+                            && previous.optimization_revision > 0
                             && previous.landmarks.is_empty()
                         {
                             return Err("global BA finished without any admitted landmarks".into());
                         }
                         atomic_json(
                             &config.output.join("finished.json"),
-                            &serde_json::json!({"revision":previous.revision,"input_revision":previous.input_revision}),
+                            &serde_json::json!({"revision":previous.revision,"input_revision":previous.input_revision,"optimization_revision":previous.optimization_revision}),
                         )?;
                     }
                     if complete {

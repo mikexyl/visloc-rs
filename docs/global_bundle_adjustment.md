@@ -85,15 +85,26 @@ The solver uses point-first constrained COLAMD, sparse multifrontal Cholesky,
 Huber pixel loss, and at most 20 LM iterations. Components are optimized
 independently with one anchor each. GPS alignment releases east/north/yaw while
 preserving root height and gravity. A verified connecting loop joins components;
-GPS alone does not merge them. The backend schedules at most one solve per
-second while dirty; solves never overlap. Only finite solutions with
+GPS alone does not merge them. Online BA runs only after a **new accepted loop**
+has both endpoints and the current keyframes' BA observations available. GPS,
+keyframes, and observations accumulate between loops; they do not trigger solves.
+The worker coalesces pending loops, never overlaps solves, and limits updates to
+once per second. Only finite solutions with
 non-increasing robust objective and valid depths replace the previous snapshot.
 
 Robots journal reliable `/<robot>/slam/bundle_frames` and serve 16-frame pages at
 `/<robot>/slam/bundle_history`. History recovery uses steady-time two-second
 requests and three retries. The backend deduplicates immutable records and
 persists observations in `graph.jsonl`. Final drain waits for observations for
-every known keyframe; a final BA graph without admitted landmarks is a failure.
+every known keyframe and publishes the complete graph. Drain does **not** force
+another solve unless a new loop remains pending. Before the first loop, poses
+remain raw VIO. Afterward, new poses carry the latest correction forward while
+previous corrected poses and optimized landmarks remain fixed. GPS arriving
+after a solve waits for the next accepted loop. A no-loop run completes with no
+optimized landmarks; a run that actually solves BA must admit landmarks.
+Local JSON snapshots persist `optimized_loops` and `optimization_revision` for
+restart deduplication and ScaRF correction scheduling. Ordinary graph revisions
+still advance, but have zero solve time and no optimizer reports.
 Snapshots include optimized points, component IDs, admission counts, solver
 cost/timing and reprojection RMSE. Rerun displays the optimized points directly
 in batched clouds and uses optimized camera poses; it does not re-refine BA points.
@@ -101,6 +112,9 @@ in batched clouds and uses optimized camera poses; it does not re-refine BA poin
 ## Measurements and known limitations
 
 Frozen South-ece backend comparison, 2026-10-06:
+
+These are explicit offline full-graph solves, not measurements of the new
+loop-triggered online schedule. Offline tools can still request a solve directly.
 
 | Mode | Matched-keyframe ATE | Cold backend time |
 | --- | ---: | ---: |

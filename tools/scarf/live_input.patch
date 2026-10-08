@@ -1,0 +1,91 @@
+--- a/scarf_slam/mapping_app.py
++++ b/scarf_slam/mapping_app.py
+@@ -170,6 +170,7 @@
+         self.publish_ros2_images = False
+         self.ros2_images_topic = "/scarf_slam/images"
+         self.slam_bag_data = None
++        self.input_source = None  # Optional append-only live input adapter.
+         self.timestamp_sync_result = None
+         self.is_mono = False
+         self.fixed_mono_trajectory_scale: Optional[float] = None
+@@ -1230,6 +1231,7 @@
+         poses_changed = not pose_dicts_equal(
+             self.in_ref_poses_dict,
+             new_ref_poses_dict,
++            rotation_tol_deg=1e-6 if self.input_source is not None else None,
+         )
+ 
+         missing_batch_timestamps = [ts for ts in batch_ref_timestamps if ts not in new_ref_poses_dict]
+@@ -1242,6 +1244,10 @@
+ 
+         self.current_traj_timestamp = traj_timestamp
+         self.in_ref_poses_dict = new_ref_poses_dict
++
++        if self.input_source is not None:
++            loop_correction = self.input_source.take_loop_correction()
++            poses_changed = poses_changed and loop_correction
+ 
+         if not poses_changed:
+             return False
+@@ -1809,7 +1815,7 @@
+         def _run_periodic_submap_scale_optimization() -> None:
+             nonlocal next_periodic_submap_opt_count
+             while counter >= next_periodic_submap_opt_count:
+-                if self.submap_scale_opt and len(self.submaps) >= 2:
++                if self.input_source is None and self.submap_scale_opt and len(self.submaps) >= 2:
+                     self._run_submap_scale_optimization(
+                         latest_n_submaps=min(10, counter),
+                         max_points_per_overlap_frame=200,
+@@ -1818,6 +1824,10 @@
+                 next_periodic_submap_opt_count += periodic_submap_opt_interval
+ 
+         while True:
++            if self.input_source is not None:
++                self.input_source.poll(self)
++                if self.config.get("use_slam") and self.out_ph_poses_dict:
++                    self._refresh_slam_trajectory_for_batch([self.ref_timestamps[-1]])
+             indices = indices_overlap
+ 
+             i = indices_overlap[-1] + 1
+@@ -1850,13 +1860,15 @@
+                 i += 1
+ 
+             if not indices or len(indices) < self.num_ref_poses_per_batch:
++                if self.input_source is not None and self.input_source.wait(self):
++                    continue
+                 print(f"No enough poses left; exiting loop.")
+                 self._print_runtime_summary(counter)
+ 
+                 updated_traj = False
+                 if self.config.get("use_slam"):
+                     updated_traj = self._refresh_slam_trajectory_for_batch([self.ref_timestamps[-1]])
+-                if self.submap_scale_opt and not updated_traj:
++                if self.input_source is None and self.submap_scale_opt and not updated_traj:
+                     self._run_submap_scale_optimization(
+                         latest_n_submaps=None,
+                         max_points_per_overlap_frame=100,
+@@ -2300,7 +2312,7 @@
+ 
+         # Submap scale optimization
+         submap_scale_opt_duration = 0.0
+-        if self.submap_scale_opt and len(self.submaps) >= 2:
++        if self.input_source is None and self.submap_scale_opt and len(self.submaps) >= 2:
+             submap_scale_opt_start_time = time.perf_counter()
+             self._run_submap_scale_optimization(
+                 latest_n_submaps=3,
+--- a/scarf_slam/utils/timestamp_ops.py
++++ b/scarf_slam/utils/timestamp_ops.py
+@@ -57,8 +57,11 @@
+         quat_b = quat_b / norm_b
+ 
+         dots = np.sum(quat_a * quat_b, axis=1)
+-        dots = np.clip(np.abs(dots), -1.0, 1.0)
+-        rotation_deltas_deg = np.degrees(2.0 * np.arccos(dots))
++        # Chord distance stays accurate near zero; acos(dot) can report a
++        # microrotation even for identical normalized quaternions.
++        aligned_b = np.where((dots < 0)[:, None], -quat_b, quat_b)
++        chord = np.linalg.norm(quat_a - aligned_b, axis=1)
++        rotation_deltas_deg = np.degrees(4.0 * np.arcsin(np.clip(chord / 2.0, 0.0, 1.0)))
+ 
+         bad_rot = np.flatnonzero(rotation_deltas_deg > rotation_tol_deg)
+         if bad_rot.size:

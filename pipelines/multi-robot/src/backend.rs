@@ -166,6 +166,171 @@ impl Backend {
         self.input_revision += 1;
         Ok(true)
     }
+    /// Online BA is event driven. New sensors and replay completion publish
+    /// carried-forward poses; only a previously unsolved, ready loop runs BA.
+    /// Explicit offline callers can still request `solve` directly.
+    pub fn update(&self, previous: &GraphSnapshot) -> Result<GraphSnapshot> {
+        self.config.validate()?;
+        let ready_loop = self.loops.values().any(|edge| {
+            !previous.optimized_loops.contains(&edge.pair)
+                && self.records.contains_key(&edge.from)
+                && self.records.contains_key(&edge.to)
+        });
+        let complete = self
+            .records
+            .keys()
+            .all(|key| self.bundle_frames.contains_key(key));
+        if self.config.mode == BackendMode::PoseGraph || (ready_loop && complete) {
+            self.solve(previous)
+        } else {
+            self.advance_without_optimization(previous)
+        }
+    }
+
+    fn advance_without_optimization(&self, previous: &GraphSnapshot) -> Result<GraphSnapshot> {
+        // Initialize new frames through raw odometry, while keeping every
+        // already published correction intact. Pending loops do not join maps.
+        let mut adjacency: BTreeMap<Key, Vec<Key>> = BTreeMap::new();
+        for r in self.records.values() {
+            if let Some(p) = r.previous.as_ref().and_then(|p| self.records.get(p)) {
+                if p.timestamp_ns >= r.timestamp_ns {
+                    return Err(Error("non-increasing odometry time".into()));
+                }
+                adjacency
+                    .entry(p.key.clone())
+                    .or_default()
+                    .push(r.key.clone());
+                adjacency
+                    .entry(r.key.clone())
+                    .or_default()
+                    .push(p.key.clone());
+            }
+        }
+        for pair in &previous.optimized_loops {
+            if let Some(e) = self.loops.get(pair) {
+                adjacency
+                    .entry(e.from.clone())
+                    .or_default()
+                    .push(e.to.clone());
+                adjacency
+                    .entry(e.to.clone())
+                    .or_default()
+                    .push(e.from.clone());
+            }
+        }
+        let warm: BTreeMap<_, _> = previous.poses.iter().map(|p| (p.key.clone(), p)).collect();
+        let mut result = previous.clone();
+        result.backend_mode = self.config.mode;
+        result.revision += 1;
+        result.input_revision = self.input_revision;
+        result.loops = self.loops.values().cloned().collect();
+        result.solve_ms = 0.;
+        result.optimizer_reports.clear();
+        result.poses.clear();
+        result.components = 0;
+        let mut seen = BTreeSet::new();
+        let mut component_remap = BTreeMap::new();
+        for root in self.records.keys() {
+            if !seen.insert(root.clone()) {
+                continue;
+            }
+            result.components += 1;
+            let mut members = BTreeSet::from([root.clone()]);
+            let mut queue = VecDeque::from([root.clone()]);
+            while let Some(a) = queue.pop_front() {
+                for b in adjacency.get(&a).into_iter().flatten() {
+                    if seen.insert(b.clone()) {
+                        members.insert(b.clone());
+                        queue.push_back(b.clone());
+                    }
+                }
+            }
+            // All existing poses are seeds, so late/out-of-order records can
+            // extend either end without moving an already corrected keyframe.
+            let mut poses = BTreeMap::new();
+            for key in &members {
+                if let Some(old) = warm.get(key) {
+                    let mut pose = (*old).clone();
+                    component_remap.insert(pose.component.clone(), root.clone());
+                    pose.component = root.clone();
+                    poses.insert(key.clone(), pose);
+                    queue.push_back(key.clone());
+                }
+            }
+            if queue.is_empty() {
+                poses.insert(
+                    root.clone(),
+                    OptimizedPose {
+                        key: root.clone(),
+                        timestamp_ns: self.records[root].timestamp_ns,
+                        component: root.clone(),
+                        body_to_map: self.records[root].body_to_odom.clone(),
+                        map_from_odom: Transform::from(&SE3::identity()),
+                    },
+                );
+                queue.push_back(root.clone());
+            }
+            while let Some(a) = queue.pop_front() {
+                for b in adjacency.get(&a).into_iter().flatten() {
+                    if poses.contains_key(b) {
+                        continue;
+                    }
+                    // Solved cross-session loop endpoints are already warm.
+                    if !a.same_session(b) {
+                        return Err(Error("missing solved loop endpoint".into()));
+                    }
+                    let correction = poses[&a].map_from_odom.clone();
+                    let body = correction
+                        .se3()?
+                        .compose(&self.records[b].body_to_odom.se3()?);
+                    poses.insert(
+                        b.clone(),
+                        OptimizedPose {
+                            key: b.clone(),
+                            timestamp_ns: self.records[b].timestamp_ns,
+                            component: root.clone(),
+                            body_to_map: Transform::from(&body),
+                            map_from_odom: correction,
+                        },
+                    );
+                    queue.push_back(b.clone());
+                }
+            }
+            result.poses.extend(poses.into_values());
+        }
+        result.poses.sort_by(|a, b| a.key.cmp(&b.key));
+        for landmark in &mut result.landmarks {
+            if let Some(root) = component_remap.get(&landmark.component) {
+                landmark.component = root.clone();
+            }
+        }
+        result.gps.aligned_components = previous
+            .gps
+            .aligned_components
+            .iter()
+            .filter_map(|key| component_remap.get(key).cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        result.gps.datum = self.gps_datum.or(self.config.gps.origin);
+        let reported: BTreeSet<_> = result
+            .gps
+            .diagnostics
+            .iter()
+            .map(|d| d.key.clone())
+            .collect();
+        for record in self
+            .gps_records
+            .values()
+            .filter(|r| !reported.contains(&r.key))
+        {
+            let mut diagnostic = crate::gps::GpsDiagnostic::new(record);
+            diagnostic.reason = "awaiting_loop_optimization".into();
+            result.gps.diagnostics.push(diagnostic);
+        }
+        Ok(result)
+    }
+
     pub fn solve(&self, previous: &GraphSnapshot) -> Result<GraphSnapshot> {
         let start = Instant::now();
         self.config.validate()?;
@@ -225,6 +390,13 @@ impl Backend {
         let mut result = GraphSnapshot {
             backend_mode: self.config.mode,
             revision: previous.revision + 1,
+            optimization_revision: previous.revision + 1,
+            optimized_loops: self
+                .loops
+                .values()
+                .filter(|e| self.records.contains_key(&e.from) && self.records.contains_key(&e.to))
+                .map(|e| e.pair.clone())
+                .collect(),
             input_revision: self.input_revision,
             loops: self.loops.values().cloned().collect(),
             ..Default::default()

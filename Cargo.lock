@@ -858,6 +858,7 @@ dependencies = [
  "base64",
  "image 0.25.5 (git+https://github.com/image-rs/image?rev=317bc1692c134d750360ca9c8e108a08ff534d93)",
  "nalgebra",
+ "rayon",
  "serde",
  "serde_json",
  "thiserror",
